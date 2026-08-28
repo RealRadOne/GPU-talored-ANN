@@ -1,0 +1,30 @@
+{
+    "configurations": [
+        {
+            "name": "Linux",
+            "includePath": [
+                "${workspaceFolder}/**",
+                "/home/lanlu/raft/cpp/include",
+                "/home/lanlu/miniconda3/envs/rapids_raft/targets/x86_64-linux/include",
+                "/home/lanlu/miniconda3/envs/rapids_raft/include",
+                "/home/lanlu/miniconda3/envs/rapids_raft/include/rapids",
+                "/home/lanlu/miniconda3/envs/rapids_raft/include/rapids/libcudacxx",
+                "/home/lanlu/raft/cpp/build/_deps/nlohmann_json-src/include",
+                "/home/lanlu/raft/cpp/build/_deps/benchmark-src/include",
+                "/home/lanlu/scaleGANN/DiskANN/include",
+                "/home/lanlu/miniconda3/envs/rapids_raft/targets/x86_64-linux/include/cuda",
+                "/usr/local/cuda/include"
+            ],
+            "defines": [
+                "USE_AVX2",
+                "__CUDACC__"
+            ],
+            "compilerPath": "/home/lanlu/miniconda3/envs/rapids_raft/bin/nvcc",
+            "cStandard": "c17",
+            "cppStandard": "c++17",
+            "intelliSenseMode": "linux-gcc-x64",
+            "compileCommands": "${workspaceFolder}/bucketDemo/buildCAGRA/build/compile_commands.json"
+        }
+    ],
+    "version": 4
+}
