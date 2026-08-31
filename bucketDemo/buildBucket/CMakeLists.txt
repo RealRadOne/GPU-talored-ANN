@@ -101,6 +101,23 @@ set_target_properties(bucket2 PROPERTIES
     BUILD_RPATH ${CONDA_LIB}
 )
 
+# bucket_reordered: bucket_reordered.cu (with cache-optimized contiguous bucket slice layout)
+add_executable(bucket_reordered ${BUILD_SRC_PATH}/bucket_reordered.cu)
+
+target_link_libraries(bucket_reordered
+    PRIVATE
+    CUDA::cudart
+    CUDA::cublas
+    OpenMP::OpenMP_CXX
+    raft::raft
+    fmt
+    boost_program_options
+)
+
+set_target_properties(bucket_reordered PROPERTIES
+    BUILD_RPATH ${CONDA_LIB}
+)
+
 # optimize: standalone tool that runs CAGRA sort_knn_graph + optimize on
 # the vector_knn.bin produced by bucket.cu, yielding a pruned CAGRA graph.
 add_executable(optimize ${BUILD_SRC_PATH}/optimize.cu)

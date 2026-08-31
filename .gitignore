@@ -4,4 +4,14 @@
 /bucketDemo/buildBucket/CMakeFiles/
 /bucketDemo/buildBucket/output/
 /bucketDemo/buildCAGRA/build/
+scaler/
+test_data/
+output/
+*.bin
+*.fbin
+*.ibin
+*.u8bin
+*.npy
+*.png
+.ipynb_checkpoints/
 
