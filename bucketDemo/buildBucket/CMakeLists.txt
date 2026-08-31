@@ -1,11 +1,17 @@
 cmake_minimum_required(VERSION 3.22 FATAL_ERROR)
 
-# 必须在 project() 之前设置，使用 conda 工具链，避免系统版本冲突
+# 编译器探测 (优先环境变量，次选系统路径，最后回退到默认 conda 路径)
 if(NOT DEFINED CMAKE_CUDA_COMPILER)
-    set(CMAKE_CUDA_COMPILER /home/lanlu/miniconda3/envs/rapids_raft/bin/nvcc)
+    find_program(SYSTEM_NVCC nvcc PATHS /usr/local/cuda/bin /home/lanlu/miniconda3/envs/rapids_raft/bin)
+    if(SYSTEM_NVCC)
+        set(CMAKE_CUDA_COMPILER ${SYSTEM_NVCC})
+    endif()
 endif()
 if(NOT DEFINED CMAKE_CXX_COMPILER)
-    set(CMAKE_CXX_COMPILER /home/lanlu/miniconda3/envs/rapids_raft/bin/x86_64-conda-linux-gnu-g++)
+    find_program(SYSTEM_CXX g++ x86_64-conda-linux-gnu-g++ PATHS /usr/bin /home/lanlu/miniconda3/envs/rapids_raft/bin)
+    if(SYSTEM_CXX)
+        set(CMAKE_CXX_COMPILER ${SYSTEM_CXX})
+    endif()
 endif()
 if(NOT DEFINED CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
@@ -17,37 +23,53 @@ project(
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CUDA_STANDARD 17)
-# 当前只为本机 GPU 编译以加快编译速度
-# 完整多架构 (V100 sm_70 / A100 sm_80 / A10/RTX30 sm_86): set(CMAKE_CUDA_ARCHITECTURES 70 80 86)
-set(CMAKE_CUDA_ARCHITECTURES 70)
+# 自动探测或支持常用架构 (T4: 75, V100: 70, A100: 80, RTX30/A10: 86)
+if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+    set(CMAKE_CUDA_ARCHITECTURES 75 70 80 86)
+endif()
 
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mavx2 -mfma -msse2 -ftree-vectorize -fno-builtin-malloc -fno-builtin-calloc -fno-builtin-realloc -fno-builtin-free -fopenmp -fopenmp-simd -funroll-loops -Wfatal-errors -DUSE_AVX2 -DLIBCUDACXX_ENABLE_EXPERIMENTAL_MEMORY_RESOURCE")
 set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -DLIBCUDACXX_ENABLE_EXPERIMENTAL_MEMORY_RESOURCE --extended-lambda --expt-relaxed-constexpr")
 
-find_package(Boost QUIET)
+find_package(Boost QUIET COMPONENTS program_options)
 if(NOT Boost_FOUND)
-    # Try to find Boost in conda
-    set(Boost_INCLUDE_DIRS $ENV{CONDA_PREFIX}/include)
-    set(Boost_LIBRARY_DIRS $ENV{CONDA_PREFIX}/lib)
-    message(STATUS "Using Boost from CONDA: ${Boost_INCLUDE_DIRS}")
+    if(DEFINED ENV{CONDA_PREFIX})
+        set(Boost_INCLUDE_DIRS $ENV{CONDA_PREFIX}/include)
+        set(Boost_LIBRARY_DIRS $ENV{CONDA_PREFIX}/lib)
+    endif()
 endif()
+
 find_package(OpenMP REQUIRED)
 find_package(CUDAToolkit REQUIRED)
-find_package(raft CONFIG REQUIRED
-    PATHS /home/lanlu/raft/cpp/build
-    NO_DEFAULT_PATH
+
+# RAFT 查找 (支持 config package 或直接 include headers)
+find_package(raft CONFIG QUIET
+    PATHS 
+        $ENV{CONDA_PREFIX}
+        $ENV{RAFT_PATH}
+        /home/lanlu/raft/cpp/build
+        /content/raft/cpp/build
+        /usr/local
 )
+
+if(NOT TARGET raft::raft)
+    add_library(raft_interface INTERFACE)
+    add_library(raft::raft ALIAS raft_interface)
+endif()
 
 if(DEFINED ENV{CONDA_PREFIX})
     set(CONDA_INCLUDE $ENV{CONDA_PREFIX}/include)
     set(CONDA_LIB $ENV{CONDA_PREFIX}/lib)
 else()
-    message(FATAL_ERROR "CONDA_PREFIX not found. Activate your conda env first.")
+    set(CONDA_INCLUDE /usr/local/include)
+    set(CONDA_LIB /usr/local/lib)
 endif()
 
-set(RAFT_INCLUDE /home/lanlu/raft/cpp/include)
-set(RAFT_LIB /home/lanlu/raft/build/lib)
 include_directories(
+    SYSTEM
+    ${CONDA_INCLUDE}
+    /content/raft/cpp/include
+    /content/raft/cpp/build/_deps/nlohmann_json-src/include
     /home/lanlu/raft/cpp/include/
     /home/lanlu/miniconda3/envs/rapids_raft/targets/x86_64-linux/include
     /home/lanlu/miniconda3/envs/rapids_raft/include
@@ -60,6 +82,7 @@ include_directories(
 link_directories(
     /home/lanlu/raft/cpp/build/_deps/benchmark-build/src
     ${Boost_LIBRARY_DIRS}
+    ${CONDA_LIB}
 )
 
 set(BUILD_SRC_PATH ${CMAKE_CURRENT_SOURCE_DIR}/src)
