@@ -20,6 +20,7 @@
 #include <string>
 #include <vector>
 #include <algorithm>
+#include <limits>
 
 struct Neighbor {
     int id;
@@ -132,6 +133,89 @@ inline void read_fbin_sampled(const std::string& path,
         in.read(reinterpret_cast<char*>(out.data() + i * d), row_bytes);
         require(in.good(), "Failed to read sampled row " + std::to_string(sorted_indices[i]));
     }
+}
+
+// ---------- chunked sequential readers (contiguous row range) ----------
+// 按连续行区间 [start_row, start_row+num_rows) 读取数据块，用于分块（streaming）
+// 处理超大数据集，避免一次性把整个文件读进内存。
+
+inline void read_fbin_chunk(const std::string& path,
+                            int64_t start_row, int64_t num_rows,
+                            std::vector<float>& out,
+                            int32_t& D) {
+    std::ifstream in(path, std::ios::binary);
+    require(in.is_open(), "Cannot open file: " + path);
+
+    auto [n, d] = read_bigann_header(in);
+    D = d;
+    require(start_row >= 0 && start_row + num_rows <= n,
+            "read_fbin_chunk: row range out of bounds");
+
+    constexpr std::streamoff header_bytes = 2 * sizeof(int32_t);
+    std::streamoff offset = header_bytes +
+        static_cast<std::streamoff>(start_row) * d * sizeof(float);
+    in.seekg(offset);
+
+    const uint64_t cnt = static_cast<uint64_t>(num_rows) * d;
+    out.resize(cnt);
+    in.read(reinterpret_cast<char*>(out.data()),
+            static_cast<std::streamsize>(cnt * sizeof(float)));
+    require(in.good(), "Failed to read chunk [" + std::to_string(start_row) + ", " +
+                       std::to_string(start_row + num_rows) + ") from: " + path);
+}
+
+// .u8bin / .i8bin 版本：读原始 uint8 数据块，转换为 float32
+inline void read_u8bin_chunk_to_f32(const std::string& path,
+                                    int64_t start_row, int64_t num_rows,
+                                    std::vector<float>& out,
+                                    int32_t& D) {
+    std::ifstream in(path, std::ios::binary);
+    require(in.is_open(), "Cannot open file: " + path);
+
+    auto [n, d] = read_bigann_header(in);
+    D = d;
+    require(start_row >= 0 && start_row + num_rows <= n,
+            "read_u8bin_chunk_to_f32: row range out of bounds");
+
+    constexpr std::streamoff header_bytes = 2 * sizeof(int32_t);
+    std::streamoff offset = header_bytes +
+        static_cast<std::streamoff>(start_row) * d * sizeof(uint8_t);
+    in.seekg(offset);
+
+    const uint64_t cnt = static_cast<uint64_t>(num_rows) * d;
+    std::vector<uint8_t> tmp(cnt);
+    in.read(reinterpret_cast<char*>(tmp.data()), static_cast<std::streamsize>(cnt));
+    require(in.good(), "Failed to read chunk from: " + path);
+
+    out.resize(cnt);
+    for (uint64_t i = 0; i < cnt; ++i) out[i] = static_cast<float>(tmp[i]);
+}
+
+// .ibin 版本：读原始 int32 数据块，转换为 float32
+inline void read_ibin_chunk_to_f32(const std::string& path,
+                                   int64_t start_row, int64_t num_rows,
+                                   std::vector<float>& out,
+                                   int32_t& D) {
+    std::ifstream in(path, std::ios::binary);
+    require(in.is_open(), "Cannot open file: " + path);
+
+    auto [n, d] = read_bigann_header(in);
+    D = d;
+    require(start_row >= 0 && start_row + num_rows <= n,
+            "read_ibin_chunk_to_f32: row range out of bounds");
+
+    constexpr std::streamoff header_bytes = 2 * sizeof(int32_t);
+    std::streamoff offset = header_bytes +
+        static_cast<std::streamoff>(start_row) * d * sizeof(int32_t);
+    in.seekg(offset);
+
+    const uint64_t cnt = static_cast<uint64_t>(num_rows) * d;
+    std::vector<int32_t> tmp(cnt);
+    in.read(reinterpret_cast<char*>(tmp.data()), static_cast<std::streamsize>(cnt * sizeof(int32_t)));
+    require(in.good(), "Failed to read chunk from: " + path);
+
+    out.resize(cnt);
+    for (uint64_t i = 0; i < cnt; ++i) out[i] = static_cast<float>(tmp[i]);
 }
 
 // ---------- Templated raw readers (no type conversion) ----------
@@ -334,6 +418,120 @@ inline void write_npy_f32_2d(const std::string& path,
               static_cast<std::streamsize>(cnt * sizeof(float)));
 
     require(out.good(), "Failed while writing npy payload.");
+}
+
+// ---------- Row-wise (out-of-core) NPY writers ----------
+// 用于结果按任意顺序算出来（比如按 bucket 顺序），但要按行号（global id）写回
+// 文件的场景：先建好 header 定好文件形状，可选地分块把整份文件填成 sentinel，
+// 再在计算过程中随时按行号 seek 写入 —— 不需要把 N*M 的结果整个攒在内存里。
+
+inline size_t create_npy_int64_2d(const std::string& path, int64_t N, int64_t M) {
+    require(N > 0 && M > 0, "create_npy_int64_2d: N and M must be > 0");
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    require(out.is_open(), "Cannot open for write: " + path);
+
+    const char magic[] = "\x93NUMPY";
+    out.write(magic, 6);
+    out.put(static_cast<char>(1));
+    out.put(static_cast<char>(0));
+
+    std::string header = "{'descr': '<i8', 'fortran_order': False, 'shape': (";
+    header += std::to_string(N) + ", " + std::to_string(M) + "), }";
+    const size_t preamble = 10;
+    size_t header_len = header.size() + 1;
+    size_t pad = (16 - ((preamble + header_len) % 16)) % 16;
+    header.append(pad, ' ');
+    header.push_back('\n');
+    header_len = header.size();
+    require(header_len <= 65535, "NPY v1.0 header too large.");
+
+    uint16_t hlen = static_cast<uint16_t>(header_len);
+    out.write(reinterpret_cast<const char*>(&hlen), sizeof(uint16_t));
+    out.write(header.data(), static_cast<std::streamsize>(header.size()));
+    require(out.good(), "Failed while writing npy header: " + path);
+    return preamble + header_len;
+}
+
+inline size_t create_npy_f32_2d(const std::string& path, int64_t N, int64_t M) {
+    require(N > 0 && M > 0, "create_npy_f32_2d: N and M must be > 0");
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    require(out.is_open(), "Cannot open for write: " + path);
+
+    const char magic[] = "\x93NUMPY";
+    out.write(magic, 6);
+    out.put(static_cast<char>(1));
+    out.put(static_cast<char>(0));
+
+    std::string header = "{'descr': '<f4', 'fortran_order': False, 'shape': (";
+    header += std::to_string(N) + ", " + std::to_string(M) + "), }";
+    const size_t preamble = 10;
+    size_t header_len = header.size() + 1;
+    size_t pad = (16 - ((preamble + header_len) % 16)) % 16;
+    header.append(pad, ' ');
+    header.push_back('\n');
+    header_len = header.size();
+    require(header_len <= 65535, "NPY v1.0 header too large.");
+
+    uint16_t hlen = static_cast<uint16_t>(header_len);
+    out.write(reinterpret_cast<const char*>(&hlen), sizeof(uint16_t));
+    out.write(header.data(), static_cast<std::streamsize>(header.size()));
+    require(out.good(), "Failed while writing npy header: " + path);
+    return preamble + header_len;
+}
+
+// 分块顺序把整份文件填成 sentinel（-1）。理论上 Step 4 会给每一行都写一次，
+// 这一步只是防御性的：如果某个点因为某种原因没有被写到（不应该发生，因为
+// 每个点必然会被分配到某个桶），它的行至少是有意义的 -1 padding，而不是
+// 文件空洞被操作系统清零后看起来像"邻居 0，距离 0"的脏数据。
+inline void prefill_npy_int64_2d(std::fstream& f, size_t header_bytes,
+                                 int64_t N, int64_t M, size_t chunk_bytes_budget) {
+    int64_t chunk_rows = std::max<int64_t>(
+        1, static_cast<int64_t>(chunk_bytes_budget / (static_cast<size_t>(M) * sizeof(int64_t))));
+    chunk_rows = std::min(chunk_rows, N);
+    std::vector<int64_t> buf(static_cast<size_t>(chunk_rows) * M, -1);
+
+    f.seekp(static_cast<std::streamoff>(header_bytes));
+    for (int64_t start = 0; start < N; start += chunk_rows) {
+        int64_t cur = std::min(chunk_rows, N - start);
+        f.write(reinterpret_cast<const char*>(buf.data()),
+               static_cast<std::streamsize>(cur * M * sizeof(int64_t)));
+        require(f.good(), "Failed prefilling npy payload");
+    }
+}
+
+inline void prefill_npy_f32_2d(std::fstream& f, size_t header_bytes,
+                               int64_t N, int64_t M, size_t chunk_bytes_budget) {
+    int64_t chunk_rows = std::max<int64_t>(
+        1, static_cast<int64_t>(chunk_bytes_budget / (static_cast<size_t>(M) * sizeof(float))));
+    chunk_rows = std::min(chunk_rows, N);
+    std::vector<float> buf(static_cast<size_t>(chunk_rows) * M,
+                           std::numeric_limits<float>::infinity());
+
+    f.seekp(static_cast<std::streamoff>(header_bytes));
+    for (int64_t start = 0; start < N; start += chunk_rows) {
+        int64_t cur = std::min(chunk_rows, N - start);
+        f.write(reinterpret_cast<const char*>(buf.data()),
+               static_cast<std::streamsize>(cur * M * sizeof(float)));
+        require(f.good(), "Failed prefilling npy payload");
+    }
+}
+
+inline void write_npy_row_int64(std::fstream& f, size_t header_bytes,
+                                int64_t row, int64_t M, const int64_t* data) {
+    f.seekp(static_cast<std::streamoff>(header_bytes) +
+           static_cast<std::streamoff>(row) * static_cast<std::streamoff>(M) * sizeof(int64_t));
+    f.write(reinterpret_cast<const char*>(data),
+           static_cast<std::streamsize>(M * sizeof(int64_t)));
+    require(f.good(), "Failed writing npy row " + std::to_string(row));
+}
+
+inline void write_npy_row_f32(std::fstream& f, size_t header_bytes,
+                              int64_t row, int64_t M, const float* data) {
+    f.seekp(static_cast<std::streamoff>(header_bytes) +
+           static_cast<std::streamoff>(row) * static_cast<std::streamoff>(M) * sizeof(float));
+    f.write(reinterpret_cast<const char*>(data),
+           static_cast<std::streamsize>(M * sizeof(float)));
+    require(f.good(), "Failed writing npy row " + std::to_string(row));
 }
 
 void save_distances_npy(const std::string& path,

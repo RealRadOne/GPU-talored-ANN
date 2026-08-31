@@ -1,13 +1,18 @@
 // reorder.cpp
-// 把数据集 + per-vector KNN 图按 bucket 重排成连续 ID，让 bucket b 占用
-// 连续 ID 区间 [offsets[b], offsets[b+1])。这样 optimize_chunked --method C
-// 的 chunk 边界就能对齐 bucket，几乎所有边都落在 chunk 内。
+// 把数据集 + per-vector KNN 图按 bucket 重排成连续 ID，让每个 bucket 占用一段
+// 连续 ID 区间。这样 optimize_chunked --method C/D 的 chunk 边界就能对齐 bucket，
+// 更多边落在 chunk 内 —— 但前提是"新 ID 空间里相邻的 bucket，在特征空间里也相
+// 邻"，这正是 --centroid-knn 要解决的：不给它时退化为原始 bucket 编号顺序（跟
+// centroid 生成顺序有关，没有空间局部性保证）；给了它，就用 DiskJoin 风格的
+// task ordering（见 bucket_order.hpp）算一个有空间局部性的 bucket 处理顺序。
 //
 // 输入（来自 bucket.cu 的输出目录）：
 //   bucket_index.bin           bucket 元信息 (n_buckets, offset, count)
 //   bucket_data.bin            每个 bucket 的原始 int32 全局 ID
 //   data.fbin / .u8bin / ...   原始数据集
 //   [vector_knn.bin]           可选，per-vector KNN 图
+//   [centroid_knn.bin]         可选（bucket.cu --reorder 时会写），centroid KNN
+//                              图，用于推导有空间局部性的 bucket 处理顺序
 //
 // 输出（写入指定输出目录）：
 //   data_reordered.<ext>       重排后的数据集（保留原始格式 / 元素类型）
@@ -32,11 +37,13 @@
 #include <cstdint>
 #include <filesystem>
 #include <cstring>
+#include <numeric>
 #include <omp.h>
 
 #include <boost/program_options.hpp>
 
 #include "load.hpp"
+#include "bucket_order.hpp"
 
 namespace po = boost::program_options;
 namespace fs = std::filesystem;
@@ -92,6 +99,34 @@ static std::vector<int32_t> read_bucket_data(const std::string& path, int64_t to
     if (!in.good())
         throw std::runtime_error("Failed to read bucket_data");
     return ids;
+}
+
+// centroid_knn.bin (written by bucket.cu when --reorder is set):
+//   int64_t  n_centroids
+//   int32_t  K
+//   uint32_t graph[n_centroids * K]   // row-major, bucket -> its K nearest buckets
+struct CentroidKnn {
+    int64_t n_centroids;
+    int32_t K;
+    std::vector<uint32_t> graph;
+};
+
+static CentroidKnn read_centroid_knn(const std::string& path) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in.is_open())
+        throw std::runtime_error("Cannot open centroid_knn: " + path);
+
+    CentroidKnn ck;
+    in.read(reinterpret_cast<char*>(&ck.n_centroids), sizeof(int64_t));
+    in.read(reinterpret_cast<char*>(&ck.K), sizeof(int32_t));
+    if (!in.good() || ck.n_centroids <= 0 || ck.K <= 0)
+        throw std::runtime_error("Invalid centroid_knn header");
+    ck.graph.resize(static_cast<size_t>(ck.n_centroids) * ck.K);
+    in.read(reinterpret_cast<char*>(ck.graph.data()),
+            static_cast<std::streamsize>(ck.graph.size() * sizeof(uint32_t)));
+    if (!in.good())
+        throw std::runtime_error("Failed to read centroid_knn payload");
+    return ck;
 }
 
 // vector_knn.bin: int64 N, int32 M, int32 graph[N*M]
@@ -157,6 +192,13 @@ int main(int argc, char** argv) {
                 "bucket_data.bin (from bucket.cu)")
             ("vector-knn,k",    po::value<std::string>()->default_value(""),
                 "vector_knn.bin (optional; will be remapped to new ID space)")
+            ("centroid-knn,c",  po::value<std::string>()->default_value(""),
+                "centroid_knn.bin (optional, from bucket.cu --reorder). When given, buckets "
+                "are laid out in a DiskJoin-style spatial processing order instead of raw "
+                "bucket-index order, so optimize_chunked --method C/D chunk boundaries "
+                "actually land on spatially coherent groups of buckets.")
+            ("order-window",    po::value<int32_t>()->default_value(0),
+                "Sliding-window size for --centroid-knn's bucket ordering (0 = auto: 4*K)")
             ("output-dir,o",    po::value<std::string>()->required(),
                 "Output directory");
 
@@ -169,6 +211,8 @@ int main(int argc, char** argv) {
         const std::string bidx_path  = vm["bucket-index"].as<std::string>();
         const std::string bdat_path  = vm["bucket-data"].as<std::string>();
         const std::string vknn_path  = vm["vector-knn"].as<std::string>();
+        const std::string cknn_path  = vm["centroid-knn"].as<std::string>();
+        const int32_t order_window_arg = vm["order-window"].as<int32_t>();
         const std::string out_dir    = vm["output-dir"].as<std::string>();
 
         fs::create_directories(out_dir);
@@ -194,16 +238,43 @@ int main(int argc, char** argv) {
         // 读所有 bucket 的原始 ID（按 bucket 顺序）
         auto bucket_data = read_bucket_data(bdat_path, total_in_buckets);
 
+        // bucket 处理顺序：给定 --centroid-knn 时，用 DiskJoin 风格 task ordering
+        // (bucket_order.hpp) 算一个让相邻 bucket 在特征空间也相邻的顺序；否则退化
+        // 为原始 bucket 编号顺序（旧行为，chunk 边界不保证贴合空间分布）。
+        std::vector<int32_t> bucket_process_order(n_buckets);
+        if (!cknn_path.empty()) {
+            std::cout << "  Loading centroid_knn from " << cknn_path << " ...\n";
+            auto ck = read_centroid_knn(cknn_path);
+            if (ck.n_centroids != n_buckets)
+                throw std::runtime_error("centroid_knn n_centroids (" +
+                    std::to_string(ck.n_centroids) + ") != bucket-index n_buckets (" +
+                    std::to_string(n_buckets) + ")");
+            int32_t order_window = (order_window_arg > 0)
+                ? order_window_arg
+                : std::max<int32_t>(4 * ck.K, 16);
+            bucket_process_order = bucket_order::compute_bucket_processing_order(
+                bucket_order::adjacency_from_flat_graph(ck.graph.data(), ck.n_centroids, ck.K),
+                order_window);
+            std::cout << "  Bucket processing order: DiskJoin task ordering (K=" << ck.K
+                      << ", window=" << order_window << ")\n";
+        } else {
+            std::iota(bucket_process_order.begin(), bucket_process_order.end(), 0);
+            std::cout << "  [Warn] --centroid-knn not given: falling back to raw bucket-index "
+                         "order (chunk boundaries won't be spatially aligned)\n";
+        }
+
         // 推导 perm / inverse_perm
-        // 新 ID 空间：bucket 0 [0, counts[0]) → bucket 1 [counts[0], counts[0]+counts[1]) → ...
+        // 新 ID 空间按 bucket_process_order 排列：
+        // bucket_process_order[0] 占 [0, counts[.]) → bucket_process_order[1] 占下一段 → ...
         std::vector<uint32_t> perm(N, 0xFFFFFFFFu);
         std::vector<uint32_t> inverse_perm(total_in_buckets);
         std::vector<uint32_t> offsets_new(n_buckets + 1, 0);
 
-        // bucket_data 在文件中是按 bucket 0,1,2,... 顺序紧凑排列的。
-        // bucket b 的 IDs 占 [bi.offsets[b]/4, bi.offsets[b]/4 + counts[b]) 这段
-        for (int64_t b = 0; b < n_buckets; ++b) {
-            uint32_t base_new = offsets_new[b];
+        // bucket_data 在文件中是按 bucket 0,1,2,... 顺序紧凑排列的，但我们按
+        // bucket_process_order 给每个 bucket 分配新 ID 区间。
+        for (int64_t pos = 0; pos < n_buckets; ++pos) {
+            int64_t b = bucket_process_order[pos];
+            uint32_t base_new = offsets_new[pos];
             int64_t  base_old = bi.offsets[b] / sizeof(int32_t);
             for (int32_t k = 0; k < bi.counts[b]; ++k) {
                 int32_t old_id = bucket_data[base_old + k];
@@ -217,7 +288,7 @@ int main(int argc, char** argv) {
                 perm[old_id] = new_id;
                 inverse_perm[new_id] = static_cast<uint32_t>(old_id);
             }
-            offsets_new[b + 1] = base_new + static_cast<uint32_t>(bi.counts[b]);
+            offsets_new[pos + 1] = base_new + static_cast<uint32_t>(bi.counts[b]);
         }
 
         // 检查未被分配的点（perm 仍是 sentinel）
