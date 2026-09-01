@@ -15,6 +15,7 @@
 
 // Boost
 #include <boost/program_options.hpp>
+#include <fmt/ostream.h>
 
 // CUDA
 #include <cuda_runtime.h>

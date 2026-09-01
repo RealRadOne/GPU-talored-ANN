@@ -18,6 +18,7 @@
 #include <chrono>
 #include <future>
 #include <memory>
+#include <fmt/ostream.h>
 
 // Boost
 #include <boost/program_options.hpp>
@@ -1406,7 +1407,6 @@ void build_centroid_knn_on_gpu(
     params.intermediate_graph_degree = static_cast<size_t>(1.5 * intermediate_graph_degree);
     params.max_iterations            = max_iterations;
     params.termination_threshold     = termination_threshold;
-    params.return_distances          = false;
 
     auto dataset = raft::make_host_matrix_view<const float, int64_t>(
         centroids_host.data(), n_centroids, D);
