@@ -25,6 +25,7 @@ def setup_dependencies():
 
     # 2. NVIDIA / RAPIDS header repositories
     repos = {
+        "/content/fmt": "https://github.com/fmtlib/fmt.git -b 10.2.1",
         "/content/raft": "https://github.com/rapidsai/raft.git -b branch-24.04",
         "/content/rmm": "https://github.com/rapidsai/rmm.git -b branch-24.04",
         "/content/cutlass": "https://github.com/NVIDIA/cutlass.git -b v3.5.0",
