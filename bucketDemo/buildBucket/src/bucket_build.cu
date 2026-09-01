@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <string>
 #include <filesystem>
+#include <fstream>
 #include <algorithm>
 #include <cmath>
 #include <numeric>
@@ -10,6 +11,7 @@
 #include <random>
 #include <limits>
 #include <iomanip>
+#include <unordered_set>
 
 // Boost
 #include <boost/program_options.hpp>
@@ -29,6 +31,7 @@
 #include "utils.hpp"
 #include "load.hpp"
 #include "bucket_build.cuh"
+#include "bucket_order.hpp"
 
 namespace po = boost::program_options;
 using namespace bucket;
@@ -90,6 +93,74 @@ inline void init_gpu_limit_if_needed(LoadConfig& config) {
         std::cout << "Auto-detected GPU memory: " << total_bytes / 1e9 << " GB total, "
                   << config.gpu_limit_bytes / 1e9 << " GB available\n";
     }
+}
+
+// ============== Format-aware chunked/sampled loading ==============
+// 统一处理 .fbin/.u8bin/.i8bin/.ibin 的分块顺序读取与按下标采样读取，
+// 使得质心生成和分桶都不需要把整份数据集常驻内存。
+
+inline std::string detect_ext(const std::string& path) {
+    size_t dot_pos = path.rfind('.');
+    return (dot_pos != std::string::npos) ? path.substr(dot_pos) : std::string();
+}
+
+inline void load_chunk_as_f32(const std::string& path, const std::string& ext,
+                              int64_t start, int64_t count,
+                              std::vector<float>& out, int32_t& D) {
+    if (ext == ".u8bin" || ext == ".i8bin") {
+        load::read_u8bin_chunk_to_f32(path, start, count, out, D);
+    } else if (ext == ".ibin") {
+        load::read_ibin_chunk_to_f32(path, start, count, out, D);
+    } else {
+        load::read_fbin_chunk(path, start, count, out, D);
+    }
+}
+
+inline void load_sampled_as_f32(const std::string& path, const std::string& ext,
+                                const std::vector<int64_t>& sorted_indices,
+                                std::vector<float>& out) {
+    int32_t N_tmp, D_tmp;
+    if (ext == ".u8bin" || ext == ".i8bin") {
+        std::vector<uint8_t> tmp;
+        load::read_bigann_raw_sampled<uint8_t>(path, sorted_indices, tmp, N_tmp, D_tmp);
+        out.resize(tmp.size());
+        std::copy(tmp.begin(), tmp.end(), out.begin());
+    } else if (ext == ".ibin") {
+        std::vector<int32_t> tmp;
+        load::read_bigann_raw_sampled<int32_t>(path, sorted_indices, tmp, N_tmp, D_tmp);
+        out.resize(tmp.size());
+        std::copy(tmp.begin(), tmp.end(), out.begin());
+    } else {
+        load::read_fbin_sampled(path, sorted_indices, out, N_tmp, D_tmp);
+    }
+}
+
+/**
+ * A bucket's members loaded on demand: global ids plus their raw vectors
+ * (contiguous, ids[i] <-> vecs[i*D .. (i+1)*D)). This is a transient,
+ * short-lived object - only bucket_ids[b] (just the int32 ids, see
+ * assign_to_buckets_chunked) is kept resident for the life of the program;
+ * a Bucket's vecs are materialized on demand (see load_bucket_vectors) by
+ * reading straight from the original dataset file, and discarded once used.
+ */
+struct Bucket {
+    std::vector<int32_t> ids;
+    std::vector<float> vecs;
+};
+
+/**
+ * Materialize one bucket's vectors on demand by reading them straight out of
+ * the original dataset file (ids must already be known, e.g. from
+ * bucket_ids[b] built by assign_to_buckets_chunked). Nothing here is cached
+ * or kept beyond the returned Bucket's lifetime.
+ */
+inline Bucket load_bucket_vectors(const std::vector<int32_t>& ids,
+                                  const std::string& data_path, const std::string& ext) {
+    Bucket bk;
+    bk.ids = ids;  // assign_to_buckets_chunked builds these in ascending global-id order already
+    std::vector<int64_t> ids64(ids.begin(), ids.end());
+    load_sampled_as_f32(data_path, ext, ids64, bk.vecs);
+    return bk;
 }
 
 /**
@@ -926,27 +997,30 @@ refine_centers_kmeans(const std::vector<float>& X, int N, int D,
  */
 std::pair<std::vector<int64_t>, std::vector<float>>
 prepare_and_kmeans_pp_gpu(
-    const std::vector<float>& X_full,
-    int64_t N, int D,
+    const std::string& data_path, const std::string& ext,
+    int64_t N_full, int D,
     const LoadConfig& config,
     const MemoryEstimate& mem_est) {
 
     std::cout << "[GPU KMeans++ Centroid Generation]\n";
 
-    // Step 1: Sample data if needed
-    std::vector<float> X_work = X_full;
+    // Step 1: Load only what's needed directly from disk (full dataset only
+    // when it actually fits the GPU budget; otherwise just the sampled rows)
+    std::vector<float> X_work;
     std::vector<int64_t> sampled_indices;
+    int64_t N = N_full;
 
     if (!mem_est.fits_in_gpu) {
-        std::cout << "  Sampling " << (config.sample_rate * 100) << "% of data...\n";
-        auto [sampled_data, indices] = sample_data(
-            X_full, N, D, config.sample_rate, config.seed);
-        X_work = sampled_data;
-        sampled_indices = indices;
-        N = mem_est.n_sampled;
+        std::cout << "  Sampling " << (config.sample_rate * 100) << "% of data from disk...\n";
+        sampled_indices = sample_without_replacement(N_full, mem_est.n_sampled, config.seed);
+        std::sort(sampled_indices.begin(), sampled_indices.end());  // sequential reads are faster
+        load_sampled_as_f32(data_path, ext, sampled_indices, X_work);
+        N = static_cast<int64_t>(sampled_indices.size());
     } else {
-        // Full dataset, create identity mapping
-        sampled_indices.resize(N);
+        std::cout << "  Loading full dataset (fits in GPU budget)...\n";
+        int32_t D_loaded;
+        load_chunk_as_f32(data_path, ext, 0, N_full, X_work, D_loaded);
+        sampled_indices.resize(N_full);
         std::iota(sampled_indices.begin(), sampled_indices.end(), 0LL);
     }
 
@@ -1147,16 +1221,75 @@ build_buckets(const std::vector<float>& X, int N, int D,
 }
 
 /**
- * Find k nearest buckets by center distance
+ * Assign the FULL dataset to the nearest centroid, reading it in sequential
+ * chunks straight from disk instead of requiring it all resident in CPU RAM
+ * up front. Only each point's global id is kept (appended to its bucket's
+ * id list) - the vector itself is dropped once the chunk is processed.
+ * Step 4 re-reads whichever vectors it needs later, on demand, straight
+ * from the original dataset file (see load_bucket_vectors).
+ *
+ * Peak resident memory here is the transient chunk buffer (bounded by
+ * cpu_limit_bytes) plus the id lists themselves, which total N*4 bytes
+ * across all buckets - independent of D. For typical embedding dimensions
+ * (D=100-1000+) that's a 100-1000x smaller footprint than holding the full
+ * N*D*4-byte dataset, which is what actually made Step 1 (loading) and
+ * Step 4 (neighbor search) memory-heavy before. It is not literally O(1)
+ * in N: a dataset large enough that even N*4 bytes of ids doesn't fit would
+ * need a further disk-spilled (two-level radix bucketing) design, which is
+ * a fair amount more moving parts for a regime this project isn't in yet.
+ */
+std::vector<std::vector<int32_t>>
+assign_to_buckets_chunked(const std::string& data_path, const std::string& ext,
+                          int64_t N, int D,
+                          const std::vector<float>& centroids, int B,
+                          size_t cpu_limit_bytes) {
+    std::vector<std::vector<int32_t>> bucket_ids(B);
+
+    size_t bytes_per_row = static_cast<size_t>(D) * sizeof(float);
+    int64_t chunk_rows = static_cast<int64_t>(
+        std::max<size_t>(1, (cpu_limit_bytes / 4) / bytes_per_row));
+    chunk_rows = std::max<int64_t>(1, std::min(chunk_rows, N));
+
+    std::cout << "  [assign] Chunked assignment: chunk_rows=" << chunk_rows
+              << " (~" << (chunk_rows * bytes_per_row / 1e6) << " MB/chunk)\n";
+
+    for (int64_t start = 0; start < N; start += chunk_rows) {
+        int64_t cur = std::min(chunk_rows, N - start);
+
+        std::vector<float> X_chunk;
+        int32_t D_chunk;
+        load_chunk_as_f32(data_path, ext, start, cur, X_chunk, D_chunk);
+
+        auto assign = pairwise_l2_min_assign_cpu(X_chunk, static_cast<int>(cur), D, centroids, B);
+        // X_chunk is discarded at the end of this iteration - only the ids survive.
+
+        for (int64_t i = 0; i < cur; ++i) {
+            int64_t b = assign[i];
+            if (b < 0 || b >= B) continue;
+            bucket_ids[b].push_back(static_cast<int32_t>(start + i));
+        }
+
+        std::cout << "      Processed " << (start + cur) << "/" << N << " points\n";
+    }
+
+    std::vector<int> counts(B);
+    for (int b = 0; b < B; ++b) counts[b] = static_cast<int>(bucket_ids[b].size());
+    int minc = *std::min_element(counts.begin(), counts.end());
+    int maxc = *std::max_element(counts.begin(), counts.end());
+    double avg = static_cast<double>(N) / B;
+    std::cout << "  [bucket] min=" << minc << "  max=" << maxc << "  avg=" << avg << "\n";
+
+    return bucket_ids;
+}
+
+/**
+ * CPU brute-force fallback for k_nearest_buckets: one exact B x B distance
+ * pass via topk_from_A_to_B_cpu, then self-loop removal.
  */
 std::vector<std::vector<int64_t>>
-k_nearest_buckets(const std::vector<float>& centers, int B, int D,
-                  int k) {
-    std::cout << "  [KNB] Finding k nearest buckets using CPU (OpenMP) ...\n";
-    // Use CPU version - more efficient for this size due to better sorting
+k_nearest_buckets_cpu(const std::vector<float>& centers, int B, int D, int k) {
     auto [indices, dists] = topk_from_A_to_B_cpu(centers, B, D, centers, B, k + 1);
 
-    // Remove self-loops
     std::vector<std::vector<int64_t>> result(B);
     for (int b = 0; b < B; ++b) {
         std::vector<int64_t> neighbors;
@@ -1164,90 +1297,244 @@ k_nearest_buckets(const std::vector<float>& centers, int B, int D,
             int64_t neighbor = indices[b * (k + 1) + j];
             if (neighbor != b && neighbor >= 0) {
                 neighbors.push_back(neighbor);
-                if (neighbors.size() >= k) break;
+                if (static_cast<int>(neighbors.size()) >= k) break;
             }
         }
         result[b] = neighbors;
+    }
+    return result;
+}
+
+/**
+ * Find k nearest buckets by center distance - GPU, batched over rows.
+ *
+ * Centroids (B x D) are small and stay fully resident on the GPU for the
+ * whole call, but the B x B distance matrix is not computed in one shot:
+ * it's built in row-batches sized to keep each batch's distance matrix
+ * under ~2GB (same batching pattern as pairwise_l2_min_assign_gpu). That
+ * avoids the single dense-B*B-float allocation that made the naive GPU path
+ * (topk_from_A_to_B_gpu) infeasible for large B, while doing the O(B^2)
+ * distance work at GPU throughput instead of the CPU brute force (which,
+ * for large B, was both O(B^2) compute AND heavy on allocation churn from
+ * a per-row candidate vector).
+ *
+ * find_topk_gpu's kernel keeps its running top-k in a fixed 256-slot stack
+ * array, so this only takes the GPU path when k+1 <= 256; otherwise it uses
+ * the CPU version, which has no such limit.
+ */
+std::vector<std::vector<int64_t>>
+k_nearest_buckets(const std::vector<float>& centers, int B, int D, int k) {
+    if (k + 1 > 256) {
+        std::cout << "  [KNB] k+1=" << (k + 1)
+                  << " exceeds find_topk_gpu's fixed 256-slot buffer; using CPU.\n";
+        return k_nearest_buckets_cpu(centers, B, D, k);
+    }
+
+    std::vector<std::vector<int64_t>> result(B);
+
+    try {
+        std::cout << "  [KNB] Finding k nearest buckets using GPU (batched) ...\n";
+
+        // Keep each batch's [batch_size x B] distance matrix under ~2GB.
+        long long max_distance_bytes = 2000000000LL;
+        long long calc = max_distance_bytes / (static_cast<long long>(B) * sizeof(float));
+        int batch_size = std::max(1, static_cast<int>(std::min<long long>(calc, B)));
+
+        GPUBuffer<float> C_gpu(static_cast<int64_t>(B) * D);
+        C_gpu.copy_from_host(centers.data(), static_cast<size_t>(B) * D);
+
+        for (int start = 0; start < B; start += batch_size) {
+            int cur = std::min(batch_size, B - start);
+
+            GPUBuffer<float> Q_gpu(static_cast<int64_t>(cur) * D);
+            GPUBuffer<float> distances_gpu(static_cast<int64_t>(cur) * B);
+            GPUBuffer<int64_t> indices_gpu(static_cast<int64_t>(cur) * (k + 1));
+            GPUBuffer<float> dists_gpu(static_cast<int64_t>(cur) * (k + 1));
+
+            Q_gpu.copy_from_host(centers.data() + static_cast<size_t>(start) * D,
+                                 static_cast<size_t>(cur) * D);
+
+            compute_distances_gpu(Q_gpu, cur, D, C_gpu, B, distances_gpu);
+            find_topk_gpu(distances_gpu, cur, B, k + 1, indices_gpu, dists_gpu);
+
+            std::vector<int64_t> h_indices(static_cast<size_t>(cur) * (k + 1));
+            indices_gpu.copy_to_host(h_indices.data(), static_cast<size_t>(cur) * (k + 1));
+            CUDA_CHECK(cudaDeviceSynchronize());
+
+            for (int i = 0; i < cur; ++i) {
+                int b = start + i;
+                std::vector<int64_t> neighbors;
+                for (int j = 0; j < k + 1; ++j) {
+                    int64_t neighbor = h_indices[i * (k + 1) + j];
+                    if (neighbor != b && neighbor >= 0) {
+                        neighbors.push_back(neighbor);
+                        if (static_cast<int>(neighbors.size()) >= k) break;
+                    }
+                }
+                result[b] = neighbors;
+            }
+
+            std::cout << "      Processed " << (start + cur) << "/" << B << " buckets\n";
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "GPU k-nearest-buckets computation failed: " << e.what() << "\n";
+        std::cerr << "Falling back to CPU...\n";
+        return k_nearest_buckets_cpu(centers, B, D, k);
     }
 
     return result;
 }
 
+/**
+ * Bundles the two open output files (neighbors.npy, neighbors_dist.npy) so
+ * results can be streamed out row-by-row as they're computed, instead of
+ * accumulating N*m-sized arrays in memory. Files are pre-created (header +
+ * sentinel-filled) by the caller in main(); this just seeks and writes one
+ * row at a time.
+ */
+struct ResultWriter {
+    std::fstream* neighbors_out;
+    size_t neighbors_header;
+    std::fstream* dists_out;
+    size_t dists_header;
+    int m;
+
+    void write_row(int64_t qi, const std::vector<std::pair<float, int64_t>>& neighbors) const {
+        std::vector<int64_t> row_n(m, -1);
+        std::vector<float> row_d(m, std::numeric_limits<float>::infinity());
+        for (size_t j = 0; j < neighbors.size() && static_cast<int>(j) < m; ++j) {
+            row_n[j] = neighbors[j].second;
+            row_d[j] = neighbors[j].first;
+        }
+        load::write_npy_row_int64(*neighbors_out, neighbors_header, qi, m, row_n.data());
+        load::write_npy_row_f32(*dists_out, dists_header, qi, m, row_d.data());
+    }
+};
+
 // Forward declaration
-std::pair<std::vector<int64_t>, std::vector<float>>
-neighbors_within_knn_buckets(const std::vector<float>& X, int N, int D,
-                             const std::vector<std::vector<int32_t>>& buckets,
-                             const std::vector<std::vector<int64_t>>& knb,
-                             int m, int B);
+void neighbors_within_knn_buckets(int64_t N, int D,
+                                  const std::vector<std::vector<int32_t>>& bucket_ids,
+                                  const std::string& data_path, const std::string& ext,
+                                  const std::vector<std::vector<int64_t>>& knb,
+                                  int m, int B, const ResultWriter& writer,
+                                  const std::vector<int32_t>& order, size_t cache_bytes);
 
 /**
- * Find m nearest neighbors within bucket's k nearest buckets - GPU Tensor Core version
+ * Byte footprint of a materialized Bucket, for sizing the Belady cache below.
  */
-std::pair<std::vector<int64_t>, std::vector<float>>
-neighbors_within_knn_buckets_gpu(const std::vector<float>& X, int N, int D,
-                                 const std::vector<std::vector<int32_t>>& buckets,
-                                 const std::vector<std::vector<int64_t>>& knb,
-                                 int m, int B) {
-    std::vector<int64_t> all_neighbors(static_cast<int64_t>(N) * m, -1);
-    std::vector<float> all_dists(static_cast<int64_t>(N) * m, std::numeric_limits<float>::infinity());
+inline size_t bucket_bytes(const Bucket& bk) {
+    return bk.vecs.size() * sizeof(float) + bk.ids.size() * sizeof(int32_t);
+}
+
+/**
+ * Gather (deduped) candidate ids/vectors for bucket b and its k nearest
+ * buckets, routing every per-bucket load through `cache` (a
+ * bucket_order::BeladyBucketCache<Bucket>) instead of reading straight from
+ * disk each time. Consecutive positions in the processing order tend to
+ * share most of their neighbor buckets (that's what
+ * compute_bucket_processing_order optimizes for), so most of these end up as
+ * cache hits rather than fresh disk reads.
+ *
+ * Buckets partition all N points, so members never truly overlap across
+ * buckets; the `seen` dedup is defensive, not load-bearing (mirrors the
+ * pre-cache version's sort+unique pass).
+ */
+template <typename Cache>
+inline Bucket gather_candidates_cached(const std::vector<std::vector<int32_t>>& bucket_ids,
+                                       const std::string& data_path, const std::string& ext,
+                                       int32_t pos, int b,
+                                       const std::vector<int64_t>& neighbor_buckets,
+                                       Cache& cache) {
+    Bucket merged;
+    std::unordered_set<int32_t> seen;
+
+    auto loader = [&](int32_t id) {
+        return load_bucket_vectors(bucket_ids[id], data_path, ext);
+    };
+    auto append = [&](int32_t id) {
+        const Bucket& src = cache.get(pos, id, loader);
+        if (src.ids.empty()) return;
+        int Dloc = static_cast<int>(src.vecs.size() / src.ids.size());
+        for (size_t i = 0; i < src.ids.size(); ++i) {
+            if (!seen.insert(src.ids[i]).second) continue;
+            merged.ids.push_back(src.ids[i]);
+            merged.vecs.insert(merged.vecs.end(),
+                               src.vecs.begin() + i * Dloc, src.vecs.begin() + (i + 1) * Dloc);
+        }
+    };
+
+    append(static_cast<int32_t>(b));
+    for (int64_t nb : neighbor_buckets) append(static_cast<int32_t>(nb));
+
+    return merged;
+}
+
+/**
+ * Find m nearest neighbors within bucket's k nearest buckets - GPU Tensor Core version.
+ * Out-of-core on both ends: only bucket_ids[b] (int32 ids, N*4 bytes total)
+ * is resident on the input side; bucket vectors are loaded on demand through
+ * a Belady-optimal cache (see bucket_order.hpp) sized to `cache_bytes`,
+ * keyed on the bucket processing `order` (a DiskJoin-style task ordering
+ * over the k-nearest-bucket graph `knb` - see compute_bucket_processing_order
+ * in main()) so that consecutive buckets share most of their k-nearest
+ * neighbor buckets and mostly hit cache instead of re-reading from disk. On
+ * the output side, each query's row is written straight to disk via
+ * `writer` as soon as it's computed, so there's no N*m-sized result array
+ * either.
+ */
+void neighbors_within_knn_buckets_gpu(int64_t N, int D,
+                                      const std::vector<std::vector<int32_t>>& bucket_ids,
+                                      const std::string& data_path, const std::string& ext,
+                                      const std::vector<std::vector<int64_t>>& knb,
+                                      int m, int B, const ResultWriter& writer,
+                                      const std::vector<int32_t>& order, size_t cache_bytes) {
+    auto adj = bucket_order::adjacency_from_nested(knb);
+    auto future_access = bucket_order::compute_future_access_lists(order, adj);
+    bucket_order::BeladyBucketCache<Bucket> cache(std::move(future_access), cache_bytes, bucket_bytes);
 
     try {
         int processed_buckets = 0;
-        for (int b = 0; b < B; ++b) {
-            const auto& q_indices = buckets[b];
-            if (q_indices.empty()) continue;
+        for (int32_t pos = 0; pos < B; ++pos) {
+            int b = order[pos];
+            if (bucket_ids[b].empty()) continue;
 
             if (processed_buckets % 100 == 0) {
-                std::cout << "      [Progress] Processed " << processed_buckets << "/" << B << " buckets\n";
+                std::cout << "      [Progress] Processed " << processed_buckets << "/" << B
+                          << " buckets (cache: " << cache.resident_count() << " buckets, "
+                          << cache.used_bytes() / 1e6 << " MB)\n";
             }
             processed_buckets++;
 
-            // Gather candidate indices from b and its k nearest buckets
-            std::vector<int32_t> cand_indices;
-            for (int nb : knb[b]) {
-                cand_indices.insert(cand_indices.end(), buckets[nb].begin(), buckets[nb].end());
-            }
-            cand_indices.insert(cand_indices.end(), q_indices.begin(), q_indices.end());
+            // Query = this bucket's own vectors, via cache (copied out - the
+            // gather_candidates_cached call below issues further cache.get()
+            // calls that may evict it otherwise, see BeladyBucketCache's
+            // usage contract in bucket_order.hpp).
+            Bucket query = cache.get(pos, static_cast<int32_t>(b), [&](int32_t id) {
+                return load_bucket_vectors(bucket_ids[id], data_path, ext);
+            });
+            // Candidates = this bucket + its k nearest buckets, deduped, via cache
+            Bucket cand = gather_candidates_cached(bucket_ids, data_path, ext, pos, b, knb[b], cache);
+            if (cand.ids.empty()) continue;
 
-            // Remove duplicates
-            std::sort(cand_indices.begin(), cand_indices.end());
-            cand_indices.erase(std::unique(cand_indices.begin(), cand_indices.end()), cand_indices.end());
-
-            if (cand_indices.empty()) continue;
-
-            // Extract query and candidate data
-            int nq = q_indices.size();
-            int nc = cand_indices.size();
+            const auto& q_ids = query.ids;
+            const auto& cand_ids = cand.ids;
+            int nq = static_cast<int>(q_ids.size());
+            int nc = static_cast<int>(cand_ids.size());
+            const float* Q = query.vecs.data();
 
             // For small buckets, fall back to CPU
-            if (nq * nc < 100000) {
-                std::vector<float> Q(nq * D), Cand(nc * D);
-
-                #pragma omp parallel for collapse(2) schedule(static)
-                for (int i = 0; i < nq; ++i) {
-                    for (int d = 0; d < D; ++d) {
-                        Q[i * D + d] = X[q_indices[i] * D + d];
-                    }
-                }
-
-                #pragma omp parallel for collapse(2) schedule(static)
-                for (int i = 0; i < nc; ++i) {
-                    for (int d = 0; d < D; ++d) {
-                        Cand[i * D + d] = X[cand_indices[i] * D + d];
-                    }
-                }
-
-                auto [indices, dists] = topk_from_A_to_B_gpu(Q, nq, D, Cand, nc, m + 1);
+            if (static_cast<int64_t>(nq) * nc < 100000) {
+                auto [indices, dists] = topk_from_A_to_B_gpu(query.vecs, nq, D, cand.vecs, nc, m + 1);
 
                 // Map local indices to global and filter self
                 for (int i = 0; i < nq; ++i) {
-                    int qi = q_indices[i];
+                    int qi = q_ids[i];
                     std::vector<std::pair<float, int64_t>> neighbors;
 
                     for (int j = 0; j < m + 1; ++j) {
                         int64_t local_idx = indices[i * (m + 1) + j];
                         if (local_idx < 0 || local_idx >= nc) continue;
-                        int64_t global_idx = cand_indices[local_idx];
+                        int64_t global_idx = cand_ids[local_idx];
                         float dist = dists[i * (m + 1) + j];
 
                         if (global_idx != qi) {  // Skip self
@@ -1256,19 +1543,12 @@ neighbors_within_knn_buckets_gpu(const std::vector<float>& X, int N, int D,
                         if (neighbors.size() >= m) break;
                     }
 
-                    // Fill result
-                    for (size_t j = 0; j < neighbors.size(); ++j) {
-                        all_neighbors[qi * m + j] = neighbors[j].second;
-                        all_dists[qi * m + j] = neighbors[j].first;
-                    }
+                    writer.write_row(qi, neighbors);
                 }
                 continue;
             }
 
             // GPU path for larger buckets
-            // std::cout << "    [GPU TC] Bucket " << b << ": nq=" << nq << " nc=" << nc
-            //           << " size=" << (nq * nc * 4 / 1e6) << "MB\n";
-
             // Allocate GPU buffers
             GPUBuffer<float> Q_gpu(static_cast<int64_t>(nq) * D);
             GPUBuffer<float> Cand_gpu(static_cast<int64_t>(nc) * D);
@@ -1276,25 +1556,8 @@ neighbors_within_knn_buckets_gpu(const std::vector<float>& X, int N, int D,
             GPUBuffer<int64_t> indices_gpu(static_cast<int64_t>(nq) * (m + 1));
             GPUBuffer<float> dists_gpu(static_cast<int64_t>(nq) * (m + 1));
 
-            // Copy query and candidate data to GPU
-            std::vector<float> Q(nq * D), Cand(nc * D);
-
-            #pragma omp parallel for collapse(2) schedule(static)
-            for (int i = 0; i < nq; ++i) {
-                for (int d = 0; d < D; ++d) {
-                    Q[i * D + d] = X[q_indices[i] * D + d];
-                }
-            }
-
-            #pragma omp parallel for collapse(2) schedule(static)
-            for (int i = 0; i < nc; ++i) {
-                for (int d = 0; d < D; ++d) {
-                    Cand[i * D + d] = X[cand_indices[i] * D + d];
-                }
-            }
-
-            Q_gpu.copy_from_host(Q.data(), nq * D);
-            Cand_gpu.copy_from_host(Cand.data(), nc * D);
+            Q_gpu.copy_from_host(Q, static_cast<size_t>(nq) * D);
+            Cand_gpu.copy_from_host(cand.vecs.data(), cand.vecs.size());
 
             // Compute distances using tensor cores
             compute_distances_gpu(Q_gpu, nq, D, Cand_gpu, nc, distances_gpu);
@@ -1313,13 +1576,13 @@ neighbors_within_knn_buckets_gpu(const std::vector<float>& X, int N, int D,
 
             // Map local indices to global and filter self
             for (int i = 0; i < nq; ++i) {
-                int qi = q_indices[i];
+                int qi = q_ids[i];
                 std::vector<std::pair<float, int64_t>> neighbors;
 
                 for (int j = 0; j < m + 1; ++j) {
                     int64_t local_idx = h_indices[i * (m + 1) + j];
                     if (local_idx < 0 || local_idx >= nc) continue;
-                    int64_t global_idx = cand_indices[local_idx];
+                    int64_t global_idx = cand_ids[local_idx];
                     float dist = h_dists[i * (m + 1) + j];
 
                     if (global_idx != qi) {  // Skip self
@@ -1328,81 +1591,59 @@ neighbors_within_knn_buckets_gpu(const std::vector<float>& X, int N, int D,
                     if (neighbors.size() >= m) break;
                 }
 
-                // Fill result
-                for (size_t j = 0; j < neighbors.size(); ++j) {
-                    all_neighbors[qi * m + j] = neighbors[j].second;
-                    all_dists[qi * m + j] = neighbors[j].first;
-                }
+                writer.write_row(qi, neighbors);
             }
         }
     } catch (const std::exception& e) {
         std::cerr << "GPU tensor core computation failed: " << e.what() << "\n";
         std::cerr << "Falling back to CPU version...\n";
-        return neighbors_within_knn_buckets(X, N, D, buckets, knb, m, B);
+        neighbors_within_knn_buckets(N, D, bucket_ids, data_path, ext, knb, m, B, writer,
+                                     order, cache_bytes);
     }
-
-    return {all_neighbors, all_dists};
 }
 
 /**
- * Find m nearest neighbors within bucket's k nearest buckets
+ * Find m nearest neighbors within bucket's k nearest buckets - CPU version.
+ * Same out-of-core loading/writing strategy as the GPU version above,
+ * including the processing order + Belady cache.
  */
-std::pair<std::vector<int64_t>, std::vector<float>>
-neighbors_within_knn_buckets(const std::vector<float>& X, int N, int D,
-                             const std::vector<std::vector<int32_t>>& buckets,
-                             const std::vector<std::vector<int64_t>>& knb,
-                             int m, int B) {
-    std::vector<int64_t> all_neighbors(static_cast<int64_t>(N) * m, -1);
-    std::vector<float> all_dists(static_cast<int64_t>(N) * m, std::numeric_limits<float>::infinity());
+void neighbors_within_knn_buckets(int64_t N, int D,
+                                  const std::vector<std::vector<int32_t>>& bucket_ids,
+                                  const std::string& data_path, const std::string& ext,
+                                  const std::vector<std::vector<int64_t>>& knb,
+                                  int m, int B, const ResultWriter& writer,
+                                  const std::vector<int32_t>& order, size_t cache_bytes) {
+    auto adj = bucket_order::adjacency_from_nested(knb);
+    auto future_access = bucket_order::compute_future_access_lists(order, adj);
+    bucket_order::BeladyBucketCache<Bucket> cache(std::move(future_access), cache_bytes, bucket_bytes);
 
-    for (int b = 0; b < B; ++b) {
-        const auto& q_indices = buckets[b];
-        if (q_indices.empty()) continue;
+    for (int32_t pos = 0; pos < B; ++pos) {
+        int b = order[pos];
+        if (bucket_ids[b].empty()) continue;
 
-        // Gather candidate indices from b and its k nearest buckets
-        std::vector<int32_t> cand_indices;
-        for (int nb : knb[b]) {
-            cand_indices.insert(cand_indices.end(), buckets[nb].begin(), buckets[nb].end());
-        }
-        cand_indices.insert(cand_indices.end(), q_indices.begin(), q_indices.end());
+        Bucket query = cache.get(pos, static_cast<int32_t>(b), [&](int32_t id) {
+            return load_bucket_vectors(bucket_ids[id], data_path, ext);
+        });
+        Bucket cand = gather_candidates_cached(bucket_ids, data_path, ext, pos, b, knb[b], cache);
+        if (cand.ids.empty()) continue;
 
-        // Remove duplicates
-        std::sort(cand_indices.begin(), cand_indices.end());
-        cand_indices.erase(std::unique(cand_indices.begin(), cand_indices.end()), cand_indices.end());
-
-        if (cand_indices.empty()) continue;
-
-        // Extract query and candidate data
-        int nq = q_indices.size();
-        int nc = cand_indices.size();
-        std::vector<float> Q(nq * D), Cand(nc * D);
-
-        #pragma omp parallel for collapse(2) schedule(static)
-        for (int i = 0; i < nq; ++i) {
-            for (int d = 0; d < D; ++d) {
-                Q[i * D + d] = X[q_indices[i] * D + d];
-            }
-        }
-
-        #pragma omp parallel for collapse(2) schedule(static)
-        for (int i = 0; i < nc; ++i) {
-            for (int d = 0; d < D; ++d) {
-                Cand[i * D + d] = X[cand_indices[i] * D + d];
-            }
-        }
+        const auto& q_ids = query.ids;
+        const auto& cand_ids = cand.ids;
+        int nq = static_cast<int>(q_ids.size());
+        int nc = static_cast<int>(cand_ids.size());
 
         // Find m+1 nearest neighbors (to filter self-loops)
-        auto [indices, dists] = topk_from_A_to_B_cpu(Q, nq, D, Cand, nc, m + 1);
+        auto [indices, dists] = topk_from_A_to_B_cpu(query.vecs, nq, D, cand.vecs, nc, m + 1);
 
         // Map local indices to global and filter self
         for (int i = 0; i < nq; ++i) {
-            int qi = q_indices[i];
+            int qi = q_ids[i];
             std::vector<std::pair<float, int64_t>> neighbors;
 
             for (int j = 0; j < m + 1; ++j) {
                 int64_t local_idx = indices[i * (m + 1) + j];
                 if (local_idx < 0 || local_idx >= nc) continue;
-                int64_t global_idx = cand_indices[local_idx];
+                int64_t global_idx = cand_ids[local_idx];
                 float dist = dists[i * (m + 1) + j];
 
                 if (global_idx != qi) {  // Skip self
@@ -1411,15 +1652,9 @@ neighbors_within_knn_buckets(const std::vector<float>& X, int N, int D,
                 if (neighbors.size() >= m) break;
             }
 
-            // Fill result
-            for (size_t j = 0; j < neighbors.size(); ++j) {
-                all_neighbors[qi * m + j] = neighbors[j].second;
-                all_dists[qi * m + j] = neighbors[j].first;
-            }
+            writer.write_row(qi, neighbors);
         }
     }
-
-    return {all_neighbors, all_dists};
 }
 
 // ============== Main ==============
@@ -1456,7 +1691,13 @@ int main(int argc, char** argv) {
         ("pq-train-fraction", po::value<float>()->default_value(0.05f),
          "PQ training data fraction [0, 1] (default 0.05 = 5%)")
         ("pq-train-max-rows", po::value<uint32_t>()->default_value(65536),
-         "PQ training data row limit (default 65536)");
+         "PQ training data row limit (default 65536)")
+        // Bucket processing order (DiskJoin-style task ordering, see
+        // bucket_order.hpp) for Step 4's load order + cache.
+        ("order-window", po::value<int32_t>()->default_value(0),
+         "Sliding-window size for bucket processing order (0 = auto: 4*k)")
+        ("cache-mb", po::value<size_t>()->default_value(0),
+         "Bucket vector cache budget in MB for Step 4 (0 = auto: cpu-limit/2)");
 
     po::variables_map vm;
     try {
@@ -1482,6 +1723,8 @@ int main(int argc, char** argv) {
     int balance_slack = vm["balance-slack"].as<int>();
     std::string init_method = vm["init-method"].as<std::string>();
     int t = vm["t"].as<int>();
+    int32_t order_window_arg = vm["order-window"].as<int32_t>();
+    size_t cache_mb_arg = vm["cache-mb"].as<size_t>();
 
     // Parse data loading parameters
     LoadConfig load_config;
@@ -1507,30 +1750,13 @@ int main(int argc, char** argv) {
     // Create output directory
     std::filesystem::create_directories(out_dir);
 
-    // Load data
-    std::cout << "[1] Loading data from " << data_path << " ...\n";
-    int32_t N, D;
-    std::vector<float> X;
-
-    // Detect file format by extension
-    std::string ext;
-    size_t dot_pos = data_path.rfind('.');
-    if (dot_pos != std::string::npos) {
-        ext = data_path.substr(dot_pos);
-    }
-
-    if (ext == ".u8bin" || ext == ".i8bin") {
-        load::read_u8bin_to_f32(data_path, X, N, D);
-    } else if (ext == ".ibin") {
-        std::vector<int32_t> X_int;
-        load::read_ibin_i32(data_path, X_int, N, D);
-        X.resize(X_int.size());
-        std::copy(X_int.begin(), X_int.end(), X.begin());
-    } else {
-        // Default to .fbin/.bin
-        load::read_fbin_f32(data_path, X, N, D);
-    }
-    std::cout << "Loaded X: shape=(" << N << ", " << D << ")\n\n";
+    // Read just the header - the full dataset is never loaded into one
+    // resident array; each stage below pulls only the rows it needs,
+    // straight from disk.
+    std::cout << "[1] Reading header from " << data_path << " ...\n";
+    auto [N, D] = load::read_fbin_header(data_path);
+    std::string ext = detect_ext(data_path);
+    std::cout << "Dataset shape=(" << N << ", " << D << ")\n\n";
 
     // Estimate memory requirements
     std::cout << "[1.5] Estimating memory requirements...\n";
@@ -1539,42 +1765,75 @@ int main(int argc, char** argv) {
     print_memory_estimate(mem_est);
 
     // Generate centroids using GPU KMeans++ with sampling and optional PQ
+    // (this reads only the sampled rows it needs from disk, or the full
+    // file only when mem_est says it actually fits the GPU budget)
     std::cout << "[1.7] Generating centroids with GPU KMeans++...\n";
     auto [centroid_indices, centroids] = prepare_and_kmeans_pp_gpu(
-        X, N, D, load_config, mem_est);
+        data_path, ext, N, D, load_config, mem_est);
 
     // Use generated centroids for bucket building instead of random initialization
     int B = centroids.size() / D;
     std::cout << "Using " << B << " centroids from GPU KMeans++ initialization\n\n";
 
-    // Create bucket structure from centroids
-    std::vector<std::vector<int32_t>> buckets(B);
-
-    // Assign all points to nearest centroid
-    auto assignments = pairwise_l2_min_assign_cpu(X, N, D, centroids, B);
-    for (int64_t i = 0; i < N; ++i) {
-        buckets[assignments[i]].push_back(static_cast<int32_t>(i));
-    }
-
-    std::cout << "[2] Buckets created with centroid-based assignment\n";
+    // Assign the full dataset to buckets, streaming it in chunks from disk.
+    // Only each point's global id is kept resident (bucket_ids); vectors are
+    // re-read on demand in Step 4.
+    std::cout << "[2] Assigning full dataset to buckets (chunked) ...\n";
+    auto bucket_ids = assign_to_buckets_chunked(
+        data_path, ext, N, D, centroids, B, load_config.cpu_limit_bytes);
 
     // Find k nearest buckets
     std::cout << "[3] Finding k=" << k << " nearest buckets ...\n";
     auto knb = k_nearest_buckets(centroids, B, D, k);
 
-    // Find neighbors within buckets
-    std::cout << "[4] Finding m=" << m << " nearest neighbors ...\n";
-    auto [neighbors, dists] = neighbors_within_knn_buckets_gpu(X, N, D, buckets, knb, m, B);
+    // Order buckets so Step 4 processes ones with overlapping k-nearest-bucket
+    // sets close together (DiskJoin's task ordering, Algorithm 2 - see
+    // bucket_order.hpp), then size a Belady-optimal cache for that order.
+    std::cout << "[3.5] Computing bucket processing order ...\n";
+    int32_t order_window = (order_window_arg > 0) ? order_window_arg : std::max(4 * k, 16);
+    auto bucket_process_order = bucket_order::compute_bucket_processing_order(
+        bucket_order::adjacency_from_nested(knb), order_window);
+    size_t cache_bytes = (cache_mb_arg > 0)
+        ? cache_mb_arg * 1024ULL * 1024ULL
+        : load_config.cpu_limit_bytes / 2;
+    std::cout << "  order_window=" << order_window
+              << " cache_budget=" << (cache_bytes / 1e6) << " MB\n";
 
-    // Save results
-    std::cout << "[5] Saving results ...\n";
+    // Prepare output files up front: create the .npy files with the right
+    // header/shape, then sentinel-fill them in chunks so any row Step 4
+    // never touches (shouldn't happen - every point lands in some bucket)
+    // still reads back as -1/inf instead of a zeroed hole.
+    std::cout << "[5] Preparing output files ...\n";
     std::string suffix = "_k" + std::to_string(k) + "m" + std::to_string(m) + "t" + std::to_string(t);
     std::string neighbors_path = out_dir + "/neighbors" + suffix + ".npy";
     std::string dists_path = out_dir + "/neighbors_dist" + suffix + ".npy";
 
-    load::write_npy_int64_2d(neighbors_path, neighbors.data(), N, m);
-    load::write_npy_f32_2d(dists_path, dists.data(), N, m);
+    size_t neighbors_header = load::create_npy_int64_2d(neighbors_path, N, m);
+    size_t dists_header = load::create_npy_f32_2d(dists_path, N, m);
 
+    std::fstream neighbors_out(neighbors_path, std::ios::binary | std::ios::in | std::ios::out);
+    std::fstream dists_out(dists_path, std::ios::binary | std::ios::in | std::ios::out);
+    if (!neighbors_out.is_open() || !dists_out.is_open()) {
+        throw std::runtime_error("Failed to reopen output files for row writes");
+    }
+    load::prefill_npy_int64_2d(neighbors_out, neighbors_header, N, m, load_config.cpu_limit_bytes / 4);
+    load::prefill_npy_f32_2d(dists_out, dists_header, N, m, load_config.cpu_limit_bytes / 4);
+
+    ResultWriter writer{&neighbors_out, neighbors_header, &dists_out, dists_header, m};
+
+    // Find neighbors within buckets - out-of-core end to end: reads each
+    // bucket's vectors from data_path on demand (instead of a resident
+    // array) and streams each query's result row straight into the files
+    // above as soon as it's computed (instead of accumulating an N*m result
+    // in memory before writing it all at once). Steps 4 and 5 are
+    // interleaved this way by design - there's no point separating "compute
+    // everything" from "write everything" once neither side is resident.
+    std::cout << "[4] Finding m=" << m << " nearest neighbors (streamed to disk) ...\n";
+    neighbors_within_knn_buckets_gpu(N, D, bucket_ids, data_path, ext, knb, m, B, writer,
+                                     bucket_process_order, cache_bytes);
+
+    neighbors_out.close();
+    dists_out.close();
     std::cout << "Done. Files written to: " << out_dir << "\n";
 
     return 0;
