@@ -17,6 +17,7 @@
 #include <omp.h>
 #include <chrono>
 #include <future>
+#include <memory>
 
 // Boost
 #include <boost/program_options.hpp>
@@ -51,6 +52,7 @@
 #include "utils.hpp"
 #include "load.hpp"
 #include "bucket_build.cuh"
+#include "bucket_order.hpp"
 
 namespace po = boost::program_options;
 using namespace bucket;
@@ -2051,6 +2053,153 @@ static inline void launch_extract_topM(
 #undef LAUNCH_KOUT
 }
 
+// ============== Disk-backed running per-vector KNN (row read-merge-write) ==============
+//
+// running_vector_knn/dists 不再是常驻内存的 (N, M) 数组。build_vector_knn_with_
+// tensorcore 每算完一个 bucket 的结果，就对该 bucket 里的每个点：读它在磁盘上
+// 现有的一行 -> 跟这一轮新算出来的候选合并去重 -> 写回同一行。文件在第一轮开始
+// 前用 sentinel (-1 / +inf) 填满，所以"这个点还没有旧结果"不需要特殊处理——
+// 跟全 sentinel 的一行合并，等价于直接取新候选，第 0 轮和后续轮走同一条代码路径。
+//
+// 代价：原来跨 iteration 的合并是整体一次性、且用 std::async 跟下一轮 GPU 计算
+// 重叠；现在合并变成了每个 bucket 结束时同步做的小块磁盘 I/O（读+写各 M*8 字节/
+// 点），发生在 scatter_pending 里，不再和"下一轮"重叠，而是跟同一轮里其他 bucket
+// 的 GPU 计算竞争 CPU 时间。多数情况下这点 I/O 应该远小于 GEMM+topM 的耗时、能被
+// 现有的 double-buffer 流水线掩盖掉，但如果磁盘慢（非 NVMe）或 bucket 很小、M 很
+// 大，可能会看到吞吐下降——这是用内存换来的一个真实的性能取舍，如果 profiling
+// 发现这里成为瓶颈，可以再把每个 bucket 的 merge 扔进后台线程池重新做重叠。
+struct RunningKnnFile {
+    std::fstream neighbors_f;
+    std::fstream dists_f;
+    int M = 0;
+
+    static constexpr size_t header_bytes() { return sizeof(int64_t) + sizeof(int32_t); }
+
+    // 建文件 + 写 header + 分块用 sentinel 填满 body（只在第 0 轮之前调用一次）。
+    static RunningKnnFile create(const std::string& knn_path, const std::string& dist_path,
+                                 int64_t N, int M, size_t chunk_bytes_budget) {
+        RunningKnnFile f;
+        f.M = M;
+        int32_t M32 = static_cast<int32_t>(M);
+
+        for (const auto& path : {knn_path, dist_path}) {
+            std::ofstream out(path, std::ios::binary | std::ios::trunc);
+            if (!out.is_open()) throw std::runtime_error("RunningKnnFile: cannot create " + path);
+            out.write(reinterpret_cast<const char*>(&N), sizeof(int64_t));
+            out.write(reinterpret_cast<const char*>(&M32), sizeof(int32_t));
+        }
+
+        f.neighbors_f.open(knn_path, std::ios::binary | std::ios::in | std::ios::out);
+        f.dists_f.open(dist_path, std::ios::binary | std::ios::in | std::ios::out);
+        if (!f.neighbors_f.is_open() || !f.dists_f.is_open())
+            throw std::runtime_error("RunningKnnFile: cannot reopen for read/write");
+
+        int64_t chunk_rows = std::max<int64_t>(1,
+            static_cast<int64_t>(chunk_bytes_budget / (static_cast<size_t>(M) * sizeof(int32_t))));
+        chunk_rows = std::min(chunk_rows, N);
+        std::vector<int32_t> nbuf(static_cast<size_t>(chunk_rows) * M, -1);
+        std::vector<float>   dbuf(static_cast<size_t>(chunk_rows) * M,
+                                  std::numeric_limits<float>::infinity());
+
+        f.neighbors_f.seekp(header_bytes());
+        f.dists_f.seekp(header_bytes());
+        for (int64_t start = 0; start < N; start += chunk_rows) {
+            int64_t cur = std::min(chunk_rows, N - start);
+            f.neighbors_f.write(reinterpret_cast<const char*>(nbuf.data()),
+                                static_cast<std::streamsize>(cur * M * sizeof(int32_t)));
+            f.dists_f.write(reinterpret_cast<const char*>(dbuf.data()),
+                            static_cast<std::streamsize>(cur * M * sizeof(float)));
+        }
+        if (!f.neighbors_f.good() || !f.dists_f.good())
+            throw std::runtime_error("RunningKnnFile: failed sentinel-filling " + knn_path);
+        return f;
+    }
+
+    void read_row(int64_t gid, int32_t* n_out, float* d_out) {
+        neighbors_f.seekg(static_cast<std::streamoff>(header_bytes())
+                          + static_cast<std::streamoff>(gid) * M * sizeof(int32_t));
+        neighbors_f.read(reinterpret_cast<char*>(n_out), static_cast<std::streamsize>(M * sizeof(int32_t)));
+        dists_f.seekg(static_cast<std::streamoff>(header_bytes())
+                      + static_cast<std::streamoff>(gid) * M * sizeof(float));
+        dists_f.read(reinterpret_cast<char*>(d_out), static_cast<std::streamsize>(M * sizeof(float)));
+    }
+
+    void write_row(int64_t gid, const int32_t* n_in, const float* d_in) {
+        neighbors_f.seekp(static_cast<std::streamoff>(header_bytes())
+                          + static_cast<std::streamoff>(gid) * M * sizeof(int32_t));
+        neighbors_f.write(reinterpret_cast<const char*>(n_in), static_cast<std::streamsize>(M * sizeof(int32_t)));
+        dists_f.seekp(static_cast<std::streamoff>(header_bytes())
+                      + static_cast<std::streamoff>(gid) * M * sizeof(float));
+        dists_f.write(reinterpret_cast<const char*>(d_in), static_cast<std::streamsize>(M * sizeof(float)));
+    }
+};
+
+// 读一个点现有的一行、跟新算出来的候选合并去重、写回同一行。逻辑跟
+// merge_two_per_vector_knn 完全一样，只是作用范围是单独一行而不是整块 (N,M)
+// 数组，因为 running 状态现在活在磁盘上而不是内存里。
+inline void merge_row_into_disk(RunningKnnFile& f, int64_t gid, int M,
+                                const int32_t* new_n, const float* new_d) {
+    std::vector<int32_t> old_n(M);
+    std::vector<float>   old_d(M);
+    f.read_row(gid, old_n.data(), old_d.data());
+
+    std::vector<std::pair<float, int32_t>> cand;
+    cand.reserve(static_cast<size_t>(2) * M);
+    for (int m = 0; m < M; ++m) if (old_n[m] >= 0) cand.push_back({old_d[m], old_n[m]});
+    for (int m = 0; m < M; ++m) if (new_n[m] >= 0) cand.push_back({new_d[m], new_n[m]});
+
+    std::vector<int32_t> merged_n(M, -1);
+    std::vector<float>   merged_d(M, std::numeric_limits<float>::infinity());
+    if (!cand.empty()) {
+        std::sort(cand.begin(), cand.end(),
+                 [](const auto& a, const auto& b) { return a.first < b.first; });
+        std::unordered_set<int32_t> seen;
+        seen.reserve(static_cast<size_t>(M) * 2);
+        int written = 0;
+        for (const auto& [dist, id] : cand) {
+            if (seen.insert(id).second) {
+                merged_n[written] = id;
+                merged_d[written] = dist;
+                if (++written >= M) break;
+            }
+        }
+    }
+    f.write_row(gid, merged_n.data(), merged_d.data());
+}
+
+// 把 vector_knn.bin (RunningKnnFile 的 int64 N + int32 M header, flat int32
+// body) 顺序分块转换成 neighbors.npy (int64)，给 Python 端评测用。纯顺序拷贝
+// + 类型转换，不需要整份常驻内存。只在全部 iteration 跑完、running 文件已经
+// close 之后调用一次。
+inline void convert_vector_knn_to_npy(const std::string& knn_path, const std::string& npy_path,
+                                      int64_t N, int M, size_t chunk_bytes_budget) {
+    std::ifstream in(knn_path, std::ios::binary);
+    if (!in.is_open()) throw std::runtime_error("Cannot open: " + knn_path);
+    in.seekg(static_cast<std::streamoff>(RunningKnnFile::header_bytes()));
+
+    size_t header_bytes = load::create_npy_int64_2d(npy_path, N, M);
+    std::fstream out(npy_path, std::ios::binary | std::ios::in | std::ios::out);
+    if (!out.is_open()) throw std::runtime_error("Cannot open for write: " + npy_path);
+    out.seekp(static_cast<std::streamoff>(header_bytes));
+
+    int64_t chunk_rows = std::max<int64_t>(1,
+        static_cast<int64_t>(chunk_bytes_budget / (static_cast<size_t>(M) * sizeof(int64_t))));
+    chunk_rows = std::min(chunk_rows, N);
+    std::vector<int32_t> buf32(static_cast<size_t>(chunk_rows) * M);
+    std::vector<int64_t> buf64(static_cast<size_t>(chunk_rows) * M);
+
+    for (int64_t start = 0; start < N; start += chunk_rows) {
+        int64_t cur = std::min(chunk_rows, N - start);
+        size_t cnt = static_cast<size_t>(cur) * M;
+        in.read(reinterpret_cast<char*>(buf32.data()), static_cast<std::streamsize>(cnt * sizeof(int32_t)));
+        if (!in.good()) throw std::runtime_error("Failed reading " + knn_path);
+        for (size_t i = 0; i < cnt; ++i) buf64[i] = static_cast<int64_t>(buf32[i]);
+        out.write(reinterpret_cast<const char*>(buf64.data()),
+                 static_cast<std::streamsize>(cnt * sizeof(int64_t)));
+        if (!out.good()) throw std::runtime_error("Failed writing " + npy_path);
+    }
+}
+
 /**
  * 为每个向量在其 bucket 及 K 个最近邻 bucket 内，用 Tensor Core 矩阵乘法
  * 计算距离并找到 M 个最近邻。
@@ -2071,14 +2220,17 @@ static inline void launch_extract_topM(
  * @param K                   centroid KNN 图度数
  * @param M                   每个向量要找的邻居数
  *
- * @return  (N, M) int32 数组，每行是该点的 M 个最近邻 global index
+ * @param running             磁盘上的 running per-vector KNN 文件（read_row/write_row）。
+ *                            每算完一个 bucket，就把该 bucket 里每个点的新候选跟
+ *                            running 里现有的一行合并写回——不再攒进内存里的
+ *                            (N, M) 数组，也不再单独返回结果，见文件顶部
+ *                            RunningKnnFile 的说明。
+ *
+ * 距离对合并是必需的 (要按距离排序去重)，所以内部始终按 want_distances=true
+ * 的路径跑；不再对外暴露"不算距离"这个选项。
  */
-// 返回 (neighbors[N*M], distances[N*M])。
-// 仅当 want_distances=true 时填充 distances；否则 distances 返回空 vector。
-// (per-vector KNN 距离主要用于 multi-iteration merge 阶段)
 template <typename DataT>
-std::pair<std::vector<int32_t>, std::vector<float>>
-build_vector_knn_with_tensorcore(
+void build_vector_knn_with_tensorcore(
     const DataT* X_full,
     int64_t N,
     int64_t D,
@@ -2088,8 +2240,9 @@ build_vector_knn_with_tensorcore(
     int64_t n_centroids,
     uint32_t K,
     int M,
-    bool want_distances = false)
+    RunningKnnFile& running)
 {
+    constexpr bool want_distances = true;  // merge_row_into_disk 总是需要距离
     // ============= Stage 2 路径选择（INT8 IMMA / fp32 fallback）=============
     // - int8/uint8 → 走 INT8 IMMA Tensor Core（uint8 入口先减 128 转 int8）
     // - 其它 (float/half/uint32/int32 等) → 走 fp32 cuBLAS GEMM（原行为）
@@ -2134,14 +2287,6 @@ build_vector_knn_with_tensorcore(
                       << ") not in its bucket, inserting.\n";
             buckets[c].push_back(centroid_gid);
         }
-    }
-
-    // 输出: (N, M) 最近邻表 + 可选距离表
-    std::vector<int32_t> all_neighbors(static_cast<size_t>(N) * M, -1);
-    std::vector<float>   all_dists;
-    if (want_distances) {
-        all_dists.assign(static_cast<size_t>(N) * M,
-                         std::numeric_limits<float>::infinity());
     }
 
     // ================================================================
@@ -2190,6 +2335,22 @@ build_vector_knn_with_tensorcore(
     //   3) ‖x‖² 全局只算一次
     //   4) Double-buffer + 双 stream: bucket c 的 GEMM/topM/D2H 与 bucket c+1 的
     //      CPU prep + H2D + gather 并行；CPU 的 sort/unique 与 GPU 工作完全重叠。
+    //
+    // 关于 (2) 的一个已知权衡（暂不改，先记录）：
+    // 之所以要求 X_full/d_X_full 整份常驻 CPU+GPU，是因为 gather A/B 这一步是
+    // GPU kernel 直接按 id 去 d_X_full 里抠数据（gather_rows_int32/gather_rows_
+    // raw），CUDA kernel 只能解引用显存指针，没法在 kernel 内部临时去读磁盘或
+    // CPU 内存，而任意一个 bucket 的近邻桶都可能覆盖数据集里的任意点，没法只常
+    // 驻一部分。理论上可以换成 bucket_build.cu 那种做法：需要哪个 bucket 就现读
+    // 磁盘、CPU 端拼好向量再整块 H2D，完全不需要 d_X_full 常驻——但一个 bucket
+    // 里的点在原文件里是随机散布的（分桶本身就打乱了顺序），这样读会退化成"每个
+    // 点一次 seek"，而不是几次大块顺序读；把这种随机 I/O 插进现在这条为吞吐量
+    // 设计的热循环（tensor core + 多 slot 流水线），可能会让 I/O 耗时超过 GPU
+    // 计算耗时，反而拖慢整体。要让它划算，需要先把数据集按桶重排到磁盘上一份
+    // （assign 阶段顺便生成，或者复用现成的 reorder 逻辑），这样每个 bucket 和它
+    // 的近邻桶就变成几段连续区间，读起来才是大块顺序读而不是随机 seek。这块目前
+    // 没有实现，先维持 d_X_full 整份常驻的现状，把这个方案记在这里，之后要做的
+    // 话再单独展开。
     size_t max_bucket_size = 0;
     size_t max_pool_size_ub = 0;  // 上界(未去重)
     for (int64_t c = 0; c < n_centroids; ++c) {
@@ -2211,7 +2372,7 @@ build_vector_knn_with_tensorcore(
     if (max_bucket_size == 0 || max_pool_size_ub == 0) {
         cublasDestroy(cublas_handle);
         std::cout << "[VectorKNN] All buckets empty, nothing to do.\n";
-        return {all_neighbors, all_dists};
+        return;
     }
 
     // ---- 显存预算分两块: 全局常驻 + per-slot ----
@@ -2332,8 +2493,8 @@ build_vector_knn_with_tensorcore(
         CUDA_CHECK(cudaStreamCreate(&streams[s]));
     }
 
-    // ---- 一次性上传 X_reordered + (uint8 时) shift → int8 + 计算所有点的 ‖x‖² (用 stream 0) ----
-    // [Cache-Opt] 数据集按 bucket_offsets 顺序重排，使得同一 bucket 及近邻 bucket 在内存中连续
+    // ---- 一次性上传 X_full + (uint8 时) shift → int8 + 计算所有点的 ‖x‖² (用 stream 0) ----
+    // norms 必须从 GEMM 实际看到的数据视图算出来（uint8 路径下要在 shift 之后用 int8 视图算）。
     {
         auto t0 = std::chrono::high_resolution_clock::now();
         std::vector<DataT> X_reordered(static_cast<size_t>(N) * D);
@@ -2342,7 +2503,6 @@ build_vector_knn_with_tensorcore(
             int32_t old_id = perm_order[i];
             std::memcpy(&X_reordered[i * D], &X_full[static_cast<int64_t>(old_id) * D], D * sizeof(DataT));
         }
-
         CUDA_CHECK(cudaMemcpyAsync(d_X_full, X_reordered.data(), bytes_X,
                                    cudaMemcpyHostToDevice, streams[0]));
         int threads = 256;
@@ -2358,6 +2518,7 @@ build_vector_knn_with_tensorcore(
 
         int64_t blocks = (N + threads - 1) / threads;
         if constexpr (kIsInt8Path) {
+            // 用 int8 视图算 norms（uint8 已 shift；int8 直接）
             compute_row_norms_kernel<int8_t><<<blocks, threads, 0, streams[0]>>>(
                 reinterpret_cast<const int8_t*>(d_X_full), d_norms_full, N, D);
         } else {
@@ -2368,7 +2529,7 @@ build_vector_knn_with_tensorcore(
         CUDA_CHECK(cudaStreamSynchronize(streams[0]));
         auto t1 = std::chrono::high_resolution_clock::now();
         double upload_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-        std::cout << "  [VectorKNN] [Cache-Opt] X_reordered upload + norms: " << upload_ms << " ms\n";
+        std::cout << "  [VectorKNN] X_full upload + norms: " << upload_ms << " ms\n";
     }
 
     // ================================================================
@@ -2376,7 +2537,7 @@ build_vector_knn_with_tensorcore(
     // ================================================================
     // 每个 slot 上有未消费 D2H 时记一笔 pending；下一次该 slot 被复用前必须:
     //   1) cudaStreamSynchronize (drain D2H)
-    //   2) 把 h_out[slot] 中的结果 scatter 到 all_neighbors
+    //   2) 把 h_out[slot] 中的结果逐点 merge 进磁盘上的 running 文件
     // 之后才能安全覆写 h_out[slot] / d_*[slot]。
     struct Pending {
         int64_t c           = -1;   // bucket index in this slot's last submitted iteration; -1 = empty
@@ -2402,23 +2563,28 @@ build_vector_knn_with_tensorcore(
         gemm_evt_valid[slot] = false;
     };
 
+    // 每个点的新候选先铺成 M 宽（不足 aM 的部分补 -1/inf），再跟磁盘上现有的
+    // 一行合并写回 —— 复用同一块 scratch buffer，避免每个点都分配一次。
+    std::vector<int32_t> scatter_new_n(M);
+    std::vector<float>   scatter_new_d(M);
+
     auto scatter_pending = [&](int slot) {
         if (pending[slot].c < 0) return;
         const auto& bk_prev = buckets[pending[slot].c];
         int bs = pending[slot].bucket_size;
         int aM = pending[slot].actual_M;
         const int32_t* hp = h_out[slot];
-        const float*   hd = want_distances ? h_out_dists[slot] : nullptr;
+        const float*   hd = h_out_dists[slot];  // 始终已分配 (want_distances 内部恒为 true)
         for (int i = 0; i < bs; ++i) {
             int32_t gid = bk_prev[i];
-            for (int m = 0; m < aM; ++m) {
-                all_neighbors[static_cast<size_t>(gid) * M + m] =
-                    hp[static_cast<size_t>(i) * aM + m];
-                if (hd) {
-                    all_dists[static_cast<size_t>(gid) * M + m] =
-                        hd[static_cast<size_t>(i) * aM + m];
-                }
+            std::fill(scatter_new_n.begin(), scatter_new_n.end(), -1);
+            std::fill(scatter_new_d.begin(), scatter_new_d.end(),
+                     std::numeric_limits<float>::infinity());
+            for (int m = 0; m < aM && m < M; ++m) {
+                scatter_new_n[m] = hp[static_cast<size_t>(i) * aM + m];
+                scatter_new_d[m] = hd[static_cast<size_t>(i) * aM + m];
             }
+            merge_row_into_disk(running, gid, M, scatter_new_n.data(), scatter_new_d.data());
         }
         pending[slot].c = -1;
     };
@@ -2467,9 +2633,15 @@ build_vector_knn_with_tensorcore(
                                    pool_size * sizeof(int32_t),
                                    cudaMemcpyHostToDevice, streams[slot]));
 
-        // ---- 3d: [Cache-Opt] Contiguous Slice Copies for A / B / norms_pool ----
-        // 避免 scattered gather kernel，直接按 bucket_offsets 执行连续内存切片拷贝
+        // ---- 3d: GPU gather A / B / norms_pool ----
+        // INT8 路径: gather_rows_raw 不转换 type；FP32 路径: gather_rows_int32 cast 到 fp32
         {
+            int threads = 256;
+            int64_t total_A  = static_cast<int64_t>(bucket_size) * D;
+            int64_t blocks_A = (total_A + threads - 1) / threads;
+            int64_t total_B  = static_cast<int64_t>(pool_size) * D;
+            int64_t blocks_B = (total_B + threads - 1) / threads;
+
             size_t cur_pool_offset = 0;
             auto copy_bucket_slice = [&](int64_t b_idx) {
                 int64_t b_start = bucket_offsets[b_idx];
@@ -2644,8 +2816,7 @@ build_vector_knn_with_tensorcore(
     cublasDestroy(cublas_handle);
 
     std::cout << "[VectorKNN] Done. Output shape: (" << N << ", " << M << ")"
-              << (want_distances ? " (+distances)" : "") << "\n";
-    return {all_neighbors, all_dists};
+              << " merged into running KNN file on disk\n";
 }
 
 /**
@@ -2759,13 +2930,19 @@ void write_vector_knn_to_disk(
 // ============== Phase 12: Optional bucket-aligned ID reorder ==============
 
 /**
- * Compute the bucket-aligned permutation: new_id 区间 [offsets[b], offsets[b+1])
- * 占据 bucket b 的所有点。
+ * Compute the bucket-aligned permutation: new_id 区间 [offsets[pos], offsets[pos+1])
+ * 占据 bucket_order[pos] 这个桶的所有点 —— 也就是说 offsets 是按 `bucket_order`
+ * (DiskJoin 风格的 task ordering, 见 bucket_order.hpp) 的顺序排列的，不是按原始
+ * 桶编号。optimize_chunked 的 method C/D 只按 offsets 数组顺序把连续几个桶划进
+ * 一个 chunk，从不关心某个 chunk 对应哪个原始桶编号，所以这个改动对它完全透明；
+ * 而这正是重排真正要解决的问题：只有当"新 ID 空间里相邻"的桶在特征空间里也相邻，
+ * chunk 边界才会真的贴合数据分布，method C/D 文档里"相邻 chunk 在特征空间也相邻"
+ * 的假设才成立。
  *
  * 输入 assignments (老 ID 空间)，输出:
  *   perm[old_id]         = new_id    (未分配的点为 0xFFFFFFFFu)
  *   inverse_perm[new_id] = old_id
- *   bucket_offsets       = bucket 边界（新 ID 空间），长度 n_buckets+1
+ *   bucket_offsets       = bucket 边界（新 ID 空间，按 bucket_order 排列），长度 n_buckets+1
  */
 struct ReorderInfo {
     std::vector<uint32_t> perm;
@@ -2775,24 +2952,35 @@ struct ReorderInfo {
 };
 
 static ReorderInfo compute_bucket_reorder(
-    const std::vector<int64_t>& assignments, int64_t N, int64_t n_buckets)
+    const std::vector<int64_t>& assignments, int64_t N, int64_t n_buckets,
+    const std::vector<int32_t>& bucket_order)
 {
     ReorderInfo r;
     r.bucket_offsets.assign(n_buckets + 1, 0);
 
-    // Count per bucket → 前缀和得到 offsets
+    // Count per bucket (indexed by raw bucket id, same as `assignments`).
+    std::vector<int64_t> counts(n_buckets, 0);
     for (int64_t i = 0; i < N; ++i) {
         int64_t b = assignments[i];
-        if (b >= 0 && b < n_buckets) r.bucket_offsets[b + 1]++;
+        if (b >= 0 && b < n_buckets) counts[b]++;
     }
-    for (int64_t b = 0; b < n_buckets; ++b)
-        r.bucket_offsets[b + 1] += r.bucket_offsets[b];
 
-    r.total_in_buckets = static_cast<int64_t>(r.bucket_offsets.back());
+    // Lay ranges out in bucket_order sequence (position pos -> raw bucket
+    // bucket_order[pos]), not raw bucket id order.
+    std::vector<uint32_t> new_id_range_start(n_buckets, 0);
+    uint32_t running = 0;
+    for (int64_t pos = 0; pos < n_buckets; ++pos) {
+        int32_t b = bucket_order[pos];
+        new_id_range_start[b] = running;
+        running += static_cast<uint32_t>(counts[b]);
+        r.bucket_offsets[pos + 1] = running;
+    }
+
+    r.total_in_buckets = static_cast<int64_t>(running);
     r.perm.assign(N, 0xFFFFFFFFu);
     r.inverse_perm.assign(r.total_in_buckets, 0);
 
-    std::vector<uint32_t> cursor(r.bucket_offsets.begin(), r.bucket_offsets.end() - 1);
+    std::vector<uint32_t> cursor = new_id_range_start;
     for (int64_t old_id = 0; old_id < N; ++old_id) {
         int64_t b = assignments[old_id];
         if (b >= 0 && b < n_buckets) {
@@ -2916,7 +3104,8 @@ int run_pipeline_impl(
     bool do_reorder,
     int iterations,
     LoadConfig config,
-    const std::string& ext)
+    const std::string& ext,
+    int32_t order_window_arg)
 {
     try {
         init_gpu_limit_if_needed(config);
@@ -2936,7 +3125,7 @@ int run_pipeline_impl(
         double elapsed_step1 = 0, elapsed_step2 = 0, elapsed_step3 = 0;
         double elapsed_step3p5 = 0, elapsed_step4 = 0, elapsed_step5 = 0;
         double elapsed_step6 = 0, elapsed_step7 = 0;
-        double elapsed_merge = 0, elapsed_write_knn = 0;
+        double elapsed_write_knn = 0;
 
         // ================================================================
         // Step 1: Read header + prepare sampled data for centroid selection
@@ -3036,22 +3225,24 @@ int run_pipeline_impl(
         // ================================================================
         // Per-iteration outer loop (Steps 2-6 may repeat with varying seed)
         // ================================================================
-        // 增量合并状态: running_vector_knn/dists 是"已并入到当前 iteration"的
-        // 累积结果; merge_future 是把上一轮结果并入 running 的后台任务 —— 主
-        // 线程发起后立刻进入下一轮 Step 2 (GPU 工作)，与这次 CPU merge 重叠，
-        // 不再像之前那样把 T 轮结果全部攒在内存里等最后一次性合并。
-        std::vector<int32_t> running_vector_knn;
-        std::vector<float>   running_vector_dists;
-        std::future<void>    merge_future;
+        // running per-vector KNN 现在活在磁盘上 (见 RunningKnnFile)，不再是
+        // 内存里的 (N,M) 数组，也不再需要 merge_future 这个跨 iteration 的
+        // 后台任务 —— 合并已经下沉到 build_vector_knn_with_tensorcore 内部,
+        // 逐 bucket 同步做掉了 (scatter_pending -> merge_row_into_disk)。
+        std::unique_ptr<RunningKnnFile> running_knn_file;
+        if (neighbors_m > 0) {
+            running_knn_file = std::make_unique<RunningKnnFile>(
+                RunningKnnFile::create(
+                    output_dir + "/vector_knn.bin",
+                    output_dir + "/vector_dists.bin",
+                    N, neighbors_m, config.cpu_limit_bytes / 4));
+        }
 
         // 这些值由最后一次 iteration 决定 (用于 Step 5/7)
         std::vector<int64_t> assignments;
         std::vector<int64_t> centroid_global_indices;
+        std::vector<uint32_t> centroid_knn_graph_host;  // (n_centroids, K), row-major
         uint32_t             K = config.knn_k;
-        // 仅 iterations==1 直接复用单次结果, 否则下面的 merge 会覆盖
-        std::vector<int32_t> vector_knn;
-        std::vector<float>   vector_dists;
-        const bool want_dist_per_iter = (iterations > 1) && (neighbors_m > 0);
 
         // X_full 在 Step 3.5 加载, 跨 iteration 复用 (大数据)
         // 在第一次 iteration 的 Step 4 之前加载
@@ -3209,9 +3400,9 @@ int run_pipeline_impl(
             CUDA_CHECK(cudaFree(d_centroids_f32));
         }
 
-        // Download centroid KNN graph to CPU before freeing (needed for Step 6)
-        std::vector<uint32_t> centroid_knn_graph_host;
-        if (neighbors_m > 0) {
+        // Download centroid KNN graph to CPU before freeing (needed for Step 6,
+        // and for Step 7's bucket processing order when --reorder is set).
+        if (neighbors_m > 0 || do_reorder) {
             centroid_knn_graph_host.resize(static_cast<size_t>(n_centroids) * K);
             CUDA_CHECK(cudaMemcpy(centroid_knn_graph_host.data(), d_graph,
                                   graph_bytes, cudaMemcpyDeviceToHost));
@@ -3243,6 +3434,21 @@ int run_pipeline_impl(
                           n_centroids * sizeof(int64_t));
             }
 
+            // Save the centroid KNN graph too, so reorder.cpp (the standalone,
+            // post-hoc equivalent of Step 7) can recompute the same DiskJoin-
+            // style bucket processing order without rebuilding it from scratch.
+            if (!centroid_knn_graph_host.empty()) {
+                std::string p = output_dir + "/centroid_knn.bin";
+                std::ofstream out(p, std::ios::binary);
+                int64_t nc = n_centroids;
+                int32_t Kw = static_cast<int32_t>(K);
+                out.write(reinterpret_cast<const char*>(&nc), sizeof(int64_t));
+                out.write(reinterpret_cast<const char*>(&Kw), sizeof(int32_t));
+                out.write(reinterpret_cast<const char*>(centroid_knn_graph_host.data()),
+                          static_cast<std::streamsize>(centroid_knn_graph_host.size() * sizeof(uint32_t)));
+                std::cout << "  Wrote " << p << " (K=" << K << ")\n";
+            }
+
             elapsed_step5 = std::chrono::duration<double>(Clock::now() - t5).count();
             std::cout << "  Step 5 done [" << std::fixed << std::setprecision(3) << elapsed_step5 << "s]\n";
         }
@@ -3267,106 +3473,91 @@ int run_pipeline_impl(
             const uint32_t* graph_ptr = centroid_topK.data();
             uint32_t graph_K = effective_nprobe;
 
-            auto [iter_knn, iter_dist] = build_vector_knn_with_tensorcore(
+            // 结果直接 merge 进 running_knn_file (磁盘上)，不再返回整块数组；
+            // 不管 iterations 是 1 还是多轮，都是同一条代码路径 —— 第 0 轮
+            // 跟全 sentinel 的文件合并，等价于直接写入,不需要为它单独分支。
+            build_vector_knn_with_tensorcore(
                 X_full.data(), N, D,
                 assignments,
                 centroid_global_indices,
                 graph_ptr,
                 n_centroids, graph_K, neighbors_m,
-                /*want_distances=*/want_dist_per_iter);
+                *running_knn_file);
 
             cudaDeviceSynchronize();
             double iter_step6 = std::chrono::duration<double>(Clock::now() - t6).count();
             elapsed_step6 += iter_step6;
             std::cout << "  Step 6 done [" << std::fixed << std::setprecision(3) << iter_step6 << "s]\n";
-
-            if (iterations > 1) {
-                if (iter == 0) {
-                    // 第 0 轮直接作为初始 running 状态，无需 merge
-                    running_vector_knn   = std::move(iter_knn);
-                    running_vector_dists = std::move(iter_dist);
-                } else {
-                    // 上一轮的后台 merge 若还没跑完，这里必须先等它 —— 它正在
-                    // 读写 running_*，不能跟本次 push 进去的新一轮同时改。
-                    // 正常情况下不会等太久: 一轮 merge (2*M 候选/点) 远比一轮
-                    // Step2-6 的 GPU 工作快，早就该跑完了。
-                    auto t_wait = Clock::now();
-                    if (merge_future.valid()) merge_future.wait();
-                    elapsed_merge += std::chrono::duration<double>(Clock::now() - t_wait).count();
-
-                    // 异步把本轮结果并入 running_*；主线程立刻返回去跑下一轮
-                    // Step 2 的 GPU 工作，和这次 CPU merge 重叠。
-                    // (先把 structured-binding 出来的 iter_knn/iter_dist move 到
-                    //  普通具名变量，再进 lambda capture —— 结构化绑定直接进
-                    //  init-capture 在部分 C++17 编译器上不受标准保证)
-                    std::vector<int32_t> new_knn  = std::move(iter_knn);
-                    std::vector<float>   new_dist = std::move(iter_dist);
-                    merge_future = std::async(std::launch::async,
-                        [&running_vector_knn, &running_vector_dists,
-                         kn = std::move(new_knn), kd = std::move(new_dist),
-                         N, neighbors_m]() mutable {
-                            merge_two_per_vector_knn(running_vector_knn, running_vector_dists,
-                                                      kn, kd, N, neighbors_m);
-                        });
-                }
-            } else {
-                vector_knn   = std::move(iter_knn);
-                vector_dists = std::move(iter_dist);
-            }
         }
 
         }   // end of per-iteration loop
 
-        // ================================================================
-        // 等最后一轮的后台 merge 完成。T 轮总共有 T-1 次 merge，其中 T-2 次
-        // 已经和后续轮的 GPU 计算重叠掉了；只有"并入最后一轮结果"的这次 merge
-        // 之后没有更多 GPU 工作可以覆盖它，所以仍需在这里等待。
-        // ================================================================
-        if (iterations > 1 && neighbors_m > 0) {
-            auto t_wait = Clock::now();
-            if (merge_future.valid()) merge_future.wait();
-            elapsed_merge += std::chrono::duration<double>(Clock::now() - t_wait).count();
-            std::cout << "\n[MergeKNN] All T=" << iterations
-                      << " iterations merged (final wait=" << std::fixed
-                      << std::setprecision(3) << elapsed_merge << "s)\n";
-            vector_knn   = std::move(running_vector_knn);
-            vector_dists = std::move(running_vector_dists);
-        }
-
-        // ================================================================
-        // Write merged per-vector KNN to disk (one-time, after all iterations)
-        // ================================================================
+        // vector_knn.bin / vector_dists.bin 已经在每一轮 Step 6 里被增量写完了
+        // (running_knn_file)，这里不需要再整块写一次——只要把文件关掉 (flush)。
         if (neighbors_m > 0) {
             auto t_write = Clock::now();
-            write_vector_knn_to_disk(
-                output_dir + "/vector_knn.bin", vector_knn, N, neighbors_m);
+            running_knn_file->neighbors_f.close();
+            running_knn_file->dists_f.close();
 
-            // Also save as .npy for Python search evaluation
-            {
-                std::vector<int64_t> knn_i64(static_cast<size_t>(N) * neighbors_m);
-                for (size_t idx = 0; idx < knn_i64.size(); ++idx)
-                    knn_i64[idx] = static_cast<int64_t>(vector_knn[idx]);
-                load::write_npy_int64_2d(
-                    output_dir + "/neighbors.npy", knn_i64.data(), N, neighbors_m);
-                std::cout << "[WriteVectorKNN] Also saved neighbors.npy\n";
-            }
-            // vector_dists currently not persisted (callers don't read it).
-            // Drop now to free RAM before Step 7.
-            { auto _drop = std::move(vector_dists); }
+            // 分块把 vector_knn.bin 转成 neighbors.npy，给 Python 端评测用
+            // (纯顺序拷贝+类型转换，不需要整份常驻内存)
+            convert_vector_knn_to_npy(
+                output_dir + "/vector_knn.bin", output_dir + "/neighbors.npy",
+                N, neighbors_m, config.cpu_limit_bytes / 4);
+            std::cout << "[WriteVectorKNN] Saved neighbors.npy\n";
             elapsed_write_knn = std::chrono::duration<double>(Clock::now() - t_write).count();
         }
 
         // ================================================================
         // Step 7: Bucket-aligned ID reorder (optional, --reorder)
+        //
+        // 已知限制: assignments/centroid_global_indices (以及 bucket_index.bin/
+        // bucket_data.bin) 都只保留"最后一轮" iteration 的分桶结果 (见上面
+        // "这些值由最后一次 iteration 决定" 的注释)。当 iterations > 1 时，
+        // 最终合并出的 vector_knn 里的边可能来自任意一轮的分桶，并不都落在
+        // "最后一轮"划出的桶边界内——所以这里按最后一轮的桶结构重排，只是让
+        // 那一轮产生的边对齐，其余轮的边不保证对齐，reorder 的"bucket-aligned"
+        // 效果在多轮场景下是打了折扣的近似，不是严格保证。暂时按这个近似做，
+        // 没有为多轮场景单独设计一套对齐方案。
         // ================================================================
         if (do_reorder) {
             std::cout << "=== Step 7: Bucket-aligned reorder ===\n";
             auto t7 = Clock::now();
 
-            auto reorder_info = compute_bucket_reorder(assignments, N, n_centroids);
+            // Order buckets so ranges that end up adjacent in the new ID space
+            // are also adjacent in feature space (DiskJoin's task ordering,
+            // Algorithm 2 - see bucket_order.hpp), using the centroid KNN
+            // graph already built in Step 3 as the bucket dependency graph.
+            int32_t order_window = (order_window_arg > 0)
+                ? order_window_arg
+                : std::max<int32_t>(4 * static_cast<int32_t>(K), 16);
+            auto bucket_process_order = bucket_order::compute_bucket_processing_order(
+                bucket_order::adjacency_from_flat_graph(
+                    centroid_knn_graph_host.data(), n_centroids, static_cast<int32_t>(K)),
+                order_window);
+            std::cout << "  order_window=" << order_window << "\n";
+
+            auto reorder_info = compute_bucket_reorder(assignments, N, n_centroids,
+                                                        bucket_process_order);
             std::cout << "  N=" << N
                       << " total_in_buckets=" << reorder_info.total_in_buckets
                       << " (unassigned=" << (N - reorder_info.total_in_buckets) << ")\n";
+
+            // write_reordered_outputs 需要整份 vector_knn 在内存里做按 id 重排；
+            // 现在它活在磁盘上，这里读回来（顺序读，一次性，只有 --reorder 时
+            // 才会触发）。
+            std::vector<int32_t> vector_knn;
+            if (neighbors_m > 0) {
+                std::ifstream in(output_dir + "/vector_knn.bin", std::ios::binary);
+                if (!in.is_open())
+                    throw std::runtime_error("Cannot open vector_knn.bin for reorder");
+                in.seekg(static_cast<std::streamoff>(RunningKnnFile::header_bytes()));
+                vector_knn.resize(static_cast<size_t>(N) * neighbors_m);
+                in.read(reinterpret_cast<char*>(vector_knn.data()),
+                       static_cast<std::streamsize>(vector_knn.size() * sizeof(int32_t)));
+                if (!in.good())
+                    throw std::runtime_error("Failed reading vector_knn.bin for reorder");
+            }
 
             write_reordered_outputs(output_dir, ext, X_full, N, D,
                                     vector_knn, neighbors_m,
@@ -3377,9 +3568,8 @@ int run_pipeline_impl(
                       << elapsed_step7 << "s]\n";
         }
 
-        // X_full + vector_knn no longer needed
+        // X_full no longer needed
         { auto _drop = std::move(X_full); }
-        { auto _drop = std::move(vector_knn); }
 
         double elapsed_total = std::chrono::duration<double>(Clock::now() - t_total_start).count();
 
@@ -3394,10 +3584,8 @@ int run_pipeline_impl(
         std::cout << "  Step 4   (Batch assignment):    " << elapsed_step4 << "s\n";
         std::cout << "  Step 5   (Write buckets):       " << elapsed_step5 << "s\n";
         if (neighbors_m > 0) {
-            std::cout << "  Step 6   (Per-vector KNN):      " << elapsed_step6 << "s\n";
-            if (iterations > 1)
-                std::cout << "  Merge    (blocked wait, mostly overlapped w/ GPU): " << elapsed_merge << "s\n";
-            std::cout << "  Write    (vector_knn + .npy):    " << elapsed_write_knn << "s\n";
+            std::cout << "  Step 6   (Per-vector KNN, merge included):      " << elapsed_step6 << "s\n";
+            std::cout << "  Write    (close + .npy convert):    " << elapsed_write_knn << "s\n";
         }
         if (do_reorder)
             std::cout << "  Step 7   (Bucket reorder):      " << elapsed_step7 << "s\n";
@@ -3407,6 +3595,10 @@ int run_pipeline_impl(
         std::cout << "    bucket_index.bin  — offset/count table for each centroid\n";
         std::cout << "    bucket_data.bin   — packed int32 point IDs per bucket\n";
         std::cout << "    centroid_global_indices.bin — centroid-to-original-data mapping\n";
+        if (!centroid_knn_graph_host.empty()) {
+            std::cout << "    centroid_knn.bin  — centroid KNN graph (K=" << K
+                      << "), lets reorder.cpp reproduce Step 7's bucket order\n";
+        }
         if (neighbors_m > 0) {
             std::cout << "    vector_knn.bin    — per-vector " << neighbors_m << "-NN index\n";
             std::cout << "    neighbors.npy     — same as above in NumPy format (for search.py)\n";
@@ -3468,7 +3660,10 @@ int main(int argc, char** argv) {
             ("reorder",       po::bool_switch()->default_value(false),
                 "Also output bucket-aligned reordered files (data_reordered.<ext>, "
                 "vector_knn_reordered.bin, bucket_offsets.bin, perm.bin, inverse_perm.bin) "
-                "for optimize_chunked --method C/D");
+                "for optimize_chunked --method C/D")
+            ("order-window",  po::value<int32_t>()->default_value(0),
+                "Sliding-window size for the bucket processing order used by --reorder "
+                "(DiskJoin-style task ordering over the centroid KNN graph; 0 = auto: 4*knn-k)");
 
         po::variables_map vm;
         po::store(po::parse_command_line(argc, argv, desc), vm);
@@ -3486,6 +3681,7 @@ int main(int argc, char** argv) {
         uint32_t nprobe         = vm["nprobe"].as<uint32_t>();
         bool do_reorder         = vm["reorder"].as<bool>();
         int iterations          = vm["iterations"].as<int>();
+        int32_t order_window_arg = vm["order-window"].as<int32_t>();
 
         constexpr uint32_t MAX_NPROBE = 256;
         if (nprobe > MAX_NPROBE) {
@@ -3515,23 +3711,23 @@ int main(int argc, char** argv) {
         if (ext == ".fbin" || ext == ".bin") {
             return run_pipeline_impl<float>(input_path, output_root, search_max_iters,
                                             neighbors_m, nprobe, do_reorder, iterations,
-                                            config, ext);
+                                            config, ext, order_window_arg);
         } else if (ext == ".u8bin") {
             return run_pipeline_impl<uint8_t>(input_path, output_root, search_max_iters,
                                               neighbors_m, nprobe, do_reorder, iterations,
-                                              config, ext);
+                                              config, ext, order_window_arg);
         } else if (ext == ".i8bin") {
             return run_pipeline_impl<int8_t>(input_path, output_root, search_max_iters,
                                              neighbors_m, nprobe, do_reorder, iterations,
-                                             config, ext);
+                                             config, ext, order_window_arg);
         } else if (ext == ".ibin") {
             return run_pipeline_impl<int32_t>(input_path, output_root, search_max_iters,
                                               neighbors_m, nprobe, do_reorder, iterations,
-                                              config, ext);
+                                              config, ext, order_window_arg);
         } else if (ext == ".ubin") {
             return run_pipeline_impl<uint32_t>(input_path, output_root, search_max_iters,
                                                neighbors_m, nprobe, do_reorder, iterations,
-                                               config, ext);
+                                               config, ext, order_window_arg);
         } else {
             throw std::runtime_error("Unsupported file extension: " + ext +
                 ". Supported: .fbin/.bin (float), .u8bin (uint8), .i8bin (int8), "
