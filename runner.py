@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Standalone Runner Script for GPANN Benchmarking
-Builds bucket2 and bucket_reordered, then executes the benchmark suite.
+Automates dependency setup (RAFT, RMM, CUTLASS, cuCollections), builds both targets, and benchmarks.
 """
 
 import os
@@ -15,28 +15,41 @@ def run_cmd(cmd: str, cwd: str = None):
     res = subprocess.run(cmd, shell=True, cwd=cwd, check=True)
     return res
 
-def main():
+def setup_dependencies():
     print("=" * 60)
-    print("  GPANN: Standalone Benchmark Runner")
+    print("  1. Setting up NVIDIA / RAPIDS Dependencies")
     print("=" * 60)
+    
+    # 1. System packages
+    run_cmd("apt-get update -qq && apt-get install -y -qq libboost-program-options-dev libfmt-dev nlohmann-json3-dev libspdlog-dev")
 
-    # 1. Ensure Dependencies & RAFT/RMM headers
-    if not os.path.exists("/content/raft"):
-        run_cmd("git clone --depth 1 -b branch-24.04 https://github.com/rapidsai/raft.git /content/raft")
-    if not os.path.exists("/content/rmm"):
-        run_cmd("git clone --depth 1 -b branch-24.04 https://github.com/rapidsai/rmm.git /content/rmm")
-    if not os.path.exists("/content/cuco"):
-        run_cmd("git clone --depth 1 https://github.com/NVIDIA/cuCollections.git /content/cuco")
+    # 2. NVIDIA / RAPIDS header repositories
+    repos = {
+        "/content/raft": "https://github.com/rapidsai/raft.git -b branch-24.04",
+        "/content/rmm": "https://github.com/rapidsai/rmm.git -b branch-24.04",
+        "/content/cutlass": "https://github.com/NVIDIA/cutlass.git -b v3.5.0",
+        "/content/cuco": "https://github.com/NVIDIA/cuCollections.git"
+    }
 
-    # Install apt dependencies
-    run_cmd("apt-get update -qq && apt-get install -y -qq libspdlog-dev libboost-program-options-dev libfmt-dev")
+    for path, repo in repos.items():
+        if not os.path.exists(path):
+            print(f"Cloning {path}...")
+            run_cmd(f"git clone --depth 1 {repo} {path}")
+        else:
+            print(f"✅ {path} already exists.")
 
-    # Set CUDA environment
+    # 3. Environment variables for CUDA
     os.environ["PATH"] = "/usr/local/cuda/bin:" + os.environ.get("PATH", "")
     os.environ["LD_LIBRARY_PATH"] = "/usr/local/cuda/lib64:" + os.environ.get("LD_LIBRARY_PATH", "")
 
-    # 2. Clean & Build
-    build_dir = "/content/GPU-talored-ANN/bucketDemo/buildBucket/build"
+def build_project():
+    print("\n" + "=" * 60)
+    print("  2. Building GPANN (bucket2 & bucket_reordered)")
+    print("=" * 60)
+
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    build_dir = os.path.join(base_dir, "bucketDemo/buildBucket/build")
+    
     shutil.rmtree(build_dir, ignore_errors=True)
     os.makedirs(build_dir, exist_ok=True)
 
@@ -49,11 +62,19 @@ def main():
     )
     run_cmd(cmake_cmd, cwd=build_dir)
     run_cmd(f"make -j{os.cpu_count() or 4} bucket2 bucket_reordered", cwd=build_dir)
+    print("✅ Binaries built successfully!")
 
-    # 3. Run Benchmark
-    benchmark_dir = "/content/GPU-talored-ANN/bucketDemo"
+def run_benchmark():
+    print("\n" + "=" * 60)
+    print("  3. Running Cache-Optimization Benchmark")
+    print("=" * 60)
+    
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    benchmark_dir = os.path.join(base_dir, "bucketDemo")
     run_cmd("python3 benchmark.py --sizes 50000 100000 200000 --dim 128 --k 32 --m 32", cwd=benchmark_dir)
-    print("\n✅ Benchmark completed successfully! Results saved to output/benchmark/benchmark_results.png")
+    print("\n🎉 Benchmark completed! Results plot saved to bucketDemo/output/benchmark/benchmark_results.png")
 
 if __name__ == "__main__":
-    main()
+    setup_dependencies()
+    build_project()
+    run_benchmark()
