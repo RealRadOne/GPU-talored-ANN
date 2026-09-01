@@ -69,6 +69,8 @@ include_directories(
     SYSTEM
     ${CONDA_INCLUDE}
     /content/raft/cpp/include
+    /content/rmm/include
+    /content/cuco/include
     /content/raft/cpp/build/_deps/nlohmann_json-src/include
     /home/lanlu/raft/cpp/include/
     /home/lanlu/miniconda3/envs/rapids_raft/targets/x86_64-linux/include
