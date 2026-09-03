@@ -24,14 +24,29 @@ def setup_dependencies():
     run_cmd("apt-get update -qq && apt-get install -y -qq libboost-program-options-dev libfmt-dev nlohmann-json3-dev libspdlog-dev")
 
     # 2. NVIDIA / RAPIDS header repositories
+    # Note: RAFT 24.04 officially targets CUTLASS v2.10.0. CUTLASS v3+ added
+    # OutputOp_::kIsSingleSource to EpilogueWithBroadcast, which is missing in RAFT 24.04's
+    # PairwiseDistanceEpilogueElementwise and causes build failure.
     repos = {
         "/content/fmt": "https://github.com/fmtlib/fmt.git -b 10.2.1",
         "/content/spdlog": "https://github.com/gabime/spdlog.git -b v1.12.0",
         "/content/raft": "https://github.com/rapidsai/raft.git -b branch-24.04",
         "/content/rmm": "https://github.com/rapidsai/rmm.git -b branch-24.04",
-        "/content/cutlass": "https://github.com/NVIDIA/cutlass.git -b v3.5.0",
+        "/content/cutlass": "https://github.com/NVIDIA/cutlass.git -b v2.10.0",
         "/content/cuco": "https://github.com/NVIDIA/cuCollections.git"
     }
+
+    # Clean up existing CUTLASS if it was previously cloned as v3.x
+    cutlass_dir = "/content/cutlass"
+    epilogue_hdr = os.path.join(cutlass_dir, "include/cutlass/epilogue/threadblock/epilogue_with_broadcast.h")
+    if os.path.exists(epilogue_hdr):
+        try:
+            with open(epilogue_hdr, "r", errors="ignore") as f:
+                if "kIsSingleSource" in f.read():
+                    print("⚠️ Incompatible CUTLASS v3+ detected in /content/cutlass. Removing to re-clone v2.10.0...")
+                    shutil.rmtree(cutlass_dir, ignore_errors=True)
+        except Exception as e:
+            print(f"Warning checking cutlass version: {e}")
 
     for path, repo in repos.items():
         if not os.path.exists(path):
@@ -39,6 +54,25 @@ def setup_dependencies():
             run_cmd(f"git clone --depth 1 {repo} {path}")
         else:
             print(f"✅ {path} already exists.")
+
+    # Additional safeguard: ensure RAFT's PairwiseDistanceEpilogueElementwise defines kIsSingleSource
+    raft_epilogue_hdr = "/content/raft/cpp/include/raft/distance/detail/pairwise_distance_epilogue_elementwise.h"
+    if os.path.exists(raft_epilogue_hdr):
+        try:
+            with open(raft_epilogue_hdr, "r") as f:
+                raft_hdr_content = f.read()
+            if "kIsSingleSource" not in raft_hdr_content:
+                target_str = "static int const kCount             = kElementsPerAccess;"
+                if target_str in raft_hdr_content:
+                    raft_hdr_content = raft_hdr_content.replace(
+                        target_str,
+                        f"{target_str}\n  static bool const kIsSingleSource   = true;"
+                    )
+                    with open(raft_epilogue_hdr, "w") as f:
+                        f.write(raft_hdr_content)
+                    print("✅ Applied compatibility patch: Defined kIsSingleSource in RAFT PairwiseDistanceEpilogueElementwise.")
+        except Exception as e:
+            print(f"Warning patching RAFT header: {e}")
 
     # 3. Environment variables for CUDA
     os.environ["PATH"] = "/usr/local/cuda/bin:" + os.environ.get("PATH", "")
