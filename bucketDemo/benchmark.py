@@ -30,8 +30,8 @@ def run_binary(bin_path: str, data_path: str, out_dir: str, k: int, m: int) -> d
     os.makedirs(out_dir, exist_ok=True)
     cmd = [
         bin_path,
-        "--data", data_path,
-        "--output_dir", out_dir,
+        "-i", data_path,
+        "-o", out_dir,
         "--knn-k", str(k),
         "--neighbors-m", str(m),
         "--iterations", "1"
@@ -46,7 +46,7 @@ def run_binary(bin_path: str, data_path: str, out_dir: str, k: int, m: int) -> d
 
     # Parse timing metrics from output
     gemm_match = re.search(r"pure GEMM:\s*([\d\.]+)\s*ms", output)
-    total_match = re.search(r"Total pipeline elapsed:\s*([\d\.]+)\s*s", output)
+    total_match = re.search(r"(?:Total pipeline elapsed|Total):\s*([\d\.]+)\s*s", output)
 
     gemm_ms = float(gemm_match.group(1)) if gemm_match else 0.0
     total_s = float(total_match.group(1)) if total_match else 0.0

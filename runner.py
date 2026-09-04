@@ -153,7 +153,6 @@ def build_project():
     base_dir = os.path.dirname(os.path.abspath(__file__))
     build_dir = os.path.join(base_dir, "bucketDemo/buildBucket/build")
     
-    shutil.rmtree(build_dir, ignore_errors=True)
     os.makedirs(build_dir, exist_ok=True)
 
     cmake_cmd = (
