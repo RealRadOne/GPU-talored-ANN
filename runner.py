@@ -29,7 +29,7 @@ def setup_dependencies():
     # PairwiseDistanceEpilogueElementwise and causes build failure.
     repos = {
         "/content/fmt": "https://github.com/fmtlib/fmt.git -b 10.2.1",
-        "/content/spdlog": "https://github.com/gabime/spdlog.git -b v1.12.0",
+        "/content/spdlog": "https://github.com/gabime/spdlog.git -b v1.13.0",
         "/content/raft": "https://github.com/rapidsai/raft.git -b branch-24.04",
         "/content/rmm": "https://github.com/rapidsai/rmm.git -b branch-24.04",
         "/content/cutlass": "https://github.com/NVIDIA/cutlass.git -b v2.10.0",
@@ -47,6 +47,18 @@ def setup_dependencies():
                     shutil.rmtree(cutlass_dir, ignore_errors=True)
         except Exception as e:
             print(f"Warning checking cutlass version: {e}")
+
+    # Clean up existing spdlog if it was previously cloned as v1.12.0 (lacks nvcc/fmt constexpr fix #2901)
+    spdlog_dir = "/content/spdlog"
+    spdlog_hdr = os.path.join(spdlog_dir, "include/spdlog/common.h")
+    if os.path.exists(spdlog_hdr):
+        try:
+            with open(spdlog_hdr, "r", errors="ignore") as f:
+                if "SPDLOG_CONSTEXPR_FUNC FMT_CONSTEXPR" not in f.read():
+                    print("⚠️ Incompatible spdlog v1.12 detected in /content/spdlog. Removing to re-clone v1.13.0...")
+                    shutil.rmtree(spdlog_dir, ignore_errors=True)
+        except Exception as e:
+            print(f"Warning checking spdlog version: {e}")
 
     for path, repo in repos.items():
         if not os.path.exists(path):
@@ -73,6 +85,22 @@ def setup_dependencies():
                     print("✅ Applied compatibility patch: Defined kIsSingleSource in RAFT PairwiseDistanceEpilogueElementwise.")
         except Exception as e:
             print(f"Warning patching RAFT header: {e}")
+
+    # Additional safeguard: ensure spdlog's common.h doesn't define SPDLOG_CONSTEXPR_FUNC as constexpr under nvcc
+    if os.path.exists(spdlog_hdr):
+        try:
+            with open(spdlog_hdr, "r") as f:
+                spd_content = f.read()
+            if "SPDLOG_CONSTEXPR_FUNC FMT_CONSTEXPR" not in spd_content and "#        define SPDLOG_CONSTEXPR_FUNC constexpr" in spd_content:
+                spd_content = spd_content.replace(
+                    "#        define SPDLOG_CONSTEXPR_FUNC constexpr",
+                    "#        define SPDLOG_CONSTEXPR_FUNC inline"
+                )
+                with open(spdlog_hdr, "w") as f:
+                    f.write(spd_content)
+                print("✅ Applied compatibility patch: Inlined SPDLOG_CONSTEXPR_FUNC in spdlog/common.h.")
+        except Exception as e:
+            print(f"Warning patching spdlog header: {e}")
 
     # 3. Environment variables for CUDA
     os.environ["PATH"] = "/usr/local/cuda/bin:" + os.environ.get("PATH", "")
