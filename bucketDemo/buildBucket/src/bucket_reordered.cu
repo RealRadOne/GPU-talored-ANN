@@ -1581,6 +1581,9 @@ std::vector<uint32_t> expand_centroid_neighbors_gpu(
     uint32_t* d_graph      = nullptr;
     uint32_t* d_neighbors  = nullptr;
     float*    d_distances  = nullptr;
+    if (centroids_host.empty()) {
+        throw std::runtime_error("expand_centroid_neighbors_gpu: centroids_host is empty");
+    }
 
     size_t dataset_bytes    = static_cast<size_t>(n_centroids) * D * sizeof(float);
     size_t graph_bytes      = static_cast<size_t>(n_centroids) * K * sizeof(uint32_t);
@@ -3345,10 +3348,8 @@ int run_pipeline_impl(
         auto t4 = Clock::now();
 
         // Step 6 需要 centroid 坐标做邻居扩展; 在 Step 4 释放 GPU centroids 前先存 CPU
-        // (nprobe != knn_k 时都需要; nprobe == 0 表示用 knn_k, 此时也不需要)
         std::vector<float> centroids_host_for_step6;
-        bool need_centroids_for_step6 =
-            (neighbors_m > 0) && (nprobe > 0) && (nprobe != config.knn_k);
+        bool need_centroids_for_step6 = (neighbors_m > 0);
         if (need_centroids_for_step6) {
             centroids_host_for_step6.resize(static_cast<size_t>(n_centroids) * D);
             CUDA_CHECK(cudaMemcpy(centroids_host_for_step6.data(), d_centroids_f32,
