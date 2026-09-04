@@ -28,8 +28,8 @@ if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
     set(CMAKE_CUDA_ARCHITECTURES 75 70 80 86)
 endif()
 
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mavx2 -mfma -msse2 -ftree-vectorize -fno-builtin-malloc -fno-builtin-calloc -fno-builtin-realloc -fno-builtin-free -fopenmp -fopenmp-simd -funroll-loops -Wfatal-errors -DUSE_AVX2 -DLIBCUDACXX_ENABLE_EXPERIMENTAL_MEMORY_RESOURCE -DRAFT_SYSTEM_LITTLE_ENDIAN=1 -include fmt/ostream.h -I/content/fmt/include -I/content/spdlog/include -I/content/raft/cpp/include -I/content/rmm/include -I/content/cuco/include -I/content/cutlass/include")
-set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -DLIBCUDACXX_ENABLE_EXPERIMENTAL_MEMORY_RESOURCE -DRAFT_SYSTEM_LITTLE_ENDIAN=1 --extended-lambda --expt-relaxed-constexpr -I/content/fmt/include -I/content/spdlog/include -I/content/raft/cpp/include -I/content/rmm/include -I/content/cuco/include -I/content/cutlass/include")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mavx2 -mfma -msse2 -ftree-vectorize -fno-builtin-malloc -fno-builtin-calloc -fno-builtin-realloc -fno-builtin-free -fopenmp -fopenmp-simd -funroll-loops -Wfatal-errors -DUSE_AVX2 -DLIBCUDACXX_ENABLE_EXPERIMENTAL_MEMORY_RESOURCE -DRAFT_SYSTEM_LITTLE_ENDIAN=1 -DFMT_HEADER_ONLY=1 -include fmt/ostream.h -I/content/fmt/include -I/content/spdlog/include -I/content/raft/cpp/include -I/content/rmm/include -I/content/cuco/include -I/content/cutlass/include")
+set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -DLIBCUDACXX_ENABLE_EXPERIMENTAL_MEMORY_RESOURCE -DRAFT_SYSTEM_LITTLE_ENDIAN=1 -DFMT_HEADER_ONLY=1 --extended-lambda --expt-relaxed-constexpr -I/content/fmt/include -I/content/spdlog/include -I/content/raft/cpp/include -I/content/rmm/include -I/content/cuco/include -I/content/cutlass/include")
 
 find_package(Boost QUIET COMPONENTS program_options)
 if(NOT Boost_FOUND)
@@ -102,9 +102,9 @@ target_link_libraries(bucket
     PRIVATE
     CUDA::cudart
     CUDA::cublas
+    CUDA::cublasLt
     OpenMP::OpenMP_CXX
     raft::raft
-    fmt
     boost_program_options
 )
 
@@ -119,9 +119,9 @@ target_link_libraries(bucket2
     PRIVATE
     CUDA::cudart
     CUDA::cublas
+    CUDA::cublasLt
     OpenMP::OpenMP_CXX
     raft::raft
-    fmt
     boost_program_options
 )
 
@@ -136,9 +136,9 @@ target_link_libraries(bucket_reordered
     PRIVATE
     CUDA::cudart
     CUDA::cublas
+    CUDA::cublasLt
     OpenMP::OpenMP_CXX
     raft::raft
-    fmt
     boost_program_options
 )
 
@@ -153,9 +153,10 @@ add_executable(optimize ${BUILD_SRC_PATH}/optimize.cu)
 target_link_libraries(optimize
     PRIVATE
     CUDA::cudart
+    CUDA::cublas
+    CUDA::cublasLt
     OpenMP::OpenMP_CXX
     raft::raft
-    fmt
     boost_program_options
 )
 
@@ -171,8 +172,9 @@ add_executable(optimize_chunked ${BUILD_SRC_PATH}/optimize_chunked.cu)
 target_link_libraries(optimize_chunked
     PRIVATE
     CUDA::cudart
+    CUDA::cublas
+    CUDA::cublasLt
     OpenMP::OpenMP_CXX
-    fmt
     boost_program_options
 )
 

@@ -12,8 +12,35 @@ import shutil
 
 def run_cmd(cmd: str, cwd: str = None):
     print(f"🚀 [Executing] {cmd}")
-    res = subprocess.run(cmd, shell=True, cwd=cwd, check=True)
-    return res
+    proc = subprocess.Popen(
+        cmd,
+        shell=True,
+        cwd=cwd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1
+    )
+    captured_lines = []
+    for line in proc.stdout:
+        print(line, end="", flush=True)
+        captured_lines.append(line)
+    proc.wait()
+    if proc.returncode != 0:
+        print("\n" + "=" * 60)
+        print("❌ COMMAND FAILED!")
+        print("=" * 60)
+        error_lines = [
+            l.strip() for l in captured_lines
+            if any(k in l.lower() for k in ["error:", "fatal:", "undefined reference", "killed", "signal 9", "cannot find"])
+        ]
+        if error_lines:
+            print("\n🚨 Extracted Compiler / Linker Errors:")
+            for err in error_lines[-30:]:
+                print(f"  ▶ {err}")
+            print("=" * 60)
+        raise subprocess.CalledProcessError(proc.returncode, cmd)
+    return proc
 
 def setup_dependencies():
     print("=" * 60)
@@ -102,6 +129,18 @@ def setup_dependencies():
         except Exception as e:
             print(f"Warning patching spdlog header: {e}")
 
+    # Build & install fmt 10.2.1 to /usr/local so both header-only and static linking are guaranteed compatible
+    fmt_dir = "/content/fmt"
+    if os.path.exists(fmt_dir):
+        fmt_lib = os.path.join(fmt_dir, "build/libfmt.a")
+        if not os.path.exists(fmt_lib):
+            try:
+                print("📦 Building & installing fmt 10.2.1 to /usr/local...")
+                run_cmd("cmake -B build -DCMAKE_POSITION_INDEPENDENT_CODE=ON -DFMT_DOC=OFF -DFMT_TEST=OFF -DCMAKE_INSTALL_PREFIX=/usr/local && cmake --build build -j2 && cmake --install build", cwd=fmt_dir)
+                print("✅ fmt 10.2.1 installed to /usr/local.")
+            except Exception as e:
+                print(f"Warning building fmt: {e}")
+
     # 3. Environment variables for CUDA
     os.environ["PATH"] = "/usr/local/cuda/bin:" + os.environ.get("PATH", "")
     os.environ["LD_LIBRARY_PATH"] = "/usr/local/cuda/lib64:" + os.environ.get("LD_LIBRARY_PATH", "")
@@ -125,7 +164,11 @@ def build_project():
         "-DCMAKE_CUDA_ARCHITECTURES=75"
     )
     run_cmd(cmake_cmd, cwd=build_dir)
-    run_cmd(f"make -j{os.cpu_count() or 4} bucket2 bucket_reordered", cwd=build_dir)
+    # Build targets sequentially to prevent memory exhaustion (OOM) on 2-vCPU / 12GB instances
+    print("🔨 Building target 'bucket2'...")
+    run_cmd("make -j1 bucket2", cwd=build_dir)
+    print("🔨 Building target 'bucket_reordered'...")
+    run_cmd("make -j1 bucket_reordered", cwd=build_dir)
     print("✅ Binaries built successfully!")
 
 def run_benchmark():
