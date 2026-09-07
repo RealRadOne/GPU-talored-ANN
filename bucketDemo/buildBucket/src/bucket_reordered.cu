@@ -2243,7 +2243,8 @@ void build_vector_knn_with_tensorcore(
     int64_t n_centroids,
     uint32_t K,
     int M,
-    RunningKnnFile& running)
+    RunningKnnFile& running,
+    const std::string& output_dir = "")
 {
     constexpr bool want_distances = true;  // merge_row_into_disk 总是需要距离
     // ============= Stage 2 路径选择（INT8 IMMA / fp32 fallback）=============
@@ -2595,8 +2596,61 @@ void build_vector_knn_with_tensorcore(
     int64_t processed_buckets = 0;
     auto loop_t0 = std::chrono::high_resolution_clock::now();
 
-    for (int64_t c = 0; c < n_centroids; ++c) {
+    // Compute task ordering for Step 6 cache-locality
+    auto bucket_process_order = bucket_order::compute_bucket_processing_order(
+        bucket_order::adjacency_from_flat_graph(
+            centroid_knn_graph, n_centroids, static_cast<int32_t>(K)),
+        64);
+
+    // Algorithmic Bucket Cache Tracker (Capacity = 64 buckets)
+    const size_t cache_capacity = 64;
+    std::unordered_map<int32_t, int64_t> cache_map;
+    int64_t cache_access_time = 0;
+    int64_t cache_hits = 0;
+    int64_t cache_misses = 0;
+    std::vector<std::pair<double, double>> cache_trace;
+
+    auto access_bucket = [&](int32_t b_id) {
+        cache_access_time++;
+        auto it = cache_map.find(b_id);
+        if (it != cache_map.end()) {
+            cache_hits++;
+            it->second = cache_access_time;
+        } else {
+            cache_misses++;
+            if (cache_map.size() >= cache_capacity) {
+                int32_t lru_id = -1;
+                int64_t min_t = std::numeric_limits<int64_t>::max();
+                for (const auto& kv : cache_map) {
+                    if (kv.second < min_t) {
+                        min_t = kv.second;
+                        lru_id = kv.first;
+                    }
+                }
+                if (lru_id != -1) cache_map.erase(lru_id);
+            }
+            cache_map[b_id] = cache_access_time;
+        }
+    };
+
+    for (int64_t step_idx = 0; step_idx < n_centroids; ++step_idx) {
+        int64_t c = (step_idx < static_cast<int64_t>(bucket_process_order.size()))
+            ? static_cast<int64_t>(bucket_process_order[step_idx]) : step_idx;
         if (buckets[c].empty()) continue;
+
+        access_bucket(static_cast<int32_t>(c));
+        for (uint32_t k = 0; k < K; ++k) {
+            uint32_t nb_c = centroid_knn_graph[c * K + k];
+            if (nb_c < static_cast<uint32_t>(n_centroids) && !buckets[nb_c].empty()) {
+                access_bucket(static_cast<int32_t>(nb_c));
+            }
+        }
+        if (n_centroids > 0 && (step_idx % std::max<int64_t>(1, n_centroids / 100) == 0 || step_idx == n_centroids - 1)) {
+            double prog = (static_cast<double>(step_idx + 1) / n_centroids) * 100.0;
+            double mr = (cache_hits + cache_misses > 0)
+                ? (static_cast<double>(cache_misses) / (cache_hits + cache_misses) * 100.0) : 100.0;
+            cache_trace.emplace_back(prog, mr);
+        }
 
         int slot = static_cast<int>(c % num_slots);
 
@@ -2786,6 +2840,27 @@ void build_vector_knn_with_tensorcore(
               << " ms/bucket avg, "
               << (gemm_total_ms / std::max(1e-6, loop_ms) * 100.0)
               << "% of loop wall-time\n";
+
+    double final_mr = (cache_hits + cache_misses > 0)
+        ? (static_cast<double>(cache_misses) / (cache_hits + cache_misses) * 100.0) : 0.0;
+    std::cout << "  [CacheTrack] Capacity=" << cache_capacity
+              << " | Hits=" << cache_hits
+              << " | Misses=" << cache_misses
+              << " | Final Miss Rate: " << std::fixed << std::setprecision(2) << final_mr << "%\n";
+
+    if (!output_dir.empty()) {
+        std::string trace_path = output_dir + "/cache_miss_trace.csv";
+        std::ofstream trace_out(trace_path);
+        if (trace_out.is_open()) {
+            trace_out << "progress_pct,miss_rate_pct\n";
+            for (const auto& pt : cache_trace) {
+                trace_out << std::fixed << std::setprecision(2) << pt.first << ","
+                          << std::fixed << std::setprecision(2) << pt.second << "\n";
+            }
+            trace_out.close();
+            std::cout << "  [CacheTrack] Saved " << trace_path << "\n";
+        }
+    }
 
     // ---- 释放 ----
     cudaFree(d_X_full);
@@ -3476,7 +3551,8 @@ int run_pipeline_impl(
                 centroid_global_indices,
                 graph_ptr,
                 n_centroids, graph_K, neighbors_m,
-                *running_knn_file);
+                *running_knn_file,
+                output_dir);
 
             cudaDeviceSynchronize();
             double iter_step6 = std::chrono::duration<double>(Clock::now() - t6).count();
