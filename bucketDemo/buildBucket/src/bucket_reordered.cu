@@ -2637,14 +2637,7 @@ void build_vector_knn_with_tensorcore(
                                    cudaMemcpyHostToDevice, streams[slot]));
 
         // ---- 3d: GPU gather A / B / norms_pool ----
-        // INT8 路径: gather_rows_raw 不转换 type；FP32 路径: gather_rows_int32 cast 到 fp32
         {
-            int threads = 256;
-            int64_t total_A  = static_cast<int64_t>(bucket_size) * D;
-            int64_t blocks_A = (total_A + threads - 1) / threads;
-            int64_t total_B  = static_cast<int64_t>(pool_size) * D;
-            int64_t blocks_B = (total_B + threads - 1) / threads;
-
             size_t cur_pool_offset = 0;
             auto copy_bucket_slice = [&](int64_t b_idx) {
                 int64_t b_start = bucket_offsets[b_idx];
