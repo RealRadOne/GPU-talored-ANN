@@ -52,28 +52,39 @@ def stream_lance_laion_to_fbin(out_path: str, max_vectors: int = 1000000) -> str
         print("Note: lance is not installed. To stream LAION-1M, run: pip install pylance")
         return None
 
-    print(f"Streaming LAION-1M embeddings via lance...")
-    token = DEFAULT_HF_TOKEN
-    storage_options = {"hf_token": token} if token else {}
-    ds = lance.dataset("hf://datasets/lance-format/laion-1m/data/train.lance", storage_options=storage_options)
+    try:
+        print(f"Streaming LAION-1M embeddings via lance...")
+        token = DEFAULT_HF_TOKEN
+        storage_options = {"hf_token": token} if token else {}
+        ds = lance.dataset("hf://datasets/lance-format/laion-1m/data/train.lance", storage_options=storage_options)
 
-    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
-    with open(out_path, "wb") as f:
-        f.write(struct.pack("ii", 0, 0))
-        total = 0
-        dim = None
-        for batch in ds.to_batches(columns=["img_emb"], batch_size=50000):
-            arr = np.stack(batch["img_emb"].to_numpy()).astype(np.float32)
-            if dim is None:
-                dim = arr.shape[1]
-            f.write(arr.tobytes())
-            total += len(arr)
-            print(f"  Streamed {total:,} / {max_vectors:,} LAION vectors...")
-            if total >= max_vectors:
-                break
-        f.seek(0)
-        f.write(struct.pack("ii", total, dim))
-    return out_path
+        os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+        part_path = out_path + ".tmp"
+        with open(part_path, "wb") as f:
+            f.write(struct.pack("ii", 0, 0))
+            total = 0
+            dim = None
+            for batch in ds.to_batches(columns=["img_emb"], batch_size=50000):
+                col = batch["img_emb"]
+                if hasattr(col, "values"):
+                    arr = np.array(col.values.to_numpy(zero_copy_only=False), dtype=np.float32).reshape(len(batch), -1)
+                else:
+                    arr = np.array(col.to_pylist(), dtype=np.float32)
+
+                if dim is None:
+                    dim = arr.shape[1]
+                f.write(arr.tobytes())
+                total += len(arr)
+                print(f"  Streamed {total:,} / {max_vectors:,} LAION vectors...")
+                if total >= max_vectors:
+                    break
+            f.seek(0)
+            f.write(struct.pack("ii", total, dim))
+        os.rename(part_path, out_path)
+        return out_path
+    except Exception as e:
+        print(f"Warning: lance streaming failed: {e}")
+        return None
 
 def prepare_dataset(name: str, out_dir: str) -> str:
     name_lower = name.lower()

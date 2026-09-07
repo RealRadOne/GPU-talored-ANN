@@ -37,6 +37,7 @@ def fetch_dependency(name, archive_url, git_url, git_ref, target_path, verify_su
 def setup_dependencies():
     print("1. Installing system dependencies and RAPIDS/CUDA headers...")
     sh("apt-get update -qq && apt-get install -y -qq libboost-program-options-dev nlohmann-json3-dev")
+    sh("pip install -q pylance h5py pyarrow")
 
     deps = [
         ("fmt", "https://github.com/fmtlib/fmt/archive/refs/tags/10.2.1.tar.gz", "https://github.com/fmtlib/fmt.git", "10.2.1", "/content/fmt", "include/fmt/core.h"),
