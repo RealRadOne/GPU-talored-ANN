@@ -74,8 +74,8 @@ def main():
         else:
             data_path = prepare_dataset(dtype, data_dir)
 
-        if not os.path.exists(data_path):
-            print(f"Skipping {name}: file not found at {data_path}")
+        if not data_path or not os.path.exists(data_path):
+            print(f"Skipping {name}: file not ready")
             continue
 
         print(f"\nEvaluating {name} ({data_path}):")
