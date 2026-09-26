@@ -587,6 +587,9 @@ void build_vector_knn_with_tensorcore(
     CUDA_CHECK(cudaStreamCreate(&transfer_stream));
     size_t bytes_X = N * sizeof(float);
 
+    void* d_X_full = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_X_full, bytes_X));
+
     cudaEvent_t start_event, end_event;
     cudaEventCreate(&start_event);
     cudaEventCreate(&end_event);

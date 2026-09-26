@@ -647,4 +647,12 @@ int main(int argc, char** argv) {
                 ". Supported: .fbin/.bin (float), .u8bin (uint8), .i8bin (int8), "
                 ".ibin (int32), .ubin (uint32).");
         }
+        catch (const std::exception& e) {
+        std::cerr << "[Error] Exception caught in main: " << e.what() << std::endl;
+        return 1;
+        } catch (...) {
+        std::cerr << "[Error] Unknown exception caught in main." << std::endl;
+        return 1;
+        }
+        return 0;
     }
