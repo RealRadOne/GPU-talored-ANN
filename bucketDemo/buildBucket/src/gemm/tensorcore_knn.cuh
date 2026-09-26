@@ -1,12 +1,4 @@
 #pragma once
-
-cudaEvent_t begin(cudaStream_t stream) {
-    cudaEvent_t e;
-    CUDA_CHECK(cudaEventCreate(&e));
-    CUDA_CHECK(cudaEventRecord(e, stream));
-    return e;
-}
-
 // ============== Phase 12: Per-Vector KNN via Tensor Core Bucket MatMul ==============
 
 // 计算 X 中每行的 L2 范数平方: norms[i] = sum_d X[i,d]^2
@@ -591,6 +583,22 @@ void build_vector_knn_with_tensorcore(
     RunningKnnFile& running,
     const std::string& output_dir = "")
 {
+
+    cudaEVent_t start_event, end_event;
+    cudaEventCreate(&start_event);
+    cudaEventCreate(&end_event);
+
+    cudaEventRecord(start_event,streams[0]);
+    CUDA_CHECK(cudaMemcpyAsync(d_X_full, X_reordered.data(),bytes_X, cudaMemcpyHostToDevice,streams[0]));
+    cudaEventSynchronize(start_event);
+
+    float ms = 0.0f;
+    cudaEventElapsedTime(&ms, start_event, end_event);
+    printf("[step6_full_upload] bytes=%zu ms=%.3f gbps=%.2f\n", bytes_X, ms, gb_per_s);
+
+    cudaEventDestroy(start_event);
+    cudaEventDestroy(end_event);
+
     constexpr bool want_distances = true;  // merge_row_into_disk 总是需要距离
     // ============= Stage 2 路径选择（INT8 IMMA / fp32 fallback）=============
     // - int8/uint8 → 走 INT8 IMMA Tensor Core（uint8 入口先减 128 转 int8）
