@@ -584,7 +584,7 @@ void build_vector_knn_with_tensorcore(
     const std::string& output_dir = "")
 {
 
-    cudaEVent_t start_event, end_event;
+    cudaEvent_t start_event, end_event;
     cudaEventCreate(&start_event);
     cudaEventCreate(&end_event);
 
