@@ -647,3 +647,4 @@ int main(int argc, char** argv) {
                 ". Supported: .fbin/.bin (float), .u8bin (uint8), .i8bin (int8), "
                 ".ibin (int32), .ubin (uint32).");
         }
+    }
