@@ -45,12 +45,12 @@ def main():
     args = parser.parse_args()
 
     bin_base = os.path.join(REPO_ROOT, "bucketDemo", "buildBucket", "build", "bucket2")
-    bin_opt = os.path.join(REPO_ROOT, "bucketDemo", "buildBucket", "build", "bucket_reordered")
+    bin_opt = os.path.join(REPO_ROOT, "bucketDemo", "buildBucket", "build", "gpann_modular")
     data_dir = os.path.join(REPO_ROOT, "test_data")
     out_dir = os.path.join(os.path.dirname(__file__), "output")
 
     print("=" * 60)
-    print("GPANN Benchmark Suite: Baseline (bucket2) vs Cache-Opt (bucket_reordered)")
+    print("GPANN Benchmark Suite: Baseline (bucket2) vs Modular Cache-Opt (gpann_modular)")
     print("=" * 60)
 
     # 1 Test trial on generated data, followed by mandated real benchmark datasets

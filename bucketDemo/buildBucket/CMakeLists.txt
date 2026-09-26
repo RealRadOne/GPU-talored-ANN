@@ -92,60 +92,6 @@ link_directories(
 
 set(BUILD_SRC_PATH ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
-set(BUILD_SOURCES
-    bucket_build.cu)
-list(TRANSFORM BUILD_SOURCES PREPEND ${BUILD_SRC_PATH}/)
-
-add_executable(bucket ${BUILD_SOURCES})
-
-target_link_libraries(bucket
-    PRIVATE
-    CUDA::cudart
-    CUDA::cublas
-    CUDA::cublasLt
-    OpenMP::OpenMP_CXX
-    raft::raft
-    boost_program_options
-)
-
-set_target_properties(bucket PROPERTIES
-    BUILD_RPATH ${CONDA_LIB}
-)
-
-# bucket2: bucket.cu (with tensor core matmul + per-vector KNN)
-add_executable(bucket2 ${BUILD_SRC_PATH}/bucket.cu)
-
-target_link_libraries(bucket2
-    PRIVATE
-    CUDA::cudart
-    CUDA::cublas
-    CUDA::cublasLt
-    OpenMP::OpenMP_CXX
-    raft::raft
-    boost_program_options
-)
-
-set_target_properties(bucket2 PROPERTIES
-    BUILD_RPATH ${CONDA_LIB}
-)
-
-# bucket_reordered: bucket_reordered.cu (with cache-optimized contiguous bucket slice layout)
-add_executable(bucket_reordered ${BUILD_SRC_PATH}/bucket_reordered.cu)
-
-target_link_libraries(bucket_reordered
-    PRIVATE
-    CUDA::cudart
-    CUDA::cublas
-    CUDA::cublasLt
-    OpenMP::OpenMP_CXX
-    raft::raft
-    boost_program_options
-)
-
-set_target_properties(bucket_reordered PROPERTIES
-    BUILD_RPATH ${CONDA_LIB}
-)
-
 # optimize: standalone tool that runs CAGRA sort_knn_graph + optimize on
 # the vector_knn.bin produced by bucket.cu, yielding a pruned CAGRA graph.
 add_executable(optimize ${BUILD_SRC_PATH}/optimize.cu)
@@ -193,5 +139,39 @@ target_link_libraries(reorder
 )
 
 set_target_properties(reorder PROPERTIES
+    BUILD_RPATH ${CONDA_LIB}
+)
+
+# gpann_modular: modularized version of bucket_reordered
+add_executable(gpann_modular ${BUILD_SRC_PATH}/run_pipeline.cu)
+
+target_link_libraries(gpann_modular
+    PRIVATE
+    CUDA::cudart
+    CUDA::cublas
+    CUDA::cublasLt
+    OpenMP::OpenMP_CXX
+    raft::raft
+    boost_program_options
+)
+
+set_target_properties(gpann_modular PROPERTIES
+    BUILD_RPATH ${CONDA_LIB}
+)
+
+# bucket2: baseline bucket.cu
+add_executable(bucket2 ${BUILD_SRC_PATH}/bucket.cu)
+
+target_link_libraries(bucket2
+    PRIVATE
+    CUDA::cudart
+    CUDA::cublas
+    CUDA::cublasLt
+    OpenMP::OpenMP_CXX
+    raft::raft
+    boost_program_options
+)
+
+set_target_properties(bucket2 PROPERTIES
     BUILD_RPATH ${CONDA_LIB}
 )

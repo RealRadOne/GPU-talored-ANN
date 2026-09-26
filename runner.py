@@ -65,8 +65,8 @@ def build_and_benchmark():
     os.makedirs(build_dir, exist_ok=True)
 
     print("\n2. Building GPANN binaries...")
-    cmake_flags = "-DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=/usr/bin/g++ -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc -DCMAKE_CUDA_ARCHITECTURES=75"
-    sh(f"cmake .. {cmake_flags} && make -j1 bucket2 && make -j1 bucket_reordered", cwd=build_dir)
+    cmake_flags = "-DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=75"
+    sh(f"cmake .. {cmake_flags} && make -j1 bucket2 && make -j4 gpann_modular", cwd=build_dir)
 
     print("\n3. Running benchmark orchestrator...")
     benchmark_dir = os.path.join(base_dir, "benchmark")

@@ -4,6 +4,7 @@ import math
 import triton
 import triton.language as tl
 
+
 @torch.inference_mode()
 def measure_cuda_time(fn, warmup=5, repeat=20):
     for _ in range(warmup):
@@ -20,6 +21,7 @@ def measure_cuda_time(fn, warmup=5, repeat=20):
     ms = start.elapsed_time(end) / repeat
     return ms
 
+
 def get_dtype_info(dtype_name):
     if dtype_name == "fp32":
         return torch.float32, 4
@@ -33,20 +35,27 @@ def get_dtype_info(dtype_name):
 
 @triton.jit
 def l2sq_pairs_kernel(
-    X_ptr, Y_ptr, O_ptr,
-    IX_ptr, IY_ptr,
-    n: tl.constexpr, m: tl.constexpr, d: tl.constexpr,
-    stride_xn, stride_xd,
-    stride_ym, stride_yd,
+    X_ptr,
+    Y_ptr,
+    O_ptr,
+    IX_ptr,
+    IY_ptr,
+    n: tl.constexpr,
+    m: tl.constexpr,
+    d: tl.constexpr,
+    stride_xn,
+    stride_xd,
+    stride_ym,
+    stride_yd,
     BLOCK_D: tl.constexpr,
 ):
-    pid = tl.program_id(axis=0)   # 当前线程 = 第 pid 个 pair
-    i = tl.load(IX_ptr + pid)     # X 的行
-    j = tl.load(IY_ptr + pid)     # Y 的行
+    pid = tl.program_id(axis=0)  # 当前线程 = 第 pid 个 pair
+    i = tl.load(IX_ptr + pid)  # X 的行
+    j = tl.load(IY_ptr + pid)  # Y 的行
 
     # 可选越界保护
     cond = (i >= 0) & (i < n) & (j >= 0) & (j < m)
-    if ~cond:
+    if cond:
         tl.store(O_ptr + pid, 0.0)
         return
 
@@ -64,6 +73,7 @@ def l2sq_pairs_kernel(
 
     tl.store(O_ptr + pid, acc)
 
+
 @torch.inference_mode()
 def l2sq_pairwise(A, B, ix, iy, block_d=128, num_warps=4, out=None):
     """
@@ -72,7 +82,9 @@ def l2sq_pairwise(A, B, ix, iy, block_d=128, num_warps=4, out=None):
     整型输入会在函数里上浮到 float32 计算，避免溢出与类型限制。
     """
     assert A.dim() == 2 and B.dim() == 2 and A.size(1) == B.size(1)
-    assert ix.shape == iy.shape and ix.device.type == "cuda" and iy.device.type == "cuda"
+    assert (
+        ix.shape == iy.shape and ix.device.type == "cuda" and iy.device.type == "cuda"
+    )
     n, d = A.shape
     m = B.shape[0]
     dev = A.device
@@ -86,47 +98,60 @@ def l2sq_pairwise(A, B, ix, iy, block_d=128, num_warps=4, out=None):
 
     grid = (triton.cdiv(P, 1),)
     l2sq_pairs_kernel[grid](
-        Af, Bf, out,
-        ix, iy,
-        n, m, d,
-        Af.stride(0), Af.stride(1),
-        Bf.stride(0), Bf.stride(1),
+        Af,
+        Bf,
+        out,
+        ix,
+        iy,
+        n,
+        m,
+        d,
+        Af.stride(0),
+        Af.stride(1),
+        Bf.stride(0),
+        Bf.stride(1),
         BLOCK_D=block_d,
         num_warps=num_warps,
     )
     return out
 
+
 # def l2sq_pairwise_shard(X, Y, pair_idx):
 
 
 def l2sq_pairwise_expand(X, Y, pair_idx):
-    x = X.index_select(0, pair_idx[:,0])
-    y = Y.index_select(0, pair_idx[:,1])
-    print(f"pairwise computation: shape of matrix x: {x.shape}, shape of matrxt y: {y.shape}")
+    x = X.index_select(0, pair_idx[:, 0])
+    y = Y.index_select(0, pair_idx[:, 1])
+    print(
+        f"pairwise computation: shape of matrix x: {x.shape}, shape of matrxt y: {y.shape}"
+    )
     # 若为整型，则提升为float计算距离
     if not x.is_floating_point():
-        x = x.float(); y = y.float()
+        x = x.float()
+        y = y.float()
     return ((x - y) ** 2).sum(dim=-1)
-
 
 
 def l2sq_vec_mat(X, Y):
     if not X.is_floating_point():
-        X = X.float(); Y = Y.float()
+        X = X.float()
+        Y = Y.float()
     dot = X @ Y.t()
     xn = (X**2).sum(dim=1, keepdim=True)
     yn = (Y**2).sum(dim=1).unsqueeze(0)
-    return xn + yn - 2*dot
+    return xn + yn - 2 * dot
 
 
 def l2sq_single_vec(x, Y):
     """单个向量 x 与矩阵 Y 的 L2^2 距离"""
     if not x.is_floating_point():
-        x = x.float(); Y = Y.float()
-    dot = (x.unsqueeze(0) @ Y.t())  # (1,m)
+        x = x.float()
+        Y = Y.float()
+    dot = x.unsqueeze(0) @ Y.t()  # (1,m)
     xn = (x**2).sum()
     yn = (Y**2).sum(dim=1)
-    return xn + yn - 2*dot.squeeze(0)
+    return xn + yn - 2 * dot.squeeze(0)
+
 
 def multi_vecmat_individual(X, Y):
     """对 X 中的每个 x_i 分别计算 l2sq(x_i, Y)"""
@@ -139,17 +164,22 @@ def multi_vecmat_individual(X, Y):
 
 def l2sq_mat_mat(X, Y):
     if not X.is_floating_point():
-        X = X.float(); Y = Y.float()
+        X = X.float()
+        Y = Y.float()
     dot = X @ Y.t()
-    print(f"matrix computation: shape of matrix X: {X.shape}, shape of matrxt Y: {Y.shape}")
+    print(
+        f"matrix computation: shape of matrix X: {X.shape}, shape of matrxt Y: {Y.shape}"
+    )
     xn = (X**2).sum(dim=1, keepdim=True)
     yn = (Y**2).sum(dim=1).unsqueeze(0)
-    return xn + yn - 2*dot
+    return xn + yn - 2 * dot
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dtype", type=str, default="fp32", choices=["fp32","int32","int8"])
+    parser.add_argument(
+        "--dtype", type=str, default="fp32", choices=["fp32", "int32", "int8"]
+    )
     parser.add_argument("--n", type=int, default=32768)
     parser.add_argument("--m", type=int, default=32768)
     parser.add_argument("--d", type=int, default=128)
@@ -169,43 +199,53 @@ def main():
         X = (X * 100).to(dtype)
         Y = (Y * 100).to(dtype)
     else:
-        X = X.to(dtype); Y = Y.to(dtype)
+        X = X.to(dtype)
+        Y = Y.to(dtype)
 
     # 1) Pairwise
     P = args.pairs
-    pair_idx = torch.randint(0, args.n, (P,2), device="cuda", dtype=torch.long)
+    pair_idx = torch.randint(0, args.n, (P, 2), device="cuda", dtype=torch.long)
+
     def run_pair_expand():
         _ = l2sq_pairwise_expand(X, Y, pair_idx)
+
     ms_pair_expand_as_matrix = measure_cuda_time(run_pair_expand, repeat=args.repeat)
     print(f"[Pairwise_Expanded_Matrix] {P} pairs -> {ms_pair_expand_as_matrix:.3f} ms")
 
     ix = torch.randint(0, args.n, (P,), device="cuda", dtype=torch.long)
     iy = torch.randint(0, args.m, (P,), device="cuda", dtype=torch.long)
+
     # warmup
     # l2sq_pairswise(A, B, ix[:1024], iy[:1024])
     # torch.cuda.synchronize()
     def run_pair():
         _ = l2sq_pairwise(X, Y, ix, iy, block_d=128, num_warps=4)
+
     t1 = measure_cuda_time(run_pair, repeat=args.repeat)
     print(f"[Pairwise] {P} pairs -> {t1:.3f} ms")
 
     # 2) Vec-Mat
-    XB = X[:args.batch]
+    XB = X[: args.batch]
+
     def run_vm():
         _ = l2sq_vec_mat(XB, Y)
+
     ms_vecs_as_matrix = measure_cuda_time(run_vm, repeat=args.repeat)
     print(f"[Vec-Mat] {args.batch}x{args.m} -> {ms_vecs_as_matrix:.3f} ms")
 
     def run_multi_vecmat():
-        _ = multi_vecmat_individual(X[:args.batch], Y)
+        _ = multi_vecmat_individual(X[: args.batch], Y)
+
     t2 = measure_cuda_time(run_multi_vecmat, args.repeat)
     print(f"Multi-VecMat: {args.batch} independent (x,Y) -> {t2:.3f} ms")
 
     # 3) Mat-Mat
     n_small = min(args.n, 8192)
     m_small = min(args.m, 8192)
+
     def run_mm():
         _ = l2sq_mat_mat(X[:n_small], Y[:m_small])
+
     t3 = measure_cuda_time(run_mm, repeat=args.repeat)
     print(f"[Mat-Mat] {n_small}x{m_small} -> {t3:.3f} ms")
 
@@ -214,7 +254,9 @@ def main():
     print(f"Pairwise: {t1:.3f} ms,  Vec-Mat: {t2:.3f} ms,  Mat-Mat: {t3:.3f} ms")
     print(f"Relative Throughput (smaller=better):")
     base = min(t1, t2, t3)
-    print(f"Pairwise: {t1/base:.1f}×,  Vec-Mat: {t2/base:.1f}×,  Mat-Mat: {t3/base:.1f}×")
+    print(
+        f"Pairwise: {t1 / base:.1f}×,  Vec-Mat: {t2 / base:.1f}×,  Mat-Mat: {t3 / base:.1f}×"
+    )
 
 
 if __name__ == "__main__":
