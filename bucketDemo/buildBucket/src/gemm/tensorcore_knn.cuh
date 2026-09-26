@@ -583,17 +583,18 @@ void build_vector_knn_with_tensorcore(
     RunningKnnFile& running,
     const std::string& output_dir = "")
 {
-
     cudaEvent_t start_event, end_event;
     cudaEventCreate(&start_event);
     cudaEventCreate(&end_event);
 
-    cudaEventRecord(start_event,streams[0]);
-    CUDA_CHECK(cudaMemcpyAsync(d_X_full, X_reordered.data(),bytes_X, cudaMemcpyHostToDevice,streams[0]));
-    cudaEventSynchronize(start_event);
+    cudaEventRecord(start_event, streams[0]);
+    CUDA_CHECK(cudaMemcpyAsync(d_X_full, X_full, bytes_X, cudaMemcpyHostToDevice, streams[0]));
+    cudaEventRecord(end_event, streams[0]);
+    cudaEventSynchronize(end_event);
 
     float ms = 0.0f;
     cudaEventElapsedTime(&ms, start_event, end_event);
+    double gb_per_s = (bytes_X / 1e9) / (ms / 1e3);
     printf("[step6_full_upload] bytes=%zu ms=%.3f gbps=%.2f\n", bytes_X, ms, gb_per_s);
 
     cudaEventDestroy(start_event);
