@@ -583,6 +583,9 @@ void build_vector_knn_with_tensorcore(
     RunningKnnFile& running,
     const std::string& output_dir = "")
 {
+    cudaStream_t streams[1];
+    CUDA_CHECK(cudaStreamCreate(&streams[0]));
+
     cudaEvent_t start_event, end_event;
     cudaEventCreate(&start_event);
     cudaEventCreate(&end_event);
@@ -591,6 +594,8 @@ void build_vector_knn_with_tensorcore(
     CUDA_CHECK(cudaMemcpyAsync(d_X_full, X_full, bytes_X, cudaMemcpyHostToDevice, streams[0]));
     cudaEventRecord(end_event, streams[0]);
     cudaEventSynchronize(end_event);
+
+    cudaStreamDestroy(streams[0]);
 
     float ms = 0.0f;
     cudaEventElapsedTime(&ms, start_event, end_event);
