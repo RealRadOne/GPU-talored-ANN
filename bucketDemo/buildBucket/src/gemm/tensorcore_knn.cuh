@@ -607,7 +607,7 @@ void build_vector_knn_with_tensorcore(
     RunningKnnFile& running,
     const std::string& output_dir = "")
 {
-    const_size_t bytes_probe = static_cast<size_t>(N) * D * sizeof(DataT);
+    const size_t bytes_probe = static_cast<size_t>(N) * D * sizeof(DataT);
     void* d_probe = nullptr;
     CUDA_CHECK(cudaMalloc(&d_probe, bytes_probe));
     cudaStream_t transfer_stream;
