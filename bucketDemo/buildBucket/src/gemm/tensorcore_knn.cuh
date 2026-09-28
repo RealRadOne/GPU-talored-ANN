@@ -569,6 +569,30 @@ inline void convert_vector_knn_to_npy(const std::string& knn_path, const std::st
  * 距离对合并是必需的 (要按距离排序去重)，所以内部始终按 want_distances=true
  * 的路径跑；不再对外暴露"不算距离"这个选项。
  */
+
+template<typename Fn>
+inline float time_gpu_section(const char*label,cudaStream_t stream, Fn&& fn,size_t bytes=0)
+{
+    cudaEvent_t start_event, end_event;
+    CUDA_CHECK(cudaEventCreate(&start_event));
+    CUDA_CHECK(cudaEventCreate(&end_event));
+    CUDA_CHECK(cudaEventRecord(start_event, stream));
+    fn();
+    CUDA_CHECK(cudaEventRecord(end_event, stream));
+    CUDA_CHECK(cudaEventSynchronize(end_event));
+    float ms = 0.0f;
+    CUDA_CHECK(cudaEventElapsedTime(&ms, start_event, end_event));
+    if (bytes > 0) {
+        double gb_per_s = (bytes / 1e9) / (ms / 1e3);
+        printf("[%s] bytes=%zu ms=%.3f gbps=%.2f\n", label, bytes, ms, gb_per_s);
+    } else {
+        printf("[%s] ms=%.3f\n", label, ms);
+    }
+    CUDA_CHECK(cudaEventDestroy(start_event));
+    CUDA_CHECK(cudaEventDestroy(end_event));
+    return ms;
+}
+
 template <typename DataT>
 void build_vector_knn_with_tensorcore(
     const DataT* X_full,
@@ -583,32 +607,17 @@ void build_vector_knn_with_tensorcore(
     RunningKnnFile& running,
     const std::string& output_dir = "")
 {
+    const_size_t bytes_probe = static_cast<size_t>(N) * D * sizeof(DataT);
+    void* d_probe = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_probe, bytes_probe));
     cudaStream_t transfer_stream;
     CUDA_CHECK(cudaStreamCreate(&transfer_stream));
-    size_t bench_bytes_X = static_cast<size_t>(N) * D * sizeof(DataT);
-
-    void* d_X_full = nullptr;
-    CUDA_CHECK(cudaMalloc(&d_X_full, bytes_X));
-
-    cudaEvent_t start_event, end_event;
-    cudaEventCreate(&start_event);
-    cudaEventCreate(&end_event);
-
-
-    cudaEventRecord(start_event, transfer_stream);
-    CUDA_CHECK(cudaMemcpyAsync(d_X_full, X_full, bench_bytes_X, cudaMemcpyHostToDevice, transfer_stream));
-    cudaEventRecord(end_event, transfer_stream);
-    cudaEventSynchronize(end_event);
-
-    cudaStreamDestroy(transfer_stream);
-
-    float ms = 0.0f;
-    cudaEventElapsedTime(&ms, start_event, end_event);
-    double gb_per_s = (bytes_X / 1e9) / (ms / 1e3);
-    printf("[step6_full_upload] bytes=%zu ms=%.3f gbps=%.2f\n", bytes_X, ms, gb_per_s);
-
-    cudaEventDestroy(start_event);
-    cudaEventDestroy(end_event);
+    time_gpu_section("H2D probe", transfer_stream, [&]{
+        CUDA_CHECK(cudaMemcpyAsync(d_probe, X_full, bytes_probe, cudaMemcpyHostToDevice, transfer_stream));
+    }, bytes_probe);    
+    CUDA_CHECK(cudaStreamSynchronize(transfer_stream));
+    CUDA_CHECK(cudaStreamDestroy(transfer_stream));
+    CUDA_CHECK(cudaFree(d_probe));
 
     constexpr bool want_distances = true;  // merge_row_into_disk 总是需要距离
     // ============= Stage 2 路径选择（INT8 IMMA / fp32 fallback）=============
