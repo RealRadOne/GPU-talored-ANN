@@ -585,7 +585,7 @@ void build_vector_knn_with_tensorcore(
 {
     cudaStream_t transfer_stream;
     CUDA_CHECK(cudaStreamCreate(&transfer_stream));
-    size_t bytes_X = N * sizeof(float);
+    size_t bench_bytes_X = static_cast<size_t>(N) * D * sizeof(DataT);
 
     void* d_X_full = nullptr;
     CUDA_CHECK(cudaMalloc(&d_X_full, bytes_X));
@@ -596,7 +596,7 @@ void build_vector_knn_with_tensorcore(
 
 
     cudaEventRecord(start_event, transfer_stream);
-    CUDA_CHECK(cudaMemcpyAsync(d_X_full, X_full, bytes_X, cudaMemcpyHostToDevice, transfer_stream));
+    CUDA_CHECK(cudaMemcpyAsync(d_X_full, X_full, bench_bytes_X, cudaMemcpyHostToDevice, transfer_stream));
     cudaEventRecord(end_event, transfer_stream);
     cudaEventSynchronize(end_event);
 
