@@ -52,10 +52,10 @@
 #include <thrust/execution_policy.h>
 
 // Local headers
-#include "utils.hpp"
-#include "load.hpp"
-#include "bucket_build.cuh"
-#include "bucket_order.hpp"
+#include "../utils.hpp"
+#include "../load.hpp"
+#include "../bucket_build.cuh"
+#include "../bucket_order.hpp"
 
 namespace po = boost::program_options;
 using namespace bucket;
