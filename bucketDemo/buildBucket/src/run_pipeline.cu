@@ -328,6 +328,7 @@ int run_pipeline_impl(
         elapsed_step4 += iter_step4;
         std::cout << "  Step 4 done [" << std::fixed << std::setprecision(3) << iter_step4 << "s]\n";
 
+        restart_progress_log.record_step_complete(PipelineStep::kAssignVectors);
         // ================================================================
         // Step 5: Write bucket assignments to disk (last iteration only,
         //         多 iter 时仅最后一次的 bucket 结构落盘)
@@ -398,10 +399,13 @@ int run_pipeline_impl(
                 *running_knn_file,
                 output_dir);
 
+            restart_progress_log.record_step_complete(PipelineStep::kBuildVectorKNN);
+
             cudaDeviceSynchronize();
             double iter_step6 = std::chrono::duration<double>(Clock::now() - t6).count();
             elapsed_step6 += iter_step6;
             std::cout << "  Step 6 done [" << std::fixed << std::setprecision(3) << iter_step6 << "s]\n";
+            restart_progress_log.record_step_complete(PipelineStep::kBuildVectorKNN);
         }
 
         }   // end of per-iteration loop
@@ -480,6 +484,7 @@ int run_pipeline_impl(
             elapsed_step7 = std::chrono::duration<double>(Clock::now() - t7).count();
             std::cout << "  Step 7 done [" << std::fixed << std::setprecision(3)
                       << elapsed_step7 << "s]\n";
+            restart_progres_log.record_step_complete(PipelineStep::kReorderBuckets);
         }
 
         // X_full no longer needed
@@ -505,6 +510,12 @@ int run_pipeline_impl(
             std::cout << "  Step 7   (Bucket reorder):      " << elapsed_step7 << "s\n";
         std::cout << "  --------------------------------\n";
         std::cout << "  Total:                        " << elapsed_total << "s\n";
+        
+        
+        print_recovery_latency(restart_progress_log);
+        restart_progress_log.record_run_complete();
+
+
         std::cout << "  Output: " << output_dir << "/\n";
         std::cout << "    bucket_index.bin  — offset/count table for each centroid\n";
         std::cout << "    bucket_data.bin   — packed int32 point IDs per bucket\n";

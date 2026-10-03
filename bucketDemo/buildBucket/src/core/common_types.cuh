@@ -56,6 +56,9 @@
 #include "../load.hpp"
 #include "../bucket_build.cuh"
 #include "../bucket_order.hpp"
+#include "../utils/timing.hpp"
+#include "../utils/spot_metrics.hpp"
+#include "../utils/step_timer.hpp"
 
 namespace po = boost::program_options;
 using namespace bucket;
