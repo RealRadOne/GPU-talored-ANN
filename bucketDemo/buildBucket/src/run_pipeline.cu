@@ -143,7 +143,8 @@ int run_pipeline_impl(
         }
 
         elapsed_step1 = std::chrono::duration<double>(Clock::now() - t1).count();
-        std::cout << "  Step 1 done [" << std::fixed << std::setprecision(3) << elapsed_step1 << "s]\n";
+        log_step_timing(output_dir, -1, "Step 1", elapsed_step1);
+        restart_progress_log.record_step_complete(PipelineStep::kLoadSample);
 
         // ================================================================
         // Per-iteration outer loop (Steps 2-6 may repeat with varying seed)
@@ -211,7 +212,8 @@ int run_pipeline_impl(
         cudaDeviceSynchronize();
         double iter_step2 = std::chrono::duration<double>(Clock::now() - t2).count();
         elapsed_step2 += iter_step2;
-        std::cout << "  Step 2 done [" << std::fixed << std::setprecision(3) << iter_step2 << "s]\n";
+        
+        log_step_timing(output_dir, iter, "Step 2", iter_step2);
         restart_progress_log.record_step_complete(PipelineStep::kSelectCentroids);
 
         // ================================================================
@@ -230,8 +232,9 @@ int run_pipeline_impl(
         cudaDeviceSynchronize();
         double iter_step3 = std::chrono::duration<double>(Clock::now() - t3).count();
         elapsed_step3 += iter_step3;
-        std::cout << "  Step 3 done [" << std::fixed << std::setprecision(3) << iter_step3 << "s]\n";
-        restart_progress_log.record_step_complete(PipelineStep::kBuildCentroidGraph);
+
+        log_step_timing(output_dir, iter, "Step 3", iter_step3);
+        restart_progress_log.record_step_complete(PipelineStep::kBuildCentroidKnn);
 
         // ================================================================
         // Step 3.5: Lazy-load full dataset if not already loaded
@@ -266,6 +269,8 @@ int run_pipeline_impl(
             }
             X_full_loaded = true;
             elapsed_step3p5 = std::chrono::duration<double>(Clock::now() - t_load).count();
+            log_step_timing(output_dir, iter, "Step 3.5", elapsed_step3p5);
+            restart_progress_log.record_step_complete(PipelineStep::kLoadFull);
         }
 
         // ================================================================
@@ -341,7 +346,7 @@ int run_pipeline_impl(
         cudaDeviceSynchronize();
         double iter_step4 = std::chrono::duration<double>(Clock::now() - t4).count();
         elapsed_step4 += iter_step4;
-        std::cout << "  Step 4 done [" << std::fixed << std::setprecision(3) << iter_step4 << "s]\n";
+        log_step_timing(output_dir, iter, "Step 4", iter_step4);
 
         restart_progress_log.record_step_complete(PipelineStep::kAssignVectors);
         // ================================================================
@@ -379,7 +384,7 @@ int run_pipeline_impl(
             }
 
             elapsed_step5 = std::chrono::duration<double>(Clock::now() - t5).count();
-            std::cout << "  Step 5 done [" << std::fixed << std::setprecision(3) << elapsed_step5 << "s]\n";
+            log_step_timing(output_dir, iter, "Step 5", elapsed_step5);
             restart_progress_log.record_step_complete(PipelineStep::kWriteBuckets);
         }
 
@@ -418,7 +423,8 @@ int run_pipeline_impl(
             cudaDeviceSynchronize();
             double iter_step6 = std::chrono::duration<double>(Clock::now() - t6).count();
             elapsed_step6 += iter_step6;
-            std::cout << "  Step 6 done [" << std::fixed << std::setprecision(3) << iter_step6 << "s]\n";
+            
+            log_step_timing(output_dir, iter, "Step 6", iter_step6);
             restart_progress_log.record_step_complete(PipelineStep::kBuildVectorKnn);
         }
 
@@ -438,6 +444,7 @@ int run_pipeline_impl(
                 N, neighbors_m, config.cpu_limit_bytes / 4);
             std::cout << "[WriteVectorKNN] Saved neighbors.npy\n";
             elapsed_write_knn = std::chrono::duration<double>(Clock::now() - t_write).count();
+            log_step_timing(output_dir, -1, "WriteVectorKNN", elapsed_write_knn);
         }
 
         // ================================================================
@@ -495,10 +502,11 @@ int run_pipeline_impl(
                                     vector_knn, neighbors_m,
                                     reorder_info, n_centroids);
 
+
             elapsed_step7 = std::chrono::duration<double>(Clock::now() - t7).count();
-            std::cout << "  Step 7 done [" << std::fixed << std::setprecision(3)
-                      << elapsed_step7 << "s]\n";
-            restart_progress_log.record_step_complete(PipelineStep::kReorderBuckets);
+            log_step_timing(output_dir, -1, "Step 7", elapsed_step7);
+            restart_progress_log.record_step_complete(PipelineStep::kReorder);
+            
         }
 
         // X_full no longer needed
