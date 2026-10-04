@@ -26,7 +26,8 @@
       std::printf("  %s done [%.3fs]\n", step_name.c_str(), elapsed_seconds);
   }
 
-  void run_step_and_print_duration(const std::string& step_name, StepBody&& step_body)
+  template<typename StepBody>
+  inline void run_step_and_print_duration(const std::string& step_name, StepBody&& step_body)
   {
       print_step_duration(step_name, measure_step_seconds(std::forward<StepBody>(step_body)));
   }

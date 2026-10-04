@@ -1,6 +1,7 @@
 #pragma once
 
 #include <iostream>
+#include <stdexcept>
 #include <vector>
 #include <cstdint>
 #include <string>
@@ -56,6 +57,19 @@
 #include "../load.hpp"
 #include "../utils/spot_metrics.hpp"
 #include "../utils/step_timer.hpp"
+#include "../bucket_order.hpp"
+
+#ifndef CUDA_CHECK
+#define CUDA_CHECK(call)                                                          \
+    do {                                                                          \
+        cudaError_t err = (call);                                                 \
+        if (err != cudaSuccess) {                                                 \
+            throw std::runtime_error(std::string("CUDA error: ") +                \
+                                     cudaGetErrorString(err) +                    \
+                                     " at " __FILE__ ":" + std::to_string(__LINE__)); \
+        }                                                                         \
+    } while (0)
+#endif
 
 namespace po = boost::program_options;
 using namespace bucket;

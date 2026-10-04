@@ -1,0 +1,93 @@
+diff --git a/bucketDemo/buildBucket/src/core/common_types.cuh b/bucketDemo/buildBucket/src/core/common_types.cuh
+index 5765cb6..765cf79 100644
+--- a/bucketDemo/buildBucket/src/core/common_types.cuh
++++ b/bucketDemo/buildBucket/src/core/common_types.cuh
+@@ -1,6 +1,7 @@
+ #pragma once
+ 
+ #include <iostream>
++#include <stdexcept>
+ #include <vector>
+ #include <cstdint>
+ #include <string>
+@@ -56,6 +57,19 @@
+ #include "../load.hpp"
+ #include "../utils/spot_metrics.hpp"
+ #include "../utils/step_timer.hpp"
++#include "../bucket_order.hpp"
++
++#ifndef CUDA_CHECK
++#define CUDA_CHECK(call)                                                          \
++    do {                                                                          \
++        cudaError_t err = (call);                                                 \
++        if (err != cudaSuccess) {                                                 \
++            throw std::runtime_error(std::string("CUDA error: ") +                \
++                                     cudaGetErrorString(err) +                    \
++                                     " at " __FILE__ ":" + std::to_string(__LINE__)); \
++        }                                                                         \
++    } while (0)
++#endif
+ 
+ namespace po = boost::program_options;
+ using namespace bucket;
+diff --git a/bucketDemo/buildBucket/src/run_pipeline.cu b/bucketDemo/buildBucket/src/run_pipeline.cu
+index 2a3f816..6e4deb7 100644
+--- a/bucketDemo/buildBucket/src/run_pipeline.cu
++++ b/bucketDemo/buildBucket/src/run_pipeline.cu
+@@ -35,6 +35,14 @@ int run_pipeline_impl(
+         std::filesystem::create_directories(output_dir);
+         std::cout << "Output subdir: " << output_dir << "\n";
+ 
++        // Restart/progress tracking: read what the previous (possibly interrupted)
++        // run left behind BEFORE RunningKnnFile::create() truncates vector_knn.bin.
++        RestartProgressLog restart_progress_log(output_dir);
++        print_interrupted_run(restart_progress_log.previous_run());
++        const std::string vector_knn_path = output_dir + "/vector_knn.bin";
++        const int64_t rows_before_restart =
++            (neighbors_m > 0) ? count_rows_with_neighbors(vector_knn_path) : 0;
++
+         using Clock = std::chrono::high_resolution_clock;
+         auto t_total_start = Clock::now();
+         double elapsed_step1 = 0, elapsed_step2 = 0, elapsed_step3 = 0;
+@@ -152,7 +160,10 @@ int run_pipeline_impl(
+                     output_dir + "/vector_dists.bin",
+                     N, neighbors_m, config.cpu_limit_bytes / 4));
+         }
+-        print_rows_lost_on_restart(rows_before_restart, RunningKnnFile::count_rows_with_neighbors(vector_knn_path), N);
++        if (neighbors_m > 0) {
++            print_rows_lost_on_restart(rows_before_restart,
++                                       count_rows_with_neighbors(vector_knn_path), N);
++        }
+ 
+         // 这些值由最后一次 iteration 决定 (用于 Step 5/7)
+         std::vector<int64_t> assignments;
+@@ -404,13 +415,11 @@ int run_pipeline_impl(
+                 *running_knn_file,
+                 output_dir);
+ 
+-            restart_progress_log.record_step_complete(PipelineStep::kBuildVectorKNN);
+-
+             cudaDeviceSynchronize();
+             double iter_step6 = std::chrono::duration<double>(Clock::now() - t6).count();
+             elapsed_step6 += iter_step6;
+             std::cout << "  Step 6 done [" << std::fixed << std::setprecision(3) << iter_step6 << "s]\n";
+-            restart_progress_log.record_step_complete(PipelineStep::kBuildVectorKNN);
++            restart_progress_log.record_step_complete(PipelineStep::kBuildVectorKnn);
+         }
+ 
+         }   // end of per-iteration loop
+diff --git a/bucketDemo/buildBucket/src/utils/step_timer.hpp b/bucketDemo/buildBucket/src/utils/step_timer.hpp
+index 7c02332..fefba30 100644
+--- a/bucketDemo/buildBucket/src/utils/step_timer.hpp
++++ b/bucketDemo/buildBucket/src/utils/step_timer.hpp
+@@ -26,7 +26,8 @@
+       std::printf("  %s done [%.3fs]\n", step_name.c_str(), elapsed_seconds);
+   }
+ 
+-  void run_step_and_print_duration(const std::string& step_name, StepBody&& step_body)
++  template<typename StepBody>
++  inline void run_step_and_print_duration(const std::string& step_name, StepBody&& step_body)
+   {
+       print_step_duration(step_name, measure_step_seconds(std::forward<StepBody>(step_body)));
+   }
+\ No newline at end of file
