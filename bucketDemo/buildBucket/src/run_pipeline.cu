@@ -152,6 +152,7 @@ int run_pipeline_impl(
                     output_dir + "/vector_dists.bin",
                     N, neighbors_m, config.cpu_limit_bytes / 4));
         }
+        print_rows_lost_on_restart(rows_before_restart, RunningKnnFile::count_rows_with_neighbors(vector_knn_path), N);
 
         // 这些值由最后一次 iteration 决定 (用于 Step 5/7)
         std::vector<int64_t> assignments;
@@ -169,6 +170,7 @@ int run_pipeline_impl(
             uint32_t iter_seed = config.seed + static_cast<uint32_t>(iter);
             LoadConfig iter_config = config;
             iter_config.seed = iter_seed;
+            restart_progress_log.set_iteration(iter);
 
             if (iterations > 1) {
                 std::cout << "\n========== Iteration " << (iter + 1) << " / " << iterations
@@ -199,6 +201,7 @@ int run_pipeline_impl(
         double iter_step2 = std::chrono::duration<double>(Clock::now() - t2).count();
         elapsed_step2 += iter_step2;
         std::cout << "  Step 2 done [" << std::fixed << std::setprecision(3) << iter_step2 << "s]\n";
+        restart_progress_log.record_step_complete(PipelineStep::kSelectCentroids);
 
         // ================================================================
         // Step 3: Build KNN graph on centroids — results stay on GPU
@@ -217,6 +220,7 @@ int run_pipeline_impl(
         double iter_step3 = std::chrono::duration<double>(Clock::now() - t3).count();
         elapsed_step3 += iter_step3;
         std::cout << "  Step 3 done [" << std::fixed << std::setprecision(3) << iter_step3 << "s]\n";
+        restart_progress_log.record_step_complete(PipelineStep::kBuildCentroidGraph);
 
         // ================================================================
         // Step 3.5: Lazy-load full dataset if not already loaded
@@ -365,6 +369,7 @@ int run_pipeline_impl(
 
             elapsed_step5 = std::chrono::duration<double>(Clock::now() - t5).count();
             std::cout << "  Step 5 done [" << std::fixed << std::setprecision(3) << elapsed_step5 << "s]\n";
+            restart_progress_log.record_step_complete(PipelineStep::kWriteBuckets);
         }
 
         // ================================================================
@@ -484,7 +489,7 @@ int run_pipeline_impl(
             elapsed_step7 = std::chrono::duration<double>(Clock::now() - t7).count();
             std::cout << "  Step 7 done [" << std::fixed << std::setprecision(3)
                       << elapsed_step7 << "s]\n";
-            restart_progres_log.record_step_complete(PipelineStep::kReorderBuckets);
+            restart_progress_log.record_step_complete(PipelineStep::kReorderBuckets);
         }
 
         // X_full no longer needed
