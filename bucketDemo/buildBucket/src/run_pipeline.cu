@@ -212,7 +212,6 @@ int run_pipeline_impl(
         cudaDeviceSynchronize();
         double iter_step2 = std::chrono::duration<double>(Clock::now() - t2).count();
         elapsed_step2 += iter_step2;
-        
         log_step_timing(output_dir, iter, "Step 2", iter_step2);
         restart_progress_log.record_step_complete(PipelineStep::kSelectCentroids);
 
@@ -232,9 +231,8 @@ int run_pipeline_impl(
         cudaDeviceSynchronize();
         double iter_step3 = std::chrono::duration<double>(Clock::now() - t3).count();
         elapsed_step3 += iter_step3;
-
         log_step_timing(output_dir, iter, "Step 3", iter_step3);
-        restart_progress_log.record_step_complete(PipelineStep::kBuildCentroidKnn);
+        restart_progress_log.record_step_complete(PipelineStep::kBuildCentroidGraph);
 
         // ================================================================
         // Step 3.5: Lazy-load full dataset if not already loaded
@@ -270,7 +268,6 @@ int run_pipeline_impl(
             X_full_loaded = true;
             elapsed_step3p5 = std::chrono::duration<double>(Clock::now() - t_load).count();
             log_step_timing(output_dir, iter, "Step 3.5", elapsed_step3p5);
-            restart_progress_log.record_step_complete(PipelineStep::kLoadFull);
         }
 
         // ================================================================
@@ -423,7 +420,6 @@ int run_pipeline_impl(
             cudaDeviceSynchronize();
             double iter_step6 = std::chrono::duration<double>(Clock::now() - t6).count();
             elapsed_step6 += iter_step6;
-            
             log_step_timing(output_dir, iter, "Step 6", iter_step6);
             restart_progress_log.record_step_complete(PipelineStep::kBuildVectorKnn);
         }
@@ -444,7 +440,7 @@ int run_pipeline_impl(
                 N, neighbors_m, config.cpu_limit_bytes / 4);
             std::cout << "[WriteVectorKNN] Saved neighbors.npy\n";
             elapsed_write_knn = std::chrono::duration<double>(Clock::now() - t_write).count();
-            log_step_timing(output_dir, -1, "WriteVectorKNN", elapsed_write_knn);
+            log_step_timing(output_dir, -1, "Write", elapsed_write_knn);
         }
 
         // ================================================================
@@ -502,17 +498,16 @@ int run_pipeline_impl(
                                     vector_knn, neighbors_m,
                                     reorder_info, n_centroids);
 
-
             elapsed_step7 = std::chrono::duration<double>(Clock::now() - t7).count();
             log_step_timing(output_dir, -1, "Step 7", elapsed_step7);
-            restart_progress_log.record_step_complete(PipelineStep::kReorder);
-            
+            restart_progress_log.record_step_complete(PipelineStep::kReorderBuckets);
         }
 
         // X_full no longer needed
         { auto _drop = std::move(X_full); }
 
         double elapsed_total = std::chrono::duration<double>(Clock::now() - t_total_start).count();
+        log_step_timing(output_dir, -1, "Total", elapsed_total);
 
         std::cout << "\n=== All done! ===\n";
         std::cout << "\n=== Timing Summary"
