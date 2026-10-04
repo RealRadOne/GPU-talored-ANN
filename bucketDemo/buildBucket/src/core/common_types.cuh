@@ -54,8 +54,6 @@
 // Local headers
 #include "../utils.hpp"
 #include "../load.hpp"
-#include "../bucket_build.cuh"
-#include "../bucket_order.hpp"
 #include "../utils/spot_metrics.hpp"
 #include "../utils/step_timer.hpp"
 
