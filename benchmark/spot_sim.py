@@ -403,4 +403,4 @@ def parse_config(command_line: list[str]) -> SimulationConfig:
 
 
 if __name__ == "__main__":
-    sy****it(main())
+    sys.exit(main())
