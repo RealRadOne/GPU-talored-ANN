@@ -377,7 +377,7 @@ def print_report(report: SimulationReport) -> None:
 
 def parse_config(command_line: list[str]) -> SimulationConfig:
     """Parse the command line into a configuration."""
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser = argparse.ArgumentParser(description="Simulate a spot instance preemption schedule for gpann_modular")
     parser.add_argument("--binary", default=DEFAULT_BINARY_FILEPATH)
     parser.add_argument("--input", required=True, help="dataset, for example data.fbin")
     parser.add_argument("--output", required=True, help="root folder for runs and logs")
