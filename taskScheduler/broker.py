@@ -1,8 +1,11 @@
 from enum import Enum
-from typing import Optional, List, Callable 
+from typing import TYPE_CHECKING, Optional
 
-class TaskStatus(Enum):
-    UNINITALIZED = 0
+if TYPE_CHECKING:
+    from scheduler.policies import OrderingPolicy
+
+class PipelineStep(Enum):
+    UNINITIALIZED = 0
     CLUSTERING   = 1
     ASSIGNMENT   = 2
     INDEXING     = 3
@@ -28,7 +31,7 @@ class ShardTask:
         self.deg = deg
 
         self.status = TaskStatus.READY
-        self.current_step = PipelineStep.UNINITALIZED
+        self.current_step = PipelineStep.UNINITIALIZED
         self.retry_count = 0
         self.gpu_id = -1
         
@@ -43,10 +46,10 @@ class ShardTask:
 
 class TaskBroker:
     def __init__(self,ordering_policy: Optional["OrderingPolicy"]=None)->None:
-        self.tasks: Dict[str, ShardTask] = {}
+        self.tasks: dict[str, ShardTask] = {}
 
         if ordering_policy is None:
-            from scheduler.policies import DefaultOrderingPolicy
+            from taskScheduler.policies import DefaultOrderingPolicy
             self.ordering_policy = DefaultOrderingPolicy()
         else:
             self.ordering_policy = ordering_policy
@@ -68,7 +71,7 @@ class TaskBroker:
             deg=deg
         )
 
-    def next_task(self)->Optional[ShardTask]:
+    def next_task(self)->str | None:
         ready_tasks = [task for task in self.tasks.values() if task.status == TaskStatus.READY]
         if not ready_tasks:
             return None
@@ -82,7 +85,7 @@ class TaskBroker:
         if tid in self.tasks:
             self.tasks[tid].update_stage(step)
 
-    def compete(self,task_id:str)->None:
+    def complete(self,task_id:str)->None:
         tid = str(task_id)
         if tid in self.tasks:
             self.tasks[tid].status = TaskStatus.COMPLETED
@@ -93,15 +96,14 @@ class TaskBroker:
             self.tasks[tid].status = TaskStatus.FAILED
 
     def interrupt(self,task_id:str,max_retries:Optional[int]=None)->None:
-        tid = str(task_id)
-        if tid in self.tasks and self.tasks[tid].status == TaskStatus.RUNNING:
-            self.tasks[tid].retry_count += 1
-            if max_retries is None and self.tasks[tid].retry_count >= max_retries:
-                self.tasks[tid].status = TaskStatus.READY
-            else:
-                self.tasks[tid].status = TaskStatus.FAILED
+        task = self.tasks.get(str(task_id))
+        if task is None or task.status != TaskStatus.RUNNING:
+            return
+        task.retry_count += 1
+        has_retries_left = max_retries is None or task.retry_count < max_retries
+        task.status = TaskStatus.READY if has_retries_left else TaskStatus.FAILED
 
-    def get_task(self,task_id:str)->Optional[ShardTask]:
+    def get_task(self,task_id:str)->ShardTask | None:
         return self.tasks.get(str(task_id))
 
     def all_done(self)->bool:

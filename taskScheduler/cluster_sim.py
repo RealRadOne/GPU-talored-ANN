@@ -6,8 +6,8 @@ import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Protocol
 
-from scheduler.broker import TaskBroker, TaskStatus
-from scheduler.policies import DefaultOrderingPolicy, OrderingPolicy
+from taskScheduler.broker import TaskBroker
+from taskScheduler.policies import DefaultOrderingPolicy
 
 
 @dataclass
@@ -18,10 +18,32 @@ class AvailabilityEvent:
     event_type: str  # "ADD" or "REMOVE"
     gpu_id: int
 
+def parse_gpu_number(gpu_label:str)->int:
+    digits = "".join(character for character in gpu_label if character.isdigit())
+    if not digits:
+        raise ValueError(f"GPU label {gpu_label} does not contain a number")
+    return int(digits)
+
+def load_trace_events(
+        trace_filepath: str,
+        trace_time_scale: float = 1.0,
+        keep_every_nth_gpu: int = 1
+        )-> list[AvailabilityEvent]:
+    events = []
+    with open(trace_filepath,newline="") as trace_file:
+        for row in csv.DictReader(trace_file):
+            gpu_id = parse_gpu_number(row["gpu_id"])
+            if gpu_id % keep_every_nth_gpu != 0:
+                continue
+            event_type = row["event_type"].strip().upper()
+            if event_type not in ("ADD", "REMOVE"):
+                raise ValueError(f"unknown event type {event_type!r} in {trace_filepath}")
+            timestamp_seconds = float(row["timestamp"])/1000.0 * trace_time_scale
+            events.append(AvailabilityEvent(timestamp=timestamp_seconds,event_type=event_type, gpu_id=gpu_id))
+            events.sort(key=lambda event: event.timestamp)
+    return events
 
 class TaskRunner(Protocol):
-    """Protocol signature for task execution strategies (FakeRunner vs ShardRunner)."""
-
     def is_finished(self) -> bool:
         ...
 
@@ -30,8 +52,6 @@ class TaskRunner(Protocol):
 
 
 class FakeRunner:
-    """Simulates task execution via scaled wall-clock duration without GPU dependencies."""
-
     def __init__(
         self, task_id: str, base_duration_sec: float, time_scale: float = 1.0
     ) -> None:
