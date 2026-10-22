@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# One full build of the bucket pipeline + quality eval, on GPU 0.
+# One full build of the bucket pipeline + quality eval, on GPU 0 (SMOKE=1: see the lock block).
 #
 #   run_pipeline.sh -d sift1M|sift10M|sift100M [-m auto|large] [-r REPS] [-o OUTDIR] [-q] [-k]
 #     -m auto  : bucket2 picks GPU-resident vs out-of-core itself; optimize (cuVS
@@ -43,7 +43,26 @@ DSDIR=$(dirname "$BASE")
 [[ $DS == sift100M ]] && ITERATIONS=2
 : "${OUT:=$BB/runs/$(date +%Y%m%d_%H%M%S)_${DS}_${MODE}}"
 mkdir -p "$OUT"
-export CUDA_VISIBLE_DEVICES=0
+# 正式计时排队（user 2026-10-22）：optimize-bucket2 和 optimize-bucket2-tagore 两个 loop 的计时运行
+# 共用这把锁，同一时刻只有一个 pipeline 在测时间（CPU / 磁盘 / page cache 是共用的）。
+# SMOKE=1：冒烟测试，不拿锁、judge 拒收（OUTDIR/SMOKE），跑在 SMOKE_GPU（默认 2，NUMA node 1）上，
+# nice 19、OMP 8 线程、只用 node 1 的核，尽量不干扰另一个 loop 正在计时的运行。
+BENCH_LOCK=/home/lanlu/.bench_locks/bucket2_bench.lock
+if [[ ${SMOKE:-0} == 1 ]]; then
+  GPU=${SMOKE_GPU:-2}
+  renice -n 19 $$ >/dev/null; taskset -pc 1-79:2 $$ >/dev/null
+  export OMP_NUM_THREADS=${SMOKE_THREADS:-8}
+  touch "$OUT/SMOKE"
+else
+  GPU=0; rm -f "$OUT/SMOKE"
+  mkdir -p "$(dirname "$BENCH_LOCK")"
+  exec 9>>"$BENCH_LOCK"
+  if ! flock -n 9; then
+    echo "[bench lock] busy, waiting: $(cat "$BENCH_LOCK.owner" 2>/dev/null)"; flock 9
+  fi
+  echo "$$ $(date +%F_%T) $SKILL $* -> $OUT" > "$BENCH_LOCK.owner"
+fi
+export CUDA_VISIBLE_DEVICES=$GPU
 
 TAG="k${KNN_K}p${NPROBE}m${NEIGHBORS_M}t${ITERATIONS}"
 timed() {  # timed NAME CMD... -> $OUT/rep$R/NAME.{log,time}; returns cmd exit code
@@ -55,10 +74,10 @@ timed() {  # timed NAME CMD... -> $OUT/rep$R/NAME.{log,time}; returns cmd exit c
 for ((R = 0; R < REPS; R++)); do
   RD=$OUT/rep$R; W=$RD/work; mkdir -p "$W"
   echo "[$DS/$MODE rep $R] -> $RD"
-  # GPU-0 memory sampler (MiB), for the peak-memory guard
-  nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -i 0 -lms 200 > "$RD/gpu_mem.txt" &
+  # GPU memory sampler (MiB), for the peak-memory guard
+  nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -i "$GPU" -lms 200 > "$RD/gpu_mem.txt" 9>&- &
   SMI=$!
-  sync; echo 3 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null 2>&1 || true
+  [[ ${SMOKE:-0} == 1 ]] || { sync; echo 3 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null 2>&1 || true; }
 
   B2_FLAGS=(-i "$BASE" -o "$W" --centroid-ratio "$CENTROID_RATIO" --seed "$SEED"
             --knn-k "$KNN_K" --nprobe "$NPROBE" --neighbors-m "$NEIGHBORS_M" -t "$ITERATIONS")

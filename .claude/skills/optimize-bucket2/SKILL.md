@@ -68,7 +68,7 @@ Also:
 - If `state/best.json` does not exist, this invocation is **iteration 0 (baseline)**: skip steps 1–2, run the two tests of step 3 into `runs/iter0/`, then `judge.py $R/sift1M_auto $R/sift1M_large --update --md`, fill the log's **Current best** block, commit, and return.
 - `git -C /home/lanlu/microBenchmark status --short` on branch `opt/bucket2-loop`; the source tree must be clean (if a previous iteration was interrupted, `git checkout -- bucketDemo/buildBucket/src .claude/skills/optimize-bucket2/scripts/params.sh` first and log it as "interrupted").
 - Read `OPTIMIZATION_LOG.md`: the **Current best** block, the **Ideas backlog**, and the **Tried & rejected** list. Never retry a rejected idea unless you write down what is different this time.
-- `nvidia-smi -i 0`: if another process is using GPU 0, wait for it (use Monitor/until-loop, don't sleep-poll) — timings with a shared GPU are invalid.
+- `nvidia-smi -i 0`: if a process that is not holding the bench lock uses GPU 0, wait for it (use Monitor/until-loop, don't sleep-poll) — timings with a shared GPU are invalid. Waiting for the bench lock itself is automatic (run_pipeline blocks).
 
 ### 1. Pick ONE idea
 - Start from where time goes: the latest `stages_s` and `bucket2_steps_s` in `state/best.json` (largest stage first, both SIFT1M-auto and SIFT1M-large).
@@ -90,8 +90,17 @@ bash $S/run_pipeline.sh -d sift10M -m auto -r 1 -o $R/sift10M_auto    # SIFT10M 
 bash $S/run_pipeline.sh -d sift100M -m auto -r 1 -o $R/sift100M_auto  # SIFT100M (large path, 2 rounds), 1 run: timing + DiskANN search + memory
 ```
 Run the quick SIFT1M / SIFT10M quality checks first and skip the SIFT100M run when they already fail.
-Launch long runs detached (`setsid nohup ... &`) so a harness restart cannot kill them, and make sure no
-other session's pipeline is running at the same time (CPU / disk contention invalidates the timing).
+Launch long runs detached (`setsid nohup ... &`) so a harness restart cannot kill them.
+**Bench lock (user decision 2026-10-22):** this loop and `optimize-bucket2-tagore` (worktree
+`/home/lanlu/microBenchmark_tagore`) may be alive at the same time, but timed runs queue on one lock:
+`run_pipeline.sh` / `resume_large_tail.sh` take `/home/lanlu/.bench_locks/bucket2_bench.lock` (flock)
+before running and print `[bench lock] busy, waiting: <owner>` while the other loop holds it
+(`cat /home/lanlu/.bench_locks/bucket2_bench.lock.owner` shows who). Any other timed tool run
+(e.g. a cagra_eval baseline) goes through `flock /home/lanlu/.bench_locks/bucket2_bench.lock <cmd>`.
+While the lock is held by the other loop you may still edit, build and smoke-test, but gently:
+build with `nice -n 19 taskset -c 1-79:2 ninja -j 8 -C build`, smoke-test with
+`SMOKE=1 bash $S/run_pipeline.sh -d sift1M ...` (no lock, GPU 2, NUMA node 1 cores, nice 19,
+8 threads; judge.py rejects SMOKE dirs). Never run anything unlocked on GPU 0.
 Run them with `run_in_background` and wait for the completion notification. Any non-zero exit / "FAILED" = reject (after checking it isn't an environment issue such as a busy GPU or full disk; `df -h /home/lanlu` must keep > 50 GB free).
 Quality measured per run: (a) `knn_similarity` — pre-prune degree-64 `vector_knn` vs exact KNN (recall@1/10/32/64 on 10K sampled points); (b) `search` — final translated degree-32 graph through the cuVS CAGRA searcher, **recall@10 and QPS** at itopk 32…512 (+ graph defect counts). Always keep both recall and QPS in the log.
 

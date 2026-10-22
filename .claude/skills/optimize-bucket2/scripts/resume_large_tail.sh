@@ -11,9 +11,14 @@ while getopts "d:o:" o; do case $o in d) DS=$OPTARG ;; o) OUT=$OPTARG ;; esac; d
 [[ $DS == sift100M ]] && ITERATIONS=2
 BASE=$(ls $ROOT/dataset/$DS/base.*.u8bin); DSDIR=$(dirname "$BASE")
 RD=$OUT/rep0; W=$RD/work; O=$W/k${KNN_K}p${NPROBE}m${NEIGHBORS_M}t${ITERATIONS}
+# same bench lock as run_pipeline.sh (timed run)
+BENCH_LOCK=/home/lanlu/.bench_locks/bucket2_bench.lock; mkdir -p "$(dirname "$BENCH_LOCK")"
+exec 9>>"$BENCH_LOCK"
+flock -n 9 || { echo "[bench lock] busy, waiting: $(cat "$BENCH_LOCK.owner" 2>/dev/null)"; flock 9; }
+echo "$$ $(date +%F_%T) $SKILL resume $DS -> $OUT" > "$BENCH_LOCK.owner"
 export CUDA_VISIBLE_DEVICES=0
 timed() { local name=$1; shift; /usr/bin/time -f "%e %M" -o "$RD/$name.time" stdbuf -oL -eL "$@" > "$RD/$name.log" 2>&1; }
-nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -i 0 -lms 200 >> "$RD/gpu_mem.txt" & SMI=$!
+nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -i 0 -lms 200 >> "$RD/gpu_mem.txt" 9>&- & SMI=$!
 rm -rf "$W/tmp"
 timed optimize_chunked "$BIN/optimize_chunked" -g "$O/forward_graph_reordered.bin" \
   -o "$O/graph_new_ids.bin" -m E --bucket-offsets "$O/bucket_offsets.bin" \

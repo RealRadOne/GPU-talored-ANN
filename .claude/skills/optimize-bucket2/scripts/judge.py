@@ -60,6 +60,9 @@ cand_dirs = dict(zip(KEYS, map(os.path.abspath, args)))
 best = json.load(open(BEST)) if os.path.exists(BEST) else None
 
 fail, notes = [], []
+for k, d in cand_dirs.items():   # SMOKE=1 runs (no bench lock, other GPU, niced) are never judged
+    if os.path.exists(os.path.join(d, "SMOKE")):
+        fail.append(f"{k}: {d} is a SMOKE run (not timed under the bench lock)")
 
 def initial_floor(b, k):
     """recall table of the large path at the first baseline (it starts below CAGRA-1%)."""
