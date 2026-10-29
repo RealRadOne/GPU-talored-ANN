@@ -120,10 +120,12 @@ for ((R = 0; R < REPS; R++)); do
     timed optimize_chunked "$BIN/optimize_chunked" -g "$O/forward_graph_reordered.bin" \
       -o "$O/graph_new_ids.bin" -m E --bucket-offsets "$O/bucket_offsets.bin" \
       --gpu-budget-mb "$CHUNKED_GPU_BUDGET_MB" --edge-buffer-mb "$CHUNKED_EDGE_BUFFER_MB" \
-      --tmp-dir "$W/tmp" $CHUNKED_EXTRA \
+      --tmp-dir "$W/tmp" --inverse-perm "$O/inverse_perm.bin" --final-output "$O/final_graph.bin" $CHUNKED_EXTRA \
       || { echo "optimize_chunked FAILED"; kill $SMI; exit 3; }
   fi
-  if [[ $FUSED -eq 0 ]]; then
+  # final_graph.bin already there: ids translated in-process (bucket2 resident path, or
+  # optimize_chunked #79 when the translated graph fits its host budget)
+  if [[ ! -f $O/final_graph.bin ]]; then
     timed translate "$BIN/translate_ids" -g "$O/graph_new_ids.bin" -p "$O/inverse_perm.bin" \
       -o "$O/final_graph.bin" || { echo "translate FAILED"; kill $SMI; exit 3; }
   fi

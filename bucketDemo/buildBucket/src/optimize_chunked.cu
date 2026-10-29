@@ -58,6 +58,7 @@
 #include "load.hpp"
 #include "graph_io.hpp"
 #include "edge_chunk_accumulator.hpp"
+#include "translate_graph_ids.hpp"
 
 namespace po = boost::program_options;
 
@@ -1459,6 +1460,67 @@ __global__ void kern_e_merge(const uint32_t* __restrict__ fwd, const uint32_t* _
 // 多 stream 重叠——本机没有 GPU 没法在这上面调优，先保证正确、简单，异步
 // 重叠留作后续在真实硬件上验证过一遍之后再加。
 // =====================================================================
+// #79 进程内 id 翻译 (Method E Phase 2 的结果直接翻回原始 id 顺序写 final_graph.bin)，省掉
+// translate_ids 进程: 它把 N*K_out 的中间图写盘再按 1 GB 窗整份重读 ceil(N*K*4 / 1 GB) 遍
+// (SIFT100M 13 遍 × 12.8 GB, 25 s)。这里每个合并好的行按 inverse_perm 放到原始行位置
+// (值也翻译)，整张原始顺序的图留在内存里，最后一次顺序写出。结果与 translate_ids 逐字节相同。
+// 参考 cuVS cagra_ace.cuh::ace_adjust_sub_graph_ids: 子图 id 在合并时就地换回原始 id。
+// 只在 N*K_out*4 + N*5 B ≤ host 预算 / 4 时启用，否则照旧走 translate_ids (1B 规模)。
+struct InProcessTranslate {
+    int64_t N = 0; int32_t K = 0;
+    std::vector<uint32_t> inv;                 // new id → old id
+    std::unique_ptr<uint32_t[]> fin;           // 原始顺序的最终图 (N, K)
+    std::vector<uint8_t> hit;                  // 每个原始行被写过 (置换检查)
+    int64_t n_bad = 0;                         // 越界 id 计数 (bounds check)
+    double secs = 0;
+    static size_t bytes_needed(int64_t n, int32_t k) {
+        return static_cast<size_t>(n) * k * sizeof(uint32_t) + static_cast<size_t>(n) * (sizeof(uint32_t) + 1);
+    }
+    InProcessTranslate(const std::string& inv_path, int64_t n, int32_t k) : N(n), K(k) {
+        auto t0 = std::chrono::steady_clock::now();
+        inv = translate_ids::read_inverse_perm(inv_path, N);
+        fin.reset(new uint32_t[static_cast<size_t>(N) * K]);
+        hit.assign(static_cast<size_t>(N), 0);
+        secs += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    }
+    // rows = 新 id 空间的第 [r0, r0+n) 行
+    void add_rows(const uint32_t* rows, int64_t r0, int64_t n) {
+        auto t0 = std::chrono::steady_clock::now();
+        if (r0 < 0 || r0 + n > N) throw std::runtime_error("InProcessTranslate: row range out of bounds");
+        int64_t bad = 0;
+        #pragma omp parallel for reduction(+:bad) schedule(static)
+        for (int64_t i = 0; i < n; ++i) {
+            const uint32_t old_row = inv[static_cast<size_t>(r0 + i)];
+            if (old_row >= static_cast<uint64_t>(N)) { ++bad; continue; }   // bounds check
+            hit[old_row] = 1;
+            const uint32_t* src = rows + static_cast<size_t>(i) * K;
+            uint32_t* dst = fin.get() + static_cast<size_t>(old_row) * K;
+            for (int32_t k = 0; k < K; ++k) {
+                uint32_t v = src[k];
+                if (v >= static_cast<uint64_t>(N)) { ++bad; v = 0; }        // bounds check
+                dst[k] = inv[v];
+            }
+        }
+        n_bad += bad;
+        secs += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    }
+    void write(const std::string& path) {
+        auto t0 = std::chrono::steady_clock::now();
+        if (n_bad > 0)
+            throw std::runtime_error("Method E: " + std::to_string(n_bad) + " out-of-range ids during id translation");
+        int64_t n_hit = 0;
+        #pragma omp parallel for reduction(+:n_hit) schedule(static)
+        for (int64_t i = 0; i < N; ++i) n_hit += hit[static_cast<size_t>(i)];
+        if (n_hit != N)
+            throw std::runtime_error("Method E: inverse_perm is not a permutation (" + std::to_string(n_hit) +
+                                     " of " + std::to_string(N) + " rows hit)");
+        graph_io::StreamingGraphWriter w(path, N, K);
+        w.write_rows(fin.get(), 0, N);
+        if (w.rows_written() != N) throw std::runtime_error("Method E: short write of " + path);
+        secs += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    }
+};
+
 static void run_method_E(
     const std::string& fwd_path,
     const std::string& out_path,
@@ -1467,7 +1529,9 @@ static void run_method_E(
     size_t gpu_budget_bytes,
     size_t edge_buffer_bytes,
     const std::string& tmp_dir,
-    size_t host_budget_bytes)
+    size_t host_budget_bytes,
+    const std::string& inv_perm_path,   // 跟 final_path 一起给: Phase 2 结果进程内翻回原始 id (#79)
+    const std::string& final_path)
 {
     using Clock = std::chrono::steady_clock;
     const int32_t num_chunks = static_cast<int32_t>(plan.starts.size()) - 1;
@@ -1836,11 +1900,28 @@ static void run_method_E(
             throw std::runtime_error("Method E: cannot reopen " + fwd_path);
         fwd_in2.seekg(sizeof(int64_t) + sizeof(int32_t), std::ios::beg);
 
-        graph_io::StreamingGraphWriter writer(out_path, N, K_out);
+        std::unique_ptr<InProcessTranslate> xl;
+        if (!final_path.empty()) {
+            if (InProcessTranslate::bytes_needed(N, K_out) <= host_budget_bytes / 4)
+                xl = std::make_unique<InProcessTranslate>(inv_perm_path, N, K_out);
+            else
+                std::cout << "  [Method E] in-process id translation needs "
+                          << InProcessTranslate::bytes_needed(N, K_out) / 1e9
+                          << " GB > host budget / 4; writing " << out_path << " for translate_ids\n";
+        }
+        // 翻译时不写中间图 (out_path)，行交给 xl
+        std::unique_ptr<graph_io::StreamingGraphWriter> writer_p;
+        if (!xl) writer_p = std::make_unique<graph_io::StreamingGraphWriter>(out_path, N, K_out);
+        int64_t rows_out = 0;
+        auto emit_rows = [&](const uint32_t* rows, int64_t r0, int64_t n) {
+            if (xl) xl->add_rows(rows, r0, n);
+            else writer_p->write_rows(rows, r0, n);
+            rows_out += n;
+        };
         if (gpu_phase2) {
             PinnedStaging stg;
             stg.d2h_rows(d_gpu_out, N, K_out, [&](const uint32_t* rows, int64_t r0, int64_t n) {
-                writer.write_rows(rows, r0, n);
+                emit_rows(rows, r0, n);
             });
             cudaFree(d_gpu_out); d_gpu_out = nullptr;
             std::cout << "  [Method E] phase 2 on GPU\n";
@@ -1856,32 +1937,44 @@ static void run_method_E(
             uint32_t j_hi = plan.starts[static_cast<size_t>(c) + 1];
             uint32_t chunk_sz = j_hi - j_lo;
 
+            // 前向行按子块 (≤ 4M 行) 读 / 合并 / 输出: row_block 不再是整个 chunk 大小
+            // (SIFT100M 6.4 GB)，给 #79 的整图翻译缓冲腾出内存；输出行仍按升序连续
+            const int64_t sub_rows = std::max<int64_t>(1, std::min<int64_t>(chunk_sz, int64_t(1) << 22));
+            auto read_fwd_rows = [&](int64_t s0, int64_t s1) {
+                row_block.resize(static_cast<size_t>(s1 - s0) * K_out);
+                // 并行 pread 这一段的前向行 (原来单线程 ifstream: SIFT100M read_fwd 11 s)
+                parallel_pread_file(fwd_path,
+                    static_cast<off_t>(sizeof(int64_t) + sizeof(int32_t)) + static_cast<off_t>(j_lo + s0) * K_out * static_cast<off_t>(sizeof(uint32_t)),
+                    row_block.size() * sizeof(uint32_t), row_block.data());
+            };
             auto q0 = Clock::now();
-            row_block.resize(static_cast<size_t>(chunk_sz) * K_out);
-            // 并行 pread 这一块的前向行 (原来单线程 ifstream: SIFT100M read_fwd 11 s)
-            parallel_pread_file(fwd_path,
-                static_cast<off_t>(sizeof(int64_t) + sizeof(int32_t)) + static_cast<off_t>(j_lo) * K_out * static_cast<off_t>(sizeof(uint32_t)),
-                row_block.size() * sizeof(uint32_t), row_block.data());
-
-            p2_fwd += p2s(q0); q0 = Clock::now();
             if (use_store) {
-                // 每行的反向源直接从 store 取 ((rank, src) 升序)，合并规则不变
-                #pragma omp parallel
-                {
-                    std::vector<uint32_t> src(static_cast<size_t>(K_out));
-                    #pragma omp for schedule(dynamic, 4096)
-                    for (int64_t lj = 0; lj < static_cast<int64_t>(chunk_sz); ++lj) {
-                        uint32_t n_src = store.sources(j_lo + static_cast<uint32_t>(lj), src.data());
-                        edge_chunk::merge_rank_ordered_into_row(
-                            row_block.data() + static_cast<size_t>(lj) * K_out,
-                            src.data(), n_src, static_cast<uint32_t>(K_out));
+                for (int64_t s0 = 0; s0 < static_cast<int64_t>(chunk_sz); s0 += sub_rows) {
+                    const int64_t s1 = std::min<int64_t>(chunk_sz, s0 + sub_rows);
+                    q0 = Clock::now();
+                    read_fwd_rows(s0, s1);
+                    p2_fwd += p2s(q0); q0 = Clock::now();
+                    // 每行的反向源直接从 store 取 ((rank, src) 升序)，合并规则不变
+                    #pragma omp parallel
+                    {
+                        std::vector<uint32_t> src(static_cast<size_t>(K_out));
+                        #pragma omp for schedule(dynamic, 4096)
+                        for (int64_t lj = s0; lj < s1; ++lj) {
+                            uint32_t n_src = store.sources(j_lo + static_cast<uint32_t>(lj), src.data());
+                            edge_chunk::merge_rank_ordered_into_row(
+                                row_block.data() + static_cast<size_t>(lj - s0) * K_out,
+                                src.data(), n_src, static_cast<uint32_t>(K_out));
+                        }
                     }
+                    p2_merge += p2s(q0); q0 = Clock::now();
+                    emit_rows(row_block.data(), j_lo + s0, s1 - s0);
+                    p2_write += p2s(q0);
                 }
-                p2_merge += p2s(q0); q0 = Clock::now();
-                writer.write_rows(row_block.data(), j_lo, chunk_sz);
-                p2_write += p2s(q0);
                 continue;
             }
+            row_block.resize(static_cast<size_t>(chunk_sz) * K_out);
+            read_fwd_rows(0, chunk_sz);
+            p2_fwd += p2s(q0); q0 = Clock::now();
             if (edges_in_memory) chunk_edges = std::move(mem_edges);   // num_chunks == 1
             else acc.read_chunk(c, chunk_edges);
             p2_edges += p2s(q0); q0 = Clock::now();
@@ -1900,7 +1993,7 @@ static void run_method_E(
             }
 
             p2_merge += p2s(q0); q0 = Clock::now();
-            writer.write_rows(row_block.data(), j_lo, chunk_sz);
+            emit_rows(row_block.data(), j_lo, chunk_sz);
             p2_write += p2s(q0);
         }
         if (!gpu_phase2)
@@ -1908,9 +2001,15 @@ static void run_method_E(
                       << "s read_edges=" << p2_edges << "s csr=" << p2_csr << "s merge=" << p2_merge
                       << "s write=" << p2_write << "s\n";
 
-        if (writer.rows_written() != N)
-            throw std::runtime_error("Method E: wrote " + std::to_string(writer.rows_written()) +
+        if (rows_out != N)
+            throw std::runtime_error("Method E: wrote " + std::to_string(rows_out) +
                                      " rows, expected " + std::to_string(N));
+        if (xl) {
+            { std::vector<uint32_t>().swap(row_block); }
+            xl->write(final_path);
+            std::cout << "  [Method E] ids translated in-process -> " << final_path
+                      << " [" << std::fixed << std::setprecision(2) << xl->secs << "s incl. write]\n";
+        }
     }
     double t_phase2 = std::chrono::duration<double>(Clock::now() - tB).count();
     std::cout << "  [Timing] Phase 2 (merge + stream write) = " << t_phase2 << "s\n";
@@ -1951,6 +2050,12 @@ int main(int argc, char** argv)
             ("edge-buffer-mb", po::value<size_t>()->default_value(1024),
                 "Method E only: total host-side staging budget (MB), shared across all "
                 "chunks' disk-flush buffers -- same semantics as bucket2's --bucket-vec-buffer")
+            ("inverse-perm", po::value<std::string>()->default_value(""),
+                "Method E: inverse_perm.bin (bucket2's reorder). With --final-output the merged graph is translated "
+                "back to the original id order in-process and written to --final-output instead of --output (same "
+                "bytes as translate_ids), when N*K_out*4 + 5N bytes <= host budget / 4; otherwise --output as usual")
+            ("final-output", po::value<std::string>()->default_value(""),
+                "Method E: translated graph path (see --inverse-perm)")
             ("tmp-dir", po::value<std::string>()->default_value(""),
                 "Method E only: scratch directory for per-chunk edge files "
                 "(default: <output dir>/.optimize_chunked_e_tmp, removed on success)")
@@ -1971,6 +2076,10 @@ int main(int argc, char** argv)
 
         const std::string fwd_path  = vm["forward-graph"].as<std::string>();
         const std::string out_path  = vm["output"].as<std::string>();
+        const std::string inv_perm_path = vm["inverse-perm"].as<std::string>();
+        const std::string final_path    = vm["final-output"].as<std::string>();
+        if (inv_perm_path.empty() != final_path.empty())
+            throw std::runtime_error("--inverse-perm and --final-output must be given together");
         const std::string method    = vm["method"].as<std::string>();
         const size_t gpu_budget_mb  = vm["gpu-budget-mb"].as<size_t>();
         const size_t gpu_budget_b   = gpu_budget_mb << 20;
@@ -2026,7 +2135,8 @@ int main(int argc, char** argv)
 
             std::cout << "=== Step 3: Reverse graph + merge (method E) ===\n";
             auto t2 = Clock::now();
-            run_method_E(fwd_path, out_path, N, K_out, plan, gpu_budget_b, edge_buffer_b, tmp_dir, host_budget_b);
+            run_method_E(fwd_path, out_path, N, K_out, plan, gpu_budget_b, edge_buffer_b, tmp_dir, host_budget_b,
+                         inv_perm_path, final_path);
             std::cout << "  Done [" << std::chrono::duration<double>(Clock::now() - t2).count()
                       << "s]\n";
 
