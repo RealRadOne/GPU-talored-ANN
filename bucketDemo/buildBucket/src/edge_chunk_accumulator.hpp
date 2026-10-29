@@ -25,13 +25,16 @@
 #pragma once
 
 #include <algorithm>
+#include <omp.h>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <memory>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 #ifdef __CUDACC__
@@ -55,6 +58,8 @@ struct EdgeRecord {
 };
 #pragma pack(pop)
 static_assert(sizeof(EdgeRecord) == 10, "EdgeRecord must be 10 bytes packed");
+
+using EdgeVec = std::vector<EdgeRecord>;
 
 // ---------------------------------------------------------------------
 // chunk_of: binary search over sorted chunk boundaries (ChunkPlan::starts
@@ -181,80 +186,39 @@ public:
     // BucketVectorAccumulator::finish_iteration: bandwidth-bound sequential
     // copy instead of paying per-file open() overhead in Phase 2), then
     // open a persistent read handle.
+    // 每个 chunk 的文件写完就是完整的 (只追加、记录数已知)，不再把它们拷进一个合并文件
+    // (SIFT100M: 32 GB 读 + 32 GB 写, acc.finish 107 s)，read_chunk 直接读 chunk 自己的文件。
+    // 参考 TAGORE order_merge_new: 每个局部图一个文件，最后一趟逐个流式读。
     void finish() {
+        merged_count.assign(static_cast<size_t>(num_chunks), 0);
         for (int32_t c = 0; c < num_chunks; ++c) {
             flush_chunk(c);
             bufs[static_cast<size_t>(c)].file.close();
+            merged_count[static_cast<size_t>(c)] = bufs[static_cast<size_t>(c)].total_count;
         }
-
-        merged_offset.assign(static_cast<size_t>(num_chunks), 0);
-        merged_count.assign(static_cast<size_t>(num_chunks), 0);
-        std::ofstream mout(merged_path, std::ios::binary | std::ios::trunc);
-        if (!mout.is_open())
-            throw std::runtime_error("EdgeChunkAccumulator: cannot open " + merged_path + " for write");
-
-        int64_t pos = 0;
-        std::vector<char> copy_buf;
-        for (int32_t c = 0; c < num_chunks; ++c) {
-            merged_offset[static_cast<size_t>(c)] = pos;
-            int64_t cnt = bufs[static_cast<size_t>(c)].total_count;
-            merged_count[static_cast<size_t>(c)] = cnt;
-            if (cnt == 0) continue;
-
-            std::string p = chunk_path(dir, c);
-            size_t nbytes = static_cast<size_t>(cnt) * sizeof(EdgeRecord);
-            copy_buf.resize(nbytes);
-            {
-                std::ifstream in(p, std::ios::binary);
-                if (!in.is_open())
-                    throw std::runtime_error("EdgeChunkAccumulator: cannot open " + p + " for merge");
-                in.read(copy_buf.data(), static_cast<std::streamsize>(nbytes));
-                if (!in.good())
-                    throw std::runtime_error("EdgeChunkAccumulator: merge-read failed for chunk " + std::to_string(c));
-            }
-            mout.write(copy_buf.data(), static_cast<std::streamsize>(nbytes));
-            if (!mout.good())
-                throw std::runtime_error("EdgeChunkAccumulator: merge-write failed for chunk " + std::to_string(c));
-            pos += static_cast<int64_t>(nbytes);
-
-            std::filesystem::remove(p);
-        }
-        mout.close();
-
-        merged_in.open(merged_path, std::ios::binary);
-        if (!merged_in.is_open())
-            throw std::runtime_error("EdgeChunkAccumulator: cannot open " + merged_path + " for read");
     }
 
-    void read_chunk(int32_t c, std::vector<EdgeRecord>& out) {
+    // 读回 chunk c 的全部记录 (只读一次: 读完删掉它的文件)
+    void read_chunk(int32_t c, EdgeVec& out) {
         int64_t cnt = merged_count[static_cast<size_t>(c)];
         out.resize(static_cast<size_t>(cnt));
         if (cnt == 0) return;
-        merged_in.seekg(static_cast<std::streamoff>(merged_offset[static_cast<size_t>(c)]));
-        merged_in.read(reinterpret_cast<char*>(out.data()),
-                       static_cast<std::streamsize>(static_cast<size_t>(cnt) * sizeof(EdgeRecord)));
-        if (!merged_in.good())
+        std::string p = chunk_path(dir, c);
+        std::ifstream in(p, std::ios::binary | std::ios::ate);
+        if (!in.is_open())
+            throw std::runtime_error("EdgeChunkAccumulator: cannot open " + p + " for read");
+        const size_t nbytes = static_cast<size_t>(cnt) * sizeof(EdgeRecord);
+        if (static_cast<size_t>(in.tellg()) != nbytes)   // bounds check: 文件大小必须跟计数一致
+            throw std::runtime_error("EdgeChunkAccumulator: chunk " + std::to_string(c) + " file size mismatch");
+        in.seekg(0);
+        in.read(reinterpret_cast<char*>(out.data()), static_cast<std::streamsize>(nbytes));
+        if (!in.good())
             throw std::runtime_error("EdgeChunkAccumulator: read_chunk failed for chunk " + std::to_string(c));
+        in.close();
+        std::filesystem::remove(p);
     }
 };
 
-// ---------------------------------------------------------------------
-// Phase 2, step 1: group one chunk's edges by destination node (CSR) and,
-// within each node's segment, sort ascending by rank -- so index 0 is the
-// closest (rank 0, highest-priority) candidate and index (count-1) is the
-// weakest. merge_rank_ordered_into_row below then walks each segment from
-// the end backward, which is exactly optimize_chunked.cu's existing
-// "process weakest first, closest last so it wins the slot" loop, just
-// fed from this sorted-by-rank order instead of raw write order.
-//
-// Deliberately NOT a K_out-bucket counting sort over the whole chunk: that
-// would force resetting a K_out-sized histogram per node regardless of how
-// many edges that node actually has, which is wasteful once K_out reaches
-// the hundreds. Sorting each node's own (typically much smaller) segment
-// independently costs O(edges_for_that_node * log(that count)), summing to
-// O(E_c * log(avg segment size)) overall -- cheaper in the common case and
-// with no K_out-sized fixed cost per node.
-// ---------------------------------------------------------------------
 struct ChunkCsr {
     std::vector<uint32_t> row_offsets;  // size chunk_size+1
     std::vector<uint32_t> src;          // size row_offsets.back(), rank-ascending per row
@@ -267,7 +231,7 @@ struct ChunkCsr {
 // of the (non-deterministic) scatter order -- previously ties in rank kept
 // the GPU scatter's arrival order. Bounds check: every edge's dst must fall
 // inside [j_lo, j_lo + chunk_size).
-inline ChunkCsr build_rank_ordered_csr(const std::vector<EdgeRecord>& edges,
+inline ChunkCsr build_rank_ordered_csr(const EdgeVec& edges,
                                         uint32_t j_lo, uint32_t chunk_size)
 {
     struct RankSrc { uint16_t rank; uint32_t src; };
@@ -324,6 +288,180 @@ inline ChunkCsr build_rank_ordered_csr(const std::vector<EdgeRecord>& edges,
 // math, but reads priority from `rank_sorted_src`'s physical order (index 0
 // = strongest) instead of assuming write order encoded priority.
 // ---------------------------------------------------------------------
+// build_rank_ordered_csr 的 cache 友好版本 (结果逐字节相同)。原版对 1.6B 条边在 50M 行上做
+// 原子计数 + 原子 scatter (随机访问整块 row_offsets/cursor)，SIFT100M Phase 2 里约一半时间。
+// 这里两趟基数划分: (1) 每个线程按 kRowBlock 行一块做局部直方图 (无原子)，(2) 按块 scatter 成
+// 64 位键 ((本地行 << 5 | rank) << 32 | src)，(3) 每块在 cache 里排序 → 行内按 (rank, src) 升序，
+// 跟原版 sort 的比较完全一致 ((rank, src) 在一行内唯一，是全序)。参考 TAGORE large_index.cu
+// reorder / order_merge_new 的分块处理思路 (先按块分桶，块内再做细活)。
+// 前提: K_out ≤ 32 (rank 5 bit)、chunk_size < 2^27；不满足时调用方用原版。
+inline bool rank_ordered_csr_fast_ok(uint32_t chunk_size, uint32_t K_out) {
+    return K_out <= 32 && chunk_size < (1u << 27);
+}
+
+inline ChunkCsr build_rank_ordered_csr_fast(const EdgeVec& edges,
+                                             uint32_t j_lo, uint32_t chunk_size)
+{
+    constexpr uint32_t kRowBlockBits = 13;            // 8192 行一块
+    const uint32_t n_blocks = (chunk_size >> kRowBlockBits) + 1;
+    const int64_t n_edges = static_cast<int64_t>(edges.size());
+    const int T = std::max(1, omp_get_max_threads());
+
+    // (1) 每线程每块的边数 (线程按静态区间分边，跟 (2) 的划分一致)
+    std::vector<int64_t> hist(static_cast<size_t>(T) * n_blocks + 1, 0);
+    int64_t n_bad = 0;
+    #pragma omp parallel num_threads(T) reduction(+:n_bad)
+    {
+        const int t = omp_get_thread_num();
+        const int64_t e0 = n_edges * t / T, e1 = n_edges * (t + 1) / T;
+        int64_t* h = hist.data() + static_cast<size_t>(t) * n_blocks;
+        for (int64_t e = e0; e < e1; ++e) {
+            const EdgeRecord& r = edges[static_cast<size_t>(e)];
+            uint32_t lj = r.dst - j_lo;
+            if (lj >= chunk_size || r.rank >= 32) { ++n_bad; continue; }   // bounds check
+            h[lj >> kRowBlockBits]++;
+        }
+    }
+    if (n_bad > 0)
+        throw std::runtime_error("build_rank_ordered_csr_fast: " + std::to_string(n_bad) +
+                                 " edges with dst outside the chunk or rank >= 32");
+    // 块主序的前缀: block b 的区间 = [blk_start[b], blk_start[b+1])，块内按线程号排
+    std::vector<int64_t> blk_start(static_cast<size_t>(n_blocks) + 1, 0);
+    std::vector<int64_t> cur(static_cast<size_t>(T) * n_blocks);
+    {
+        int64_t pos = 0;
+        for (uint32_t b = 0; b < n_blocks; ++b) {
+            blk_start[b] = pos;
+            for (int t = 0; t < T; ++t) {
+                cur[static_cast<size_t>(t) * n_blocks + b] = pos;
+                pos += hist[static_cast<size_t>(t) * n_blocks + b];
+            }
+        }
+        blk_start[n_blocks] = pos;
+    }
+    // (2) scatter 成 64 位键
+    // 键数组不清零 (只被下面的并行 scatter 写满、只在本函数里用)；读文件的缓冲照旧用 std::vector
+    std::unique_ptr<uint64_t[]> keys(new uint64_t[static_cast<size_t>(std::max<int64_t>(n_edges, 1))]);
+    #pragma omp parallel num_threads(T)
+    {
+        const int t = omp_get_thread_num();
+        const int64_t e0 = n_edges * t / T, e1 = n_edges * (t + 1) / T;
+        int64_t* c = cur.data() + static_cast<size_t>(t) * n_blocks;
+        for (int64_t e = e0; e < e1; ++e) {
+            const EdgeRecord& r = edges[static_cast<size_t>(e)];
+            uint32_t lj = r.dst - j_lo;
+            uint64_t k = (static_cast<uint64_t>((lj << 5) | r.rank) << 32) | r.src;
+            keys[static_cast<size_t>(c[lj >> kRowBlockBits]++)] = k;
+        }
+    }
+    // (3) 块内排序 + 每行计数
+    ChunkCsr csr;
+    csr.row_offsets.assign(static_cast<size_t>(chunk_size) + 1, 0);
+    #pragma omp parallel for schedule(dynamic, 4) num_threads(T)
+    for (int64_t b = 0; b < static_cast<int64_t>(n_blocks); ++b) {
+        uint64_t* kb = keys.get() + blk_start[static_cast<size_t>(b)];
+        uint64_t* ke = keys.get() + blk_start[static_cast<size_t>(b) + 1];
+        std::sort(kb, ke);
+        for (uint64_t* k = kb; k < ke; ++k) csr.row_offsets[static_cast<size_t>(*k >> 37) + 1]++;
+    }
+    for (uint32_t i = 0; i < chunk_size; ++i)
+        csr.row_offsets[i + 1] += csr.row_offsets[i];
+    // 块排好序后 keys 整体就是 (行, rank, src) 升序，跟 row_offsets 一一对应
+    csr.src.resize(static_cast<size_t>(n_edges));
+    #pragma omp parallel for schedule(static) num_threads(T)
+    for (int64_t e = 0; e < n_edges; ++e)
+        csr.src[static_cast<size_t>(e)] = static_cast<uint32_t>(keys[static_cast<size_t>(e)]);
+    return csr;
+}
+
+// 每个目标点只留 L = K_out 条 (rank, src) 最小的反向边，放在内存里 (不落盘)。
+// 正确性: merge_rank_ordered_into_row 保护前 P = K_out/2 条正向边，其余 K_out − P 个位置
+// 按 rank 从弱到强处理反向边，结果就是"不在保护集里的、(rank, src) 最小的 K_out − P 个反向源"
+// (已在行里的点只是挪位置，不挤掉别人；一行内 src 唯一)。保护集最多 P 个，所以只保留每个点
+// (rank, src) 最小的 K_out 条，输出跟用全部反向边逐字节相同 (键 = rank << 32 | src，跟原来行内
+// 按 (rank, src) 排序的顺序一致)。跟 cuVS CAGRA 一样: 反向图 [N, output_degree] 按 rank 填，满了丢弃。
+// 内存 N × L × 8 B + N × 2 B，跟入度无关；Phase 1 的边不再写成 chunk 文件再读回 (不受 page cache 影响)。
+// 参考 TAGORE filter_cagra / filter_reverse_1hop: 有界的每点反向表 (这里保留的是精确的前 L 个)。
+struct TopKReverseStore {
+    int64_t N = 0;
+    uint32_t L = 0;
+    std::unique_ptr<uint64_t[]> keys;   // N × L，每行前 cnt 个按升序 (不清零: cnt 管有效长度)
+    std::vector<uint16_t> cnt;          // N
+    std::vector<EdgeRecord> tmp;        // 一批边按目标点区间分区后的暂存
+    std::vector<int64_t> hist;
+
+    void init(int64_t n, uint32_t l) {
+        if (l == 0 || l > 65535) throw std::runtime_error("TopKReverseStore: bad L");
+        N = n; L = l;
+        keys.reset(new uint64_t[static_cast<size_t>(N) * L]);
+        cnt.assign(static_cast<size_t>(N), 0);
+    }
+    static size_t bytes_needed(int64_t n, uint32_t l) {
+        return static_cast<size_t>(n) * l * sizeof(uint64_t) + static_cast<size_t>(n) * sizeof(uint16_t);
+    }
+
+    inline void insert(uint32_t d, uint64_t key) {
+        uint64_t* row = keys.get() + static_cast<size_t>(d) * L;
+        uint16_t& c = cnt[d];
+        uint32_t pos;
+        if (c < L) { pos = c; ++c; }
+        else if (key < row[L - 1]) { pos = L - 1; }
+        else return;
+        while (pos > 0 && row[pos - 1] > key) { row[pos] = row[pos - 1]; --pos; }
+        row[pos] = key;
+    }
+
+    // 一批边: 按目标点区间做一遍基数分区 (每线程直方图，无原子)，再每个区间一个线程插入 (无锁)
+    void add(const EdgeRecord* recs, size_t n) {
+        if (n == 0) return;
+        const int T = std::max(1, omp_get_max_threads());
+        const int P = T * 8;
+        auto part_of = [&](uint32_t d) { return static_cast<int>((static_cast<uint64_t>(d) * P) / static_cast<uint64_t>(N)); };
+        hist.assign(static_cast<size_t>(T) * P + 1, 0);
+        int64_t n_bad = 0;
+        #pragma omp parallel num_threads(T) reduction(+:n_bad)
+        {
+            const int t = omp_get_thread_num();
+            const size_t e0 = n * t / T, e1 = n * (t + 1) / T;
+            int64_t* h = hist.data() + static_cast<size_t>(t) * P;
+            for (size_t e = e0; e < e1; ++e) {
+                if (recs[e].dst >= static_cast<uint64_t>(N)) { ++n_bad; continue; }   // bounds check
+                h[part_of(recs[e].dst)]++;
+            }
+        }
+        if (n_bad > 0) throw std::runtime_error("TopKReverseStore: " + std::to_string(n_bad) + " edges with dst >= N");
+        std::vector<int64_t> part_start(static_cast<size_t>(P) + 1, 0), cur(static_cast<size_t>(T) * P);
+        int64_t pos = 0;
+        for (int p = 0; p < P; ++p) {
+            part_start[p] = pos;
+            for (int t = 0; t < T; ++t) { cur[static_cast<size_t>(t) * P + p] = pos; pos += hist[static_cast<size_t>(t) * P + p]; }
+        }
+        part_start[P] = pos;
+        if (tmp.size() < n) tmp.resize(n);
+        #pragma omp parallel num_threads(T)
+        {
+            const int t = omp_get_thread_num();
+            const size_t e0 = n * t / T, e1 = n * (t + 1) / T;
+            int64_t* c = cur.data() + static_cast<size_t>(t) * P;
+            for (size_t e = e0; e < e1; ++e) tmp[static_cast<size_t>(c[part_of(recs[e].dst)]++)] = recs[e];
+        }
+        #pragma omp parallel for schedule(dynamic, 1) num_threads(T)
+        for (int p = 0; p < P; ++p)
+            for (int64_t e = part_start[p]; e < part_start[p + 1]; ++e) {
+                const EdgeRecord& r = tmp[static_cast<size_t>(e)];
+                insert(r.dst, (static_cast<uint64_t>(r.rank) << 32) | r.src);
+            }
+    }
+
+    // 点 j 的反向源, (rank, src) 升序 (= merge_rank_ordered_into_row 要的顺序)
+    inline uint32_t sources(uint32_t j, uint32_t* out) const {
+        const uint64_t* row = keys.get() + static_cast<size_t>(j) * L;
+        const uint32_t c = cnt[j];
+        for (uint32_t i = 0; i < c; ++i) out[i] = static_cast<uint32_t>(row[i]);
+        return c;
+    }
+};
+
 inline void merge_rank_ordered_into_row(
     uint32_t* row,                     // [K_out], forward row for node j; modified in place
     const uint32_t* rank_sorted_src,   // this row's CSR segment, rank-ascending

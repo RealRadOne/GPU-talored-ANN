@@ -15,6 +15,8 @@
 
 #pragma once
 #include <cstdint>
+#include <unistd.h>
+#include <fcntl.h>
 #include <cstring>
 #include <fstream>
 #include <stdexcept>
@@ -63,7 +65,16 @@ inline void read_fbin_f32(const std::string& path,
     require(in.good(), "Failed to read float payload from: " + path);
 }
 
-// .u8bin / .i8bin: header int32 N,D then N*D uint8, convert to float32
+// .i8bin 的字节是有符号 int8：8-bit 读取器按扩展名决定怎么转 float (原来一律按 uint8 转，
+// 负值会变成 128…255；P2.4 2026-10-24)
+inline bool is_i8bin_path(const std::string& path) {
+    return path.size() >= 6 && path.compare(path.size() - 6, 6, ".i8bin") == 0;
+}
+inline float byte_to_f32(uint8_t b, bool is_i8) {
+    return is_i8 ? static_cast<float>(static_cast<int8_t>(b)) : static_cast<float>(b);
+}
+
+// .u8bin / .i8bin: header int32 N,D then N*D uint8 / int8, convert to float32
 inline void read_u8bin_to_f32(const std::string& path,
                               std::vector<float>& out,
                               int32_t& N, int32_t& D) {
@@ -80,7 +91,8 @@ inline void read_u8bin_to_f32(const std::string& path,
     require(in.good(), "Failed to read uint8 payload from: " + path);
 
     out.resize(cnt);
-    for (uint64_t i = 0; i < cnt; ++i) out[i] = static_cast<float>(tmp[i]);
+    const bool i8 = is_i8bin_path(path);
+    for (uint64_t i = 0; i < cnt; ++i) out[i] = byte_to_f32(tmp[i], i8);
 }
 
 // .ibin: header int32 N,D then N*D int32
@@ -110,30 +122,131 @@ inline std::pair<int32_t,int32_t> read_fbin_header(const std::string& path) {
 }
 
 // 按 sorted 索引从 .fbin 文件中只读取指定行，避免读取整个数据集。
-// indices 必须已排序（升序）；输出 out 按 indices 原始顺序排列。
-// 对于 SSD / NVMe，排序后顺序读可以最大化吞吐。
+// indices 必须已排序（升序）；out 第 i 行 = sorted_indices[i]。
+// 跟 read_u8bin_sampled_to_f32 一样按 8 MB 行块并行 pread (OpenMP)，每块从块首读到块内最后一个
+// 采样行再挑行——原来单线程逐行 seekg + read (msTuring100M 10M 行: Step 1 ~50 s，Step 4.5 resample ~43 s)。
 inline void read_fbin_sampled(const std::string& path,
                               const std::vector<int64_t>& sorted_indices,
                               std::vector<float>& out,
                               int32_t& N, int32_t& D) {
-    std::ifstream in(path, std::ios::binary);
-    require(in.is_open(), "Cannot open file: " + path);
-
-    auto [n, d] = read_bigann_header(in);
-    N = n; D = d;
-
-    const int64_t n_samples = static_cast<int64_t>(sorted_indices.size());
-    out.resize(static_cast<size_t>(n_samples) * d);
-    const std::streamsize row_bytes = static_cast<std::streamsize>(d) * sizeof(float);
-    constexpr std::streamoff header_bytes = 2 * sizeof(int32_t);  // 8 bytes
-
-    for (int64_t i = 0; i < n_samples; ++i) {
-        std::streamoff offset = header_bytes +
-            static_cast<std::streamoff>(sorted_indices[i]) * static_cast<std::streamoff>(d) * sizeof(float);
-        in.seekg(offset);
-        in.read(reinterpret_cast<char*>(out.data() + i * d), row_bytes);
-        require(in.good(), "Failed to read sampled row " + std::to_string(sorted_indices[i]));
+    {
+        std::ifstream in(path, std::ios::binary);
+        require(in.is_open(), "Cannot open file: " + path);
+        auto [n, d] = read_bigann_header(in);
+        N = n; D = d;
     }
+    const int64_t n_samples = static_cast<int64_t>(sorted_indices.size());
+    require(std::is_sorted(sorted_indices.begin(), sorted_indices.end()), "read_fbin_sampled: indices not sorted");
+    require(n_samples == 0 || (sorted_indices.front() >= 0 && sorted_indices.back() < N),   // bounds check
+            "read_fbin_sampled: index out of range");
+    out.resize(static_cast<size_t>(n_samples) * D);
+    if (n_samples == 0) return;
+
+    const int fd = ::open(path.c_str(), O_RDONLY);
+    require(fd >= 0, "Cannot open file: " + path);
+    const int64_t row_bytes = static_cast<int64_t>(D) * sizeof(float);
+    const int64_t chunk_rows = std::max<int64_t>(1, (8 << 20) / row_bytes);
+    const int64_t n_chunks = (static_cast<int64_t>(N) + chunk_rows - 1) / chunk_rows;
+    const off_t header_bytes = 2 * sizeof(int32_t);
+    bool ok = true;
+    #pragma omp parallel
+    {
+        std::vector<char> buf(static_cast<size_t>(chunk_rows * row_bytes));
+        #pragma omp for schedule(dynamic, 1)
+        for (int64_t ch = 0; ch < n_chunks; ++ch) {
+            const int64_t r0 = ch * chunk_rows, r1 = std::min<int64_t>(N, r0 + chunk_rows);
+            const int64_t i0 = std::lower_bound(sorted_indices.begin(), sorted_indices.end(), r0) - sorted_indices.begin();
+            const int64_t i1 = std::lower_bound(sorted_indices.begin(), sorted_indices.end(), r1) - sorted_indices.begin();
+            if (i0 == i1) continue;
+            // 从块内第一个采样行读到最后一个采样行
+            const int64_t first = sorted_indices[static_cast<size_t>(i0)];
+            const int64_t last = sorted_indices[static_cast<size_t>(i1 - 1)];
+            const size_t want = static_cast<size_t>((last - first + 1) * row_bytes);
+            size_t got = 0;
+            while (got < want) {
+                ssize_t r = ::pread(fd, buf.data() + got, want - got,
+                                    header_bytes + static_cast<off_t>(first * row_bytes) + static_cast<off_t>(got));
+                if (r <= 0) break;
+                got += static_cast<size_t>(r);
+            }
+            if (got != want) {
+                #pragma omp atomic write
+                ok = false;
+                continue;
+            }
+            for (int64_t i = i0; i < i1; ++i)
+                std::memcpy(out.data() + static_cast<size_t>(i) * D,
+                            buf.data() + static_cast<size_t>((sorted_indices[static_cast<size_t>(i)] - first) * row_bytes),
+                            static_cast<size_t>(row_bytes));
+        }
+    }
+    ::close(fd);
+    require(ok, "read_fbin_sampled: short read from " + path);
+}
+
+// .u8bin / .i8bin 的采样读取: 只把 sorted_indices 指到的行转成 float (跟 read_u8bin_to_f32 一样的
+// static_cast<float>(uint8)，结果逐位相同)，不再整份读进 N×D 的 float 缓冲 (SIFT100M: 51 GB) 再挑行。
+// 文件按 8 MB 的行块并行 pread (OpenMP)，每块只转换落在块里的采样行；out 第 i 行 = sorted_indices[i]。
+// 参考 TAGORE prep: 只把需要的点从磁盘读进来。
+inline void read_u8bin_sampled_to_f32(const std::string& path,
+                                      const std::vector<int64_t>& sorted_indices,
+                                      std::vector<float>& out,
+                                      int32_t& N, int32_t& D) {
+    {
+        std::ifstream in(path, std::ios::binary);
+        require(in.is_open(), "Cannot open file: " + path);
+        auto [n, d] = read_bigann_header(in);
+        N = n; D = d;
+    }
+    const int64_t n_samples = static_cast<int64_t>(sorted_indices.size());
+    require(std::is_sorted(sorted_indices.begin(), sorted_indices.end()), "read_u8bin_sampled_to_f32: indices not sorted");
+    require(n_samples == 0 || (sorted_indices.front() >= 0 && sorted_indices.back() < N),   // bounds check
+            "read_u8bin_sampled_to_f32: index out of range");
+    out.resize(static_cast<size_t>(n_samples) * D);
+    if (n_samples == 0) return;
+
+    const int fd = ::open(path.c_str(), O_RDONLY);
+    require(fd >= 0, "Cannot open file: " + path);
+    const int64_t row_bytes = D;   // 1 B per component
+    const int64_t chunk_rows = std::max<int64_t>(1, (8 << 20) / row_bytes);
+    const int64_t n_chunks = (static_cast<int64_t>(N) + chunk_rows - 1) / chunk_rows;
+    const off_t header_bytes = 2 * sizeof(int32_t);
+    const bool i8 = is_i8bin_path(path);
+    bool ok = true;
+    #pragma omp parallel
+    {
+        std::vector<uint8_t> buf(static_cast<size_t>(chunk_rows * row_bytes));
+        #pragma omp for schedule(dynamic, 1)
+        for (int64_t ch = 0; ch < n_chunks; ++ch) {
+            const int64_t r0 = ch * chunk_rows, r1 = std::min<int64_t>(N, r0 + chunk_rows);
+            // 这一块里的采样行 = sorted_indices 的 [i0, i1)
+            const int64_t i0 = std::lower_bound(sorted_indices.begin(), sorted_indices.end(), r0) - sorted_indices.begin();
+            const int64_t i1 = std::lower_bound(sorted_indices.begin(), sorted_indices.end(), r1) - sorted_indices.begin();
+            if (i0 == i1) continue;
+            // 只读到最后一个采样行为止
+            const int64_t last = sorted_indices[static_cast<size_t>(i1 - 1)];
+            const size_t want = static_cast<size_t>((last - r0 + 1) * row_bytes);
+            size_t got = 0;
+            while (got < want) {
+                ssize_t r = ::pread(fd, buf.data() + got, want - got,
+                                    header_bytes + static_cast<off_t>(r0 * row_bytes) + static_cast<off_t>(got));
+                if (r <= 0) break;
+                got += static_cast<size_t>(r);
+            }
+            if (got != want) {
+                #pragma omp atomic write
+                ok = false;
+                continue;
+            }
+            for (int64_t i = i0; i < i1; ++i) {
+                const uint8_t* src = buf.data() + static_cast<size_t>((sorted_indices[static_cast<size_t>(i)] - r0) * row_bytes);
+                float* dst = out.data() + static_cast<size_t>(i) * D;
+                for (int32_t k = 0; k < D; ++k) dst[k] = byte_to_f32(src[k], i8);
+            }
+        }
+    }
+    ::close(fd);
+    require(ok, "read_u8bin_sampled_to_f32: short read from " + path);
 }
 
 // ---------- chunked sequential readers (contiguous row range) ----------
@@ -189,7 +302,8 @@ inline void read_u8bin_chunk_to_f32(const std::string& path,
     require(in.good(), "Failed to read chunk from: " + path);
 
     out.resize(cnt);
-    for (uint64_t i = 0; i < cnt; ++i) out[i] = static_cast<float>(tmp[i]);
+    const bool i8 = is_i8bin_path(path);
+    for (uint64_t i = 0; i < cnt; ++i) out[i] = byte_to_f32(tmp[i], i8);
 }
 
 // .ibin 版本：读原始 int32 数据块，转换为 float32
@@ -294,15 +408,38 @@ inline void read_bigann_raw_range(const std::string& path,
             "read_bigann_raw_range: row range out of bounds");
 
     constexpr std::streamoff header_bytes = 2 * sizeof(int32_t);
-    std::streamoff offset = header_bytes +
-        static_cast<std::streamoff>(start_row) * static_cast<std::streamoff>(d) * sizeof(T);
-    in.seekg(offset);
+    const off_t offset = header_bytes +
+        static_cast<off_t>(start_row) * static_cast<off_t>(d) * static_cast<off_t>(sizeof(T));
+    in.close();
 
     const uint64_t cnt = static_cast<uint64_t>(num_rows) * static_cast<uint64_t>(d);
-    out.resize(cnt);
-    in.read(reinterpret_cast<char*>(out.data()), static_cast<std::streamsize>(cnt * sizeof(T)));
-    require(in.good(), "read_bigann_raw_range: failed to read rows ["
-                       + std::to_string(start_row) + ", " + std::to_string(start_row + num_rows) + ")");
+    if (out.size() != cnt) out.resize(cnt);   // 调用方复用同一个 vector 时不再每批清零
+    // 8 MB 一片并行 pread (原来单线程 ifstream ~1 GB/s；SIFT100M Step 4 / BucketWrite 每轮 12–13 s)
+    const int fd = ::open(path.c_str(), O_RDONLY);
+    require(fd >= 0, "Cannot open file: " + path);
+    const uint64_t total = cnt * sizeof(T);
+    const uint64_t piece = uint64_t(8) << 20;
+    const int64_t n_pieces = static_cast<int64_t>((total + piece - 1) / piece);
+    bool ok = true;
+    #pragma omp parallel for schedule(dynamic, 1)
+    for (int64_t i = 0; i < n_pieces; ++i) {
+        uint64_t o = static_cast<uint64_t>(i) * piece;
+        size_t want = static_cast<size_t>(std::min<uint64_t>(piece, total - o));
+        char* p = reinterpret_cast<char*>(out.data()) + o;
+        off_t off = offset + static_cast<off_t>(o);
+        while (want > 0) {
+            ssize_t r = ::pread(fd, p, want, off);
+            if (r <= 0) break;
+            p += r; want -= static_cast<size_t>(r); off += r;
+        }
+        if (want != 0) {
+            #pragma omp atomic write
+            ok = false;
+        }
+    }
+    ::close(fd);
+    require(ok, "read_bigann_raw_range: failed to read rows ["
+                + std::to_string(start_row) + ", " + std::to_string(start_row + num_rows) + ")");
 }
 
 // 推断 BIGANN 文件扩展名对应的元素类型大小（字节数）。
