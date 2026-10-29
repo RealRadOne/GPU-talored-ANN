@@ -33,6 +33,10 @@ CAGRA reference (cuVS 26.10, NN-Descent, intermediate degree 64 → graph degree
 
 Note: builds before 2026-10-21 02:00 had no `-O3` (CMake 4 left `CMAKE_BUILD_TYPE` empty); fixed, all numbers below are `-O3`.
 
+> **2026-10-29 (2nd) — skill extended:** learns from CAGRA **and CAGRA ACE**; bench set = SIFT1M auto/large,
+> SIFT10M, SIFT100M, msTuring1M, msTuring10M, msTuring100M (median of 3 each) with the TAGORE loop's judge.py
+> (±3% per config; search vs CAGRA, CAGRA ACE for msTuring100M, own best − 0.05 for SIFT100M). Next iteration re-baselines.
+>
 > **2026-10-29 — synced with `main`** (TAGORE loop #53–#89 merged into `opt/bucket2-loop`; skill scripts
 > replaced by the dataset-adaptive TAGORE versions, judge.py kept). The best below is the pre-sync
 > cuVS-loop best (archived in `state/best_pre_main_sync_2026-10-29.json`); the next iteration
@@ -51,6 +55,15 @@ After **#69 (background data_reordered write + optimize_chunked staged I/O + par
 | CAGRA native SIFT1M / SIFT10M | 11.54 / 122.59 | 0.9305 / 0.9782 / 0.9948 — 0.8672 / 0.9463 / 0.9839 | 1942K / 1036K — 1868K / 1013K |
 
 ## Ideas backlog
+
+**From CAGRA ACE (`cuvs/cpp/src/neighbors/detail/cagra/cagra_ace.cuh`, added 2026-10-29) — implementation ideas, try first on the 100M sets:**
+- `ace_reorder_and_store_dataset`: pre-allocate output files and write each partition through its own buffer sized from free memory, ≤ 64 MB per write → Step 4.5 reorder write / bucket-vector write / `data_reordered`.
+- `ace_load_partition_dataset_from_disk` + disk-mode memory model (`ace_check_use_disk_mode`, `ace_validate_disk_mode_partitions`): load whole partitions sequentially with an explicit host / GPU memory model → Step 6 bucket loading (GPU bucket cache misses) and the chunked GPU prune's window loads; derive cache sizes from one memory model instead of independent flags.
+- `ace_get_partition_labels`: chunked (32K rows) host-side float conversion + GPU distance to centroids, top-2 partitions in one pass → Step 4 assignment on the 100M sets (msTuring100M float path).
+- `ace_adjust_sub_graph_ids_disk`: id remapping on the device during the merge → fold `translate_ids` work into `optimize_chunked`'s final write (output identical).
+- `ace_check_partition_sizes`: imbalance statistics → report bucket-size outliers per round (diagnostic, no behaviour change).
+- Note: ACE's *augmented* (2nd-closest) partition copy is an algorithm choice (our neighbor-bucket pool already covers boundary points); proposing anything like it needs approval.
+
 
 Priority (from the user, 2026-10-21):
 - **Step 4:** fp32 `brute_force` in #7/#8 (0.70 → 0.42 s/round), exact fp16 GEMM + top-2 in #22 (→ 0.12 s/round). Remaining: fuse GEMM + top-2 so the 4096 × C dots tile is never written.
@@ -149,6 +162,10 @@ Bit-exact vs the batched GPU path on SIFT1M (forced 105 MB budget, 27 chunks). S
 | ours sift1M_large | 0.9138 / 2222K | 0.9708 / 1188K | 0.9921 / 561K | 0.9984 / 187K | 0.9996 / 68K |
 | ours sift10M_auto | 0.8388 / 1873K | 0.9280 / 1051K | 0.9735 / 526K | 0.9915 / 186K | 0.9977 / 68K |
 | ours sift100M_auto | 0.7449 / 65K | 0.8519 / 64K | 0.9251 / 38K | 0.9680 / 22K | 0.9877 / 11K |
+
+## Awaiting approval
+
+_(algorithm / semantic proposals `A<k>` go here; none yet in this loop — see `OPTIMIZATION_LOG_TAGORE.md` for the TAGORE loop's A1–A9)_
 
 ## Tried & rejected
 
