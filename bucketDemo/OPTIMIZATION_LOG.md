@@ -46,21 +46,21 @@ Note: builds before 2026-10-21 02:00 had no `-O3` (CMake 4 left `CMAKE_BUILD_TYP
 
 ## Current best
 
-After **#79 — in-process id translation in optimize_chunked** (2026-10-29, `runs/iter79`, median of 3, GPU 0; msTuring10M from the confirmatory rerun):
+After **#80 — optimize_chunked Phase 1 store partitions + pageable buffers** (2026-10-29, `runs/iter80`, median of 3, GPU 0; build totals updated, recall / QPS rows from #79 (graphs vary run to run through Step 4; #80 recall within ±0.002 of these, full rows in #80)):
 
 | config | path | build total (s) | vs CAGRA / ACE | vs TAGORE | recall@10 at itopk / L 32 / 64 / 128 | QPS 32 / 64 |
 |---|---|---|---|---|---|---|
-| SIFT1M auto | resident | **4.94** | 0.43x | 0.54x | 0.9244 / 0.9754 / 0.9940 | 1948K / 1034K |
-| SIFT1M large | large | **7.47** | 0.65x | 0.81x | 0.9247 / 0.9757 / 0.9940 | 2224K / 1191K |
-| SIFT10M auto | large (2 rounds) | **40.21** | 0.33x | 0.19x | 0.8313 / 0.9204 / 0.9686 | 1870K / 1011K |
-| SIFT100M auto | large (2 rounds) | **467.04** | 0.63x ACE | 0.22x | 0.7268 / 0.8344 / 0.9113 (DiskANN) | 54K / 53K |
-| msTuring1M auto | resident | **15.95** | 1.39x | 1.71x | 0.6591 / 0.7888 / 0.8846 | 1454K / 755K |
-| msTuring10M auto | large | **97.67** | 0.82x | 0.42x | 0.6269 / 0.7676 / 0.8655 | 1435K / 750K |
-| msTuring100M auto | large (2 rounds) | **781.30** | 0.65x ACE | 0.36x | 0.6117 / 0.7151 / 0.8020 (DiskANN) | 5K* / 21K |
+| SIFT1M auto | resident | **4.90** | 0.43x | 0.54x | 0.9244 / 0.9754 / 0.9940 | 1948K / 1034K |
+| SIFT1M large | large | **7.31** | 0.65x | 0.81x | 0.9247 / 0.9757 / 0.9940 | 2224K / 1191K |
+| SIFT10M auto | large (2 rounds) | **39.37** | 0.33x | 0.19x | 0.8313 / 0.9204 / 0.9686 | 1870K / 1011K |
+| SIFT100M auto | large (2 rounds) | **447.66** | 0.61x ACE | 0.22x | 0.7268 / 0.8344 / 0.9113 (DiskANN) | 54K / 53K |
+| msTuring1M auto | resident | **16.00** | 1.39x | 1.71x | 0.6591 / 0.7888 / 0.8846 | 1454K / 755K |
+| msTuring10M auto | large | **96.66** | 0.82x | 0.42x | 0.6269 / 0.7676 / 0.8655 | 1435K / 750K |
+| msTuring100M auto | large (2 rounds) | **743.13** | 0.62x ACE | 0.36x | 0.6117 / 0.7151 / 0.8020 (DiskANN) | 5K* / 21K |
 
 \* msTuring100M DiskANN QPS at small L looks like a cold-start artifact of the search script; recall is what is gated.
 
-Where the 100M time goes (s): SIFT100M bucket2 364 (Step 4 ~120, Step 6 ~160, Wait ~41, Step 4.5 ~28, Step 1 ~22), prune 40, optimize_chunked 63. msTuring100M bucket2 620 (Step 4 ~262, Step 6 ~214, Step 4.5 ~60, Wait ~45), prune 88, optimize_chunked 67.
+Where the 100M time goes (s): SIFT100M bucket2 364 (Step 4 ~120, Step 6 ~160, Wait ~41, Step 4.5 ~28, Step 1 ~22), prune 40, optimize_chunked 44. msTuring100M bucket2 620 (Step 4 ~262, Step 6 ~214, Step 4.5 ~60, Wait ~45), prune 88, optimize_chunked 48.
 
 ## Ideas backlog
 
@@ -2058,6 +2058,76 @@ SIFT10M is back in every iteration (`run_pipeline.sh -d sift10M -m auto -r 1`, t
 
 
 **Verdict:** ACCEPT — vs best: SIFT100M +9.9 % (518.1 → 467.0 s, 0.63× ACE), SIFT10M +7.0 %, msTuring100M +4.0 % (813.8 → 781.3 s, 0.65× ACE), SIFT1M large +2.5 %, msTuring10M +1.8 %, SIFT1M auto −2.3 % / msTuring1M −0.9 % (resident path, untouched; noise).
+
+### #80 — optimize_chunked Phase 1: cache-sized TopKReverseStore partitions + pageable buffers through pinned staging  (2026-10-29)
+**Idea / rationale:** profiled Phase 1 on a kept SIFT100M work dir (new per-part timers): read 0.9 s, H2D 1.0, kernel 2.8, overflow D2H 0.4, **overflow insert 4.6 s, drain (D2H + insert) 22 s** (of 33 s), plus 6.5 s `cudaMallocHost` (1.9 + 3.7 + 3.4 GB) before Phase 1 and 1–3 s `cudaFreeHost` after. (1) `TopKReverseStore::add` partitions each batch by destination into T·512 ranges instead of T·8 (capped at N/2048 rows, ≥ T·8), so one range's rows (~0.6 MB at 100M) stay in L2 during the insert pass. A/B on the same graph (Phase 1): 8 → 33.1 s, 64 → 28.8, 512 → 26.1 / 25.3, 1024 → 28.7, 2048 → 30.9. (2) batch / overflow / drain buffers are uninitialised pageable memory; H2D / D2H go through `PinnedStaging` (2 × 64 MB pinned, multi-threaded copy in/out; new `d2h`). Pinned alloc 6.5 → 0.07 s; only touched pages become resident. Output byte-identical (row result = L smallest (rank, src) keys, independent of insertion order): checked on SIFT100M, and on sift1M / msTuring1M for GPU Phase 2 vs CPU store vs disk accumulator.
+**CAGRA / ACE source:** `detail/cagra/cagra_build.cuh::build_knn_graph` — small pinned double buffers between a large host dataset and the device instead of pinning the whole host buffer; ACE `ace_reorder_and_store_dataset`'s per-partition buffers sized to memory. Ours before: whole multi-GB `cudaMallocHost` buffers, 8 coarse partitions per thread.
+**Class:** implementation (output byte-identical).
+**Files:** `src/optimize_chunked.cu`, `src/edge_chunk_accumulator.hpp`. **Params changed:** none.
+**Stage effect (standalone, same SIFT100M graph):** optimize_chunked 67.8 → 44.3–45.1 s; in the bench: SIFT100M 63.0 → 44.1 s, msTuring100M 66.7 → 48.2 s, RSS 40.9 → 41.1 GB.
+
+**Build time (s, median of reps; sum of all stages)**
+
+| config | path | reps | total | vs best | vs baseline | vs TAGORE | vs CAGRA | stages | GPU peak MiB | max RSS GB |
+|---|---|---|---|---|---|---|---|---|---|---|
+| sift1M_auto | resident | 3 | 4.90 | +0.8% | -1.4% | 0.53x | 0.42x | bucket2 4.90 | 5036 | 1.59 |
+| sift1M_large | large | 3 | 7.31 | +2.1% | +4.6% | 0.80x | 0.63x | bucket2 5.79, prune 0.73, optimize_chunked 0.79 | 1286 | 1.71 |
+| sift10M_auto | large | 3 | 39.37 | +2.1% | +8.9% | 0.18x | 0.32x | bucket2 31.92, prune 4.24, optimize_chunked 3.20 | 8996 | 9.65 |
+| sift100M_auto | large | 3 | 447.66 | +4.1% | +13.6% | 0.21x | 0.61x | bucket2 363.81, prune 39.82, optimize_chunked 44.13 | 14568 | 41.12 |
+| msTuring1M_auto | resident | 3 | 16.00 | -0.3% | -1.3% | 1.71x | 1.39x | bucket2 16.00 | 5188 | 1.64 |
+| msTuring10M_auto | large | 3 | 96.66 | +1.0% | +2.8% | 0.42x | 0.81x | bucket2 88.29, prune 5.00, optimize_chunked 3.37 | 8996 | 20.55 |
+| msTuring100M_auto | large | 3 | 743.13 | +4.9% | +8.7% | 0.34x | 0.62x | bucket2 608.82, prune 85.36, optimize_chunked 48.20 | 14728 | 52.69 |
+
+**bucket2 step breakdown (s)**
+
+| config | Step 1 (Load sampled data) | Step 2 (Select centroids) | Step 3 (Centroid KNN graph) | Step 3.5 (Load full dataset) | Step 4 (Batch assignment) | Step 4.5 (Inline reorder, round 1 only) | Step 5 (Write buckets) | Step 6 (Per-vector KNN, merge included) | Wait (final iteration's background merge) | Write (close + .npy convert) |
+|---|---|---|---|---|---|---|---|---|---|---|
+| sift1M_auto | 0.72 | 0.16 | 0.06 | 0.00 | 0.32 | 0.21 | 0.01 | 1.93 | 0.00 | 0.96 |
+| sift1M_large | 0.15 | 0.31 | 0.23 | 0.00 | 0.91 | 0.17 | 0.05 | 2.69 | 0.52 | 0.00 |
+| sift10M_auto | 1.16 | 1.81 | 0.14 | 0.00 | 6.47 | 1.65 | 0.18 | 14.72 | 4.30 | 0.00 |
+| sift100M_auto | 11.90 | 6.37 | 2.59 | 0.00 | 121.45 | 28.71 | 3.00 | 158.59 | 26.56 | 0.00 |
+| msTuring1M_auto | 0.91 | 0.41 | 0.03 | 0.00 | 0.55 | 0.50 | 0.02 | 11.39 | 0.00 | 1.00 |
+| msTuring10M_auto | 7.84 | 6.78 | 0.28 | 0.00 | 18.14 | 4.23 | 0.22 | 43.37 | 4.35 | 0.00 |
+| msTuring100M_auto | 12.00 | 16.66 | 4.26 | 0.00 | 262.92 | 60.47 | 4.42 | 199.29 | 26.78 | 0.00 |
+
+**(a) pre-prune index (degree 64) vs exact KNN, 10K sampled points**
+
+| config | recall@1 | recall@10 | recall@32 | recall@64 |
+|---|---|---|---|---|
+| sift1M_auto | 0.9361 | 0.9225 | 0.9098 | 0.9011 |
+| sift1M_large | 0.9447 | 0.9241 | 0.9116 | 0.9023 |
+| sift10M_auto | 0.7515 | 0.7206 | 0.6992 | 0.6829 |
+| sift100M_auto | 0.6519 | 0.6163 | 0.5914 | 0.5735 |
+| msTuring1M_auto | 0.9865 | 0.9789 | 0.9654 | 0.9518 |
+| msTuring10M_auto | 0.8069 | 0.7648 | 0.7349 | 0.7127 |
+| msTuring100M_auto | 0.7030 | 0.6551 | 0.6268 | 0.6064 |
+
+**(b) final graph (degree 32, original ids), recall@10 / QPS (10K queries); search per datasets.json (cagra: cuVS CAGRA itopk, diskann: DiskANN CPU L)**
+
+| graph | 32 | 64 | 128 | 256 | 512 |
+|---|---|---|---|---|---|
+| TAGORE GNN-Descent k=96 + CAGRA prune, sift1M | 0.9220 / 1947K | 0.9752 / 1033K | 0.9936 / 497K | 0.9985 / 186K | 0.9996 / 68K |
+| CAGRA , sift1M | 0.9305 / 1942K | 0.9782 / 1036K | 0.9948 / 533K | 0.9988 / 189K | 0.9998 / 68K |
+| TAGORE largeIndex Vamana, sift10M | 0.8448 / 1875K | 0.9238 / 1014K | 0.9662 / 482K | 0.9863 / 185K | 0.9950 / 68K |
+| CAGRA , sift10M | 0.8672 / 1868K | 0.9463 / 1013K | 0.9839 / 525K | 0.9959 / 187K | 0.9992 / 68K |
+| TAGORE largeIndex Vamana, sift100M | 0.7691 / 61K | 0.8615 / 55K | 0.9238 / 34K | 0.9616 / 20K | 0.9820 / 11K |
+| CAGRA CAGRA ACE 64->32, sift100M | 0.7672 / 63K | 0.8697 / 57K | 0.9374 / 34K | 0.9756 / 20K | 0.9917 / 11K |
+| TAGORE GNN-Descent k=96 + CAGRA prune (degree 32), msTuring1M | 0.6046 / 1495K | 0.7390 / 798K | 0.8454 / 371K | 0.9150 / 147K | 0.9572 / 47K |
+| CAGRA CAGRA NN-Descent 64->32, msTuring1M | 0.6628 / 1451K | 0.7924 / 735K | 0.8860 / 366K | 0.9449 / 147K | 0.9770 / 47K |
+| TAGORE largeIndex Vamana (degree 32), msTuring10M | 0.5838 / 1445K | 0.7300 / 769K | 0.8446 / 380K | 0.9135 / 152K | 0.9515 / 48K |
+| CAGRA CAGRA NN-Descent 64->32, msTuring10M | 0.6621 / 1418K | 0.7995 / 740K | 0.8922 / 370K | 0.9451 / 150K | 0.9741 / 47K |
+| TAGORE largeIndex Vamana (degree 32), msTuring100M | 0.5919 / 31K | 0.7199 / 20K | 0.8166 / 12K | 0.8862 / 7K | 0.9327 / 4K |
+| CAGRA CAGRA ACE 64->32, msTuring100M | 0.6295 / 39K | 0.7513 / 26K | 0.8456 / 16K | 0.9100 / 9K | 0.9511 / 5K |
+| ours sift1M_auto | 0.9253 / 2223K | 0.9762 / 1190K | 0.9943 / 562K | 0.9985 / 189K | 0.9997 / 68K |
+| ours sift1M_large | 0.9261 / 1945K | 0.9757 / 1052K | 0.9936 / 561K | 0.9987 / 185K | 0.9997 / 68K |
+| ours sift10M_auto | 0.8314 / 1870K | 0.9220 / 1011K | 0.9698 / 526K | 0.9902 / 186K | 0.9971 / 66K |
+| ours sift100M_auto | 0.7263 / 55K | 0.8324 / 50K | 0.9111 / 30K | 0.9587 / 17K | 0.9839 / 10K |
+| ours msTuring1M_auto | 0.6589 / 1491K | 0.7904 / 801K | 0.8847 / 371K | 0.9439 / 147K | 0.9768 / 47K |
+| ours msTuring10M_auto | 0.6271 / 1421K | 0.7704 / 729K | 0.8683 / 369K | 0.9265 / 150K | 0.9617 / 47K |
+| ours msTuring100M_auto | 0.6113 / 15K | 0.7169 / 22K | 0.8035 / 13K | 0.8678 / 8K | 0.9150 / 5K |
+
+
+**Verdict:** ACCEPT — vs best: msTuring100M +4.9 % (781.3 → 743.1 s, 0.62× ACE), SIFT100M +4.1 % (467.0 → 447.7 s, 0.61× ACE), others within ±2.1 % (no regression).
 
 <!-- template for an accepted entry:
 ### #N — <one-line idea>  (<date>, commit <hash>)

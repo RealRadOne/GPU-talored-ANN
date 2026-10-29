@@ -139,6 +139,30 @@ struct PinnedStaging {
         }
         CUDA_CHECK(cudaStreamSynchronize(st));
     }
+    // 整段 D2H 进 pageable 的 h (按 64 MB 片双缓冲，片内多线程拷出)
+    void d2h(void* h, const void* d, size_t bytes) {
+        if (bytes == 0) return;
+        auto issue = [&](size_t off, int b) {
+            CUDA_CHECK(cudaMemcpyAsync(pin[b], static_cast<const char*>(d) + off, std::min(kChunk, bytes - off),
+                                       cudaMemcpyDeviceToHost, st));
+            CUDA_CHECK(cudaEventRecord(ev[b], st));
+        };
+        issue(0, 0);
+        for (size_t off = 0, k = 0; off < bytes; off += kChunk, ++k) {
+            const int b = static_cast<int>(k & 1);
+            if (off + kChunk < bytes) issue(off + kChunk, b ^ 1);
+            CUDA_CHECK(cudaEventSynchronize(ev[b]));
+            const size_t n = std::min(kChunk, bytes - off);
+            const int64_t pieces = static_cast<int64_t>((n + (size_t(1) << 20) - 1) >> 20);
+            #pragma omp parallel for schedule(static)
+            for (int64_t i = 0; i < pieces; ++i) {
+                const size_t o = static_cast<size_t>(i) << 20;
+                std::memcpy(static_cast<char*>(h) + off + o, static_cast<const char*>(pin[b]) + o,
+                            std::min(size_t(1) << 20, n - o));
+            }
+        }
+        used[0] = used[1] = true;
+    }
     template <typename Sink>
     void d2h_rows(const uint32_t* d, int64_t N, int w, Sink&& sink) {
         const int64_t rows_per = std::max<int64_t>(1, static_cast<int64_t>(kChunk / (static_cast<size_t>(w) * 4)));
@@ -1642,16 +1666,19 @@ static void run_method_E(
     // buffer、经 pinned 暂存区上传，不再整块 cudaMallocHost (SIFT10M 1.28 GB: 0.7 s) +
     // 单线程 ifstream 读；多批时照旧
     const bool single_batch = static_cast<int64_t>(batch_rows) >= N;
-    uint32_t* h_fwd_batch = nullptr;
-    std::unique_ptr<uint32_t[]> h_fwd_page;
-    if (single_batch) h_fwd_page.reset(new uint32_t[static_cast<size_t>(N) * K_out]);
-    else CUDA_CHECK(cudaMallocHost(&h_fwd_batch, static_cast<size_t>(batch_rows) * K_out * sizeof(uint32_t)));
+    // #80: 批缓冲 / overflow / drain 缓冲都改成不清零的 pageable 内存，H2D / D2H 经 PinnedStaging 的
+    // 2 × 64 MB pinned 区 (多线程拷进拷出)，不再整块 cudaMallocHost (SIFT100M 1.9 + 3.7 + 3.4 GB:
+    // 分配 6.5 s、释放 1–3 s，都在关键路径上)；只有真正用到的页才驻留。
+    // 参考 cuVS cagra_build.cuh::build_knn_graph: 小块 pinned 双缓冲 + 大块 host 数据。
+    std::unique_ptr<uint32_t[]> h_fwd_page(new uint32_t[static_cast<size_t>(single_batch ? N : static_cast<int64_t>(batch_rows)) * K_out]);
+    uint32_t* h_fwd_batch = h_fwd_page.get();
     std::vector<uint32_t> h_chunk_count(static_cast<size_t>(num_chunks));
-    edge_chunk::EdgeRecord* h_overflow_buf = nullptr;
-    CUDA_CHECK(cudaMallocHost(&h_overflow_buf, static_cast<size_t>(overflow_cap) * sizeof(edge_chunk::EdgeRecord)));
-    edge_chunk::EdgeRecord* h_drain_buf = nullptr;
-    if (!single_drain)
-        CUDA_CHECK(cudaMallocHost(&h_drain_buf, capacity_per_chunk * sizeof(edge_chunk::EdgeRecord)));
+    std::unique_ptr<edge_chunk::EdgeRecord[]> h_overflow_page(new edge_chunk::EdgeRecord[static_cast<size_t>(overflow_cap)]);
+    edge_chunk::EdgeRecord* h_overflow_buf = h_overflow_page.get();
+    std::unique_ptr<edge_chunk::EdgeRecord[]> h_drain_page;
+    if (!single_drain) h_drain_page.reset(new edge_chunk::EdgeRecord[capacity_per_chunk]);
+    edge_chunk::EdgeRecord* h_drain_buf = h_drain_page.get();
+    PinnedStaging p1_stg;
     double t_alloc_pinned = std::chrono::duration<double>(Clock::now() - t_alloc1).count();
     std::cout << "  [Timing] Alloc: device=" << std::fixed << std::setprecision(2) << t_alloc_device
               << "s, pinned-host=" << t_alloc_pinned << "s\n";
@@ -1693,26 +1720,30 @@ static void run_method_E(
         fwd_in.seekg(sizeof(int64_t) + sizeof(int32_t), std::ios::beg);  // 跳过 N/K_out header
 
         uint64_t total_in_chunk = 0, total_overflow = 0;
+        double p1_read = 0, p1_h2d = 0, p1_kern = 0, p1_ovf_d2h = 0, p1_ovf_add = 0, p1_drain = 0;
+        auto p1s = [](Clock::time_point a) { return std::chrono::duration<double>(Clock::now() - a).count(); };
 
         for (int64_t bs = 0; bs < N; bs += batch_rows) {
+            auto q1 = Clock::now();
             uint32_t cur_rows = static_cast<uint32_t>(std::min<int64_t>(batch_rows, N - bs));
             size_t n_elems = static_cast<size_t>(cur_rows) * K_out;
 
             if (single_batch) {
                 parallel_pread_file(fwd_path, static_cast<off_t>(sizeof(int64_t) + sizeof(int32_t)),
                                     n_elems * sizeof(uint32_t), h_fwd_page.get());
-                PinnedStaging stg;
-                stg.h2d(d_fwd_batch, h_fwd_page.get(), n_elems * sizeof(uint32_t));
-                h_fwd_page.reset();
+                p1_stg.h2d(d_fwd_batch, h_fwd_page.get(), n_elems * sizeof(uint32_t));
+                h_fwd_page.reset(); h_fwd_batch = nullptr;
             } else {
             // #89: 多线程 pread 进 pinned 批缓冲 (原来单线程 ifstream 顺序读，SIFT100M 7 批 × 1.87 GB)；字节相同
             parallel_pread_file(fwd_path, static_cast<off_t>(sizeof(int64_t) + sizeof(int32_t)) +
                                               static_cast<off_t>(bs) * K_out * static_cast<off_t>(sizeof(uint32_t)),
                                 n_elems * sizeof(uint32_t), h_fwd_batch);
+            p1_read += p1s(q1); q1 = Clock::now();
 
-            CUDA_CHECK(cudaMemcpy(d_fwd_batch, h_fwd_batch,
-                n_elems * sizeof(uint32_t), cudaMemcpyHostToDevice));
+            p1_stg.h2d(d_fwd_batch, h_fwd_batch, n_elems * sizeof(uint32_t));
+            p1_h2d += p1s(q1);
             }
+            q1 = Clock::now();
             CUDA_CHECK(cudaMemset(d_overflow_count, 0, sizeof(uint32_t)));
 
             uint64_t total_edges = static_cast<uint64_t>(cur_rows) * K_out;
@@ -1725,6 +1756,7 @@ static void run_method_E(
                 d_overflow_buf, d_overflow_count, overflow_cap);
             CUDA_CHECK(cudaGetLastError());
             CUDA_CHECK(cudaDeviceSynchronize());
+            p1_kern += p1s(q1); q1 = Clock::now();
 
             CUDA_CHECK(cudaMemcpy(h_chunk_count.data(), d_chunk_count,
                 static_cast<size_t>(num_chunks) * sizeof(uint32_t), cudaMemcpyDeviceToHost));
@@ -1736,8 +1768,8 @@ static void run_method_E(
                     " > " + std::to_string(overflow_cap) +
                     "). Increase --gpu-budget-mb or --edge-buffer-mb.");
             if (ofc > 0) {
-                CUDA_CHECK(cudaMemcpy(h_overflow_buf, d_overflow_buf,
-                    static_cast<size_t>(ofc) * sizeof(edge_chunk::EdgeRecord), cudaMemcpyDeviceToHost));
+                p1_stg.d2h(h_overflow_buf, d_overflow_buf, static_cast<size_t>(ofc) * sizeof(edge_chunk::EdgeRecord));
+                p1_ovf_d2h += p1s(q1); q1 = Clock::now();
                 if (use_store) store.add(h_overflow_buf, ofc);   // 整批插入 (chunk 无关)
                 else
                 for (uint32_t e = 0; e < ofc; ++e) {
@@ -1746,19 +1778,25 @@ static void run_method_E(
                     add_edges(static_cast<int32_t>(c), &h_overflow_buf[e], 1);
                 }
                 total_overflow += ofc;
+                p1_ovf_add += p1s(q1);
             }
 
+            q1 = Clock::now();
             for (int32_t c = 0; c < num_chunks; ++c) {
                 if (!single_drain && h_chunk_count[static_cast<size_t>(c)] >= capacity_per_chunk) {
                     uint32_t take = static_cast<uint32_t>(capacity_per_chunk);
-                    CUDA_CHECK(cudaMemcpy(h_drain_buf, d_chunk_buf + static_cast<size_t>(c) * capacity_per_chunk,
-                        static_cast<size_t>(take) * sizeof(edge_chunk::EdgeRecord), cudaMemcpyDeviceToHost));
+                    p1_stg.d2h(h_drain_buf, d_chunk_buf + static_cast<size_t>(c) * capacity_per_chunk,
+                               static_cast<size_t>(take) * sizeof(edge_chunk::EdgeRecord));
                     add_edges(c, h_drain_buf, take);
                     CUDA_CHECK(cudaMemset(d_chunk_count + c, 0, sizeof(uint32_t)));
                     total_in_chunk += take;
                 }
             }
+            p1_drain += p1s(q1);
         }
+        std::cout << "  [Timing] Phase 1 batches: read=" << std::fixed << std::setprecision(2) << p1_read
+                  << "s h2d=" << p1_h2d << "s kernel=" << p1_kern << "s overflow_d2h=" << p1_ovf_d2h
+                  << "s overflow_add=" << p1_ovf_add << "s drain=" << p1_drain << "s\n";
 
         // 收尾：drain 每个 chunk 剩下没写满的部分
         CUDA_CHECK(cudaMemcpy(h_chunk_count.data(), d_chunk_count,
@@ -1851,8 +1889,8 @@ static void run_method_E(
                 total_in_chunk += take;
                 continue;
             }
-            CUDA_CHECK(cudaMemcpy(h_drain_buf, d_chunk_buf + static_cast<size_t>(c) * capacity_per_chunk,
-                static_cast<size_t>(take) * sizeof(edge_chunk::EdgeRecord), cudaMemcpyDeviceToHost));
+            p1_stg.d2h(h_drain_buf, d_chunk_buf + static_cast<size_t>(c) * capacity_per_chunk,
+                       static_cast<size_t>(take) * sizeof(edge_chunk::EdgeRecord));
             add_edges(c, h_drain_buf, take);
             total_in_chunk += take;
         }
@@ -1882,9 +1920,7 @@ static void run_method_E(
     cudaFree(d_overflow_buf);
     cudaFree(d_overflow_count);
     cudaFree(d_fwd_batch);
-    cudaFreeHost(h_fwd_batch);
-    cudaFreeHost(h_overflow_buf);
-    cudaFreeHost(h_drain_buf);
+    h_fwd_page.reset(); h_overflow_page.reset(); h_drain_page.reset();
     double t_free = std::chrono::duration<double>(Clock::now() - t_free0).count();
     std::cout << "  [Timing] acc.finish()=" << std::fixed << std::setprecision(2) << t_acc_finish
               << "s, free buffers=" << t_free << "s\n";
