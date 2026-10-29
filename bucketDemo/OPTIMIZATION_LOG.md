@@ -68,7 +68,8 @@ Where the 100M time goes (s): SIFT100M bucket2 364 (Step 4 ~120, Step 6 ~160, Wa
 - `ace_reorder_and_store_dataset`: pre-allocate output files and write each partition through its own buffer sized from free memory, ≤ 64 MB per write → Step 4.5 reorder write / bucket-vector write / `data_reordered`.
 - `ace_load_partition_dataset_from_disk` + disk-mode memory model (`ace_check_use_disk_mode`, `ace_validate_disk_mode_partitions`): load whole partitions sequentially with an explicit host / GPU memory model → Step 6 bucket loading (GPU bucket cache misses) and the chunked GPU prune's window loads; derive cache sizes from one memory model instead of independent flags.
 - `ace_get_partition_labels`: chunked (32K rows) host-side float conversion + GPU distance to centroids, top-2 partitions in one pass → Step 4 assignment on the 100M sets (msTuring100M float path).
-- `ace_adjust_sub_graph_ids_disk`: id remapping on the device during the merge → fold `translate_ids` work into `optimize_chunked`'s final write (output identical).
+- **done #79** `ace_adjust_sub_graph_ids_disk`: ids remapped in `optimize_chunked`, `translate_ids` dropped at ≤ host budget / 4.
+- Next candidates (from #78/#79 profiling): final ChunkedKNN merge (Wait ~41 s at 100M, disk-writeback bound: read_arrival / write_running); Step 4.5 msTuring100M windowed reorder makes 2 full input passes (46 s); Step 4 CAGRA search 95 s (SIFT100M) / 223 s (msTuring100M) per build.
 - `ace_check_partition_sizes`: imbalance statistics → report bucket-size outliers per round (diagnostic, no behaviour change).
 - Note: ACE's *augmented* (2nd-closest) partition copy is an algorithm choice (our neighbor-bucket pool already covers boundary points); proposing anything like it needs approval.
 
