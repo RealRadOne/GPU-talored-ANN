@@ -33,6 +33,12 @@ CAGRA reference (cuVS 26.10, NN-Descent, intermediate degree 64 → graph degree
 
 Note: builds before 2026-10-21 02:00 had no `-O3` (CMake 4 left `CMAKE_BUILD_TYPE` empty); fixed, all numbers below are `-O3`.
 
+> **2026-10-29 — synced with `main`** (TAGORE loop #53–#89 merged into `opt/bucket2-loop`; skill scripts
+> replaced by the dataset-adaptive TAGORE versions, judge.py kept). The best below is the pre-sync
+> cuVS-loop best (archived in `state/best_pre_main_sync_2026-10-29.json`); the next iteration
+> re-baselines SIFT1M auto/large, SIFT10M, SIFT100M on the merged code. Unjudged #77
+> (`--gpu-bucket-cache-mb 6144`) is in `git stash` — superseded by dataset_env's GPU bucket cache = GPU/2.
+
 ## Current best
 
 After **#69 (background data_reordered write + optimize_chunked staged I/O + parallel centroid add)**, 2026-10-21:

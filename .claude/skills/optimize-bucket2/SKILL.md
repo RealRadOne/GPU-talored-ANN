@@ -14,17 +14,36 @@ user stops it. Never stop the loop on your own.
 | what | where |
 |---|---|
 | code under optimization | `bucketDemo/buildBucket/src/` — `bucket.cu` (bucket2), `optimize.cu` (resident prune+reverse), `prune_windowed.cpp` + `prune_windowed_core.hpp`, `optimize_chunked.cu` (method E), `translate_ids.cpp` + `translate_graph_ids.hpp`, shared `*.hpp` |
-| pipeline parameters | `.claude/skills/optimize-bucket2/scripts/params.sh` |
+| pipeline parameters | `scripts/params.sh` (fixed: degrees 64/32, seed, stage flags) + **`scripts/dataset_env.py`** (size-adaptive: CENTROID_RATIO = 1/B with avg bucket B = 512, NPROBE = ceil(20000/B), KMeans train fraction, host/GPU cache sizes, A1/A7 switches) + **`scripts/datasets.json`** (dataset registry: dir, base file, iterations, search = cagra/diskann, per-dataset `params` overrides). Precedence: exported env var > datasets.json `params` > dataset_env rules. Tune per dataset in datasets.json, not in params.sh |
 | reference source (read-only) | `/home/lanlu/cuvs` = cuVS **26.12**, under `cpp/src/neighbors/`. **Two CAGRA build flavours to learn from:** (1) NN-Descent — `detail/nn_descent.cuh`, `detail/nn_descent_gnnd.hpp`; (2) **IVF-PQ** — `detail/cagra/cagra_build.cuh` (`build_knn_graph` with ivf_pq: batched queries, pinned/managed staging, overlap of search + refine, `refine_rate`), `ivf_pq/ivf_pq_build.cuh` (sampled balanced-kmeans training, `process_and_fill_codes`), `ivf_pq/ivf_pq_search.cuh`, `detail/refine*`. Also `detail/cagra/graph_core.cuh` (sort / prune / reverse edges / merge), `detail/cagra/cagra_ace.cuh` (ACE: partitioned out-of-core CAGRA build — closest to our large path), `all_neighbors/` (batched / clustered kNN — closest to our bucket design), `detail/knn_brute_force.cuh`, `detail/fused_l2_knn.cuh`, `detail/faiss_select/`, `../cluster/detail/kmeans*`. raft headers: `/home/lanlu/miniconda3/envs/cuvs-bench/include/raft` |
 | link-time dependency | conda env `cuvs-bench` = libcuvs / libraft / librmm **26.10**, nvcc 12.9. Only the **public** cuVS/raft API is available (no `detail::` from 26.10 headers). Porting a 26.12 kernel = copy it into our source, don't include `/home/lanlu/cuvs/cpp/src` |
 | toolchain | conda env `cuvs-build` (gcc 14, cmake 4, ninja, boost 1.87). Build: `cd bucketDemo/buildBucket && /home/lanlu/miniconda3/envs/cuvs-build/bin/ninja -C build` (reconfigure: `CONDA_PREFIX=/home/lanlu/miniconda3/envs/cuvs-bench /home/lanlu/miniconda3/envs/cuvs-build/bin/cmake -S . -B build -G Ninja -DCMAKE_MAKE_PROGRAM=/home/lanlu/miniconda3/envs/cuvs-build/bin/ninja`) |
 | eval tool | `bucketDemo/evalCuvs/build/cagra_eval` (cuVS 26.10 CAGRA build / search sweep) |
-| datasets | `dataset/sift1M/` and `dataset/sift10M/` (`base.*.u8bin`, `query.public.10K.u8bin`, `groundtruth.ibin` (k=100), `base_knn_sample10K_k64.ibin` (exact KNN of 10K sampled base points)) |
+| datasets | registered in `scripts/datasets.json` (`sift1M`, `sift10M`, `sift100M`, `msTuring1M/10M/100M` float32, ...); each dir holds `base.*.{u8bin,i8bin,fbin}`, `query.public.10K.*`, `groundtruth.ibin` (k=100), `base_knn_sample10K_k64.ibin` (exact KNN of 10K sampled base points; `scripts/prep_dataset.py` makes them). This loop's bench set: sift1M auto + large, sift10M auto, sift100M auto |
 | CAGRA reference | `state/cagra_baseline.json` (cuVS 26.10 NN-Descent 64→32: SIFT1M 11.54s, SIFT10M 122.6s, recall table) |
 | current best | `state/best.json` (written only by `judge.py --update`) |
 | log | `bucketDemo/OPTIMIZATION_LOG.md` |
 | branch | `opt/bucket2-loop` (commit every accepted iteration there; never push) |
 | GPU | **GPU 0 only** (`CUDA_VISIBLE_DEVICES=0`, scripts set it) |
+
+## Synced with main (2026-10-29)
+
+`opt/bucket2-loop` was merged with `main` (TAGORE loop #53–#89) and this skill's shared scripts
+(`run_pipeline.sh`, `dataset_env.py`, `datasets.json`, `summarize.py`, `knn_similarity.py`,
+`diskann_search.py`, `gen_gt.py`, `resume_large_tail.sh`, `prep_dataset.py`, `params.sh`) were
+replaced by the `optimize-bucket2-tagore` versions; `judge.py` and the acceptance rules below stay
+this loop's own. Consequences:
+- The code and defaults now include the user-approved algorithm changes from the TAGORE loop
+  (A2: avg bucket 512 + NPROBE rule; A7: unwindowed batched GPU prune on SIFT1M/SIFT10M; SIFT10M and
+  SIFT100M build with 2 rounds; A1 local join available, off on SIFT). Treat them as the new design
+  baseline; new algorithm/semantic changes still need a logged proposal + user approval.
+- The old `state/best.json` (cuVS-loop #76 code) is archived as `state/best_pre_main_sync_2026-10-29.json`
+  and is **not** comparable: the next invocation is iteration 0 and re-baselines all four configs.
+  (Dry-run on TAGORE's #99 metrics: 1M auto +23.7%, 1M large +18.7%, 10M +49.3%, 100M +84% faster than
+  the archived best, but SIFT100M DiskANN recall@10 0.727 / 0.833 / 0.910 at L 32 / 64 / 128 vs
+  0.745 / 0.852 / 0.925 — the new baseline starts from main's quality.)
+- Before picking an idea, also read `bucketDemo/OPTIMIZATION_LOG_TAGORE.md` (accepted + Tried & rejected)
+  so this loop does not repeat what the TAGORE loop already tried.
 
 ## Goal
 
@@ -65,7 +84,7 @@ Also:
 ## One iteration
 
 ### 0. Orient (cheap)
-- If `state/best.json` does not exist, this invocation is **iteration 0 (baseline)**: skip steps 1–2, run the two tests of step 3 into `runs/iter0/`, then `judge.py $R/sift1M_auto $R/sift1M_large --update --md`, fill the log's **Current best** block, commit, and return.
+- If `state/best.json` does not exist, this invocation is **iteration 0 (baseline)**: skip steps 1–2, run the four tests of step 3 into `runs/iter<N>/` (N = next free number, label it "baseline after main sync"), then `judge.py $R/sift1M_auto $R/sift1M_large $R/sift10M_auto $R/sift100M_auto --update --add-new --md`, fill the log's **Current best** block, commit, and return.
 - `git -C /home/lanlu/microBenchmark status --short` on branch `opt/bucket2-loop`; the source tree must be clean (if a previous iteration was interrupted, `git checkout -- bucketDemo/buildBucket/src .claude/skills/optimize-bucket2/scripts/params.sh` first and log it as "interrupted").
 - Read `OPTIMIZATION_LOG.md`: the **Current best** block, the **Ideas backlog**, and the **Tried & rejected** list. Never retry a rejected idea unless you write down what is different this time.
 - `nvidia-smi -i 0`: if a process that is not holding the bench lock uses GPU 0, wait for it (use Monitor/until-loop, don't sleep-poll) — timings with a shared GPU are invalid. Waiting for the bench lock itself is automatic (run_pipeline blocks).
