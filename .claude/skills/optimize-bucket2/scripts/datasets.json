@@ -1,12 +1,15 @@
 {
- "_note": "Benchmark datasets (user decision 2026-10-23). dir holds base.<N>.<ext>, query.public.10K.<ext>, groundtruth.ibin (k=100), base_knn_sample10K_k64.ibin (prep_dataset.py). ext: .u8bin uint8, .i8bin int8, .fbin float32. reps: default timing repetitions (median). iterations: build rounds (null = params.sh ITERATIONS). search: cagra (cuVS CAGRA searcher, cagra_eval worktree build: uint8 / int8 / float32, needs the data on the GPU) or diskann (DiskANN CPU in-memory searcher). ref: search-quality reference for judge.py: tagore / cagra (state/<ref>_baseline.json, resident -0.01 / large -0.05) or own (own best - own_tol). bench: part of the per-iteration bench set. params: per-dataset calibrated overrides of dataset_env.py values (CENTROID_RATIO, NPROBE, ...; step C, A2 bounds: avg bucket 128-512). | optimize-bucket2 (CAGRA / CAGRA ACE loop, user 2026-10-29): same tests and acceptance standards as optimize-bucket2-tagore, except the SIFT1M / SIFT10M search reference is CAGRA (state/cagra_baseline.json) instead of TAGORE, and msTuring100M is in the bench set every iteration.",
+ "_note": "Benchmark datasets (user decision 2026-10-23). dir holds base.<N>.<ext>, query.public.10K.<ext>, groundtruth.ibin (k=100), base_knn_sample10K_k64.ibin (prep_dataset.py). ext: .u8bin uint8, .i8bin int8, .fbin float32. reps: default timing repetitions (median). iterations: build rounds (null = params.sh ITERATIONS). search: cagra (cuVS CAGRA searcher, cagra_eval worktree build: uint8 / int8 / float32, needs the data on the GPU) or diskann (DiskANN CPU in-memory searcher). ref: search-quality reference for judge.py: tagore / cagra (state/<ref>_baseline.json, resident -0.01 / large -0.05) or own (own best - own_tol). bench: part of the per-iteration bench set. params: per-dataset calibrated overrides of dataset_env.py values (CENTROID_RATIO, NPROBE, ...; step C, A2 bounds: avg bucket 128-512). | optimize-bucket2 (CAGRA / CAGRA ACE loop, user 2026-10-29): same tests and standards as optimize-bucket2-tagore; search quality is gated against every reference in \"ref\" (CAGRA and TAGORE; SIFT100M own best and TAGORE); msTuring100M only at milestones, like the TAGORE loop.",
  "sift1M": {
   "dir": "/home/lanlu/microBenchmark/dataset/sift1M",
   "base": "base.1M.u8bin",
   "reps": 3,
   "iterations": null,
   "search": "cagra",
-  "ref": "cagra",
+  "ref": [
+   "cagra",
+   "tagore"
+  ],
   "bench": [
    "auto",
    "large"
@@ -22,7 +25,10 @@
   "reps": 3,
   "iterations": 2,
   "search": "cagra",
-  "ref": "cagra",
+  "ref": [
+   "cagra",
+   "tagore"
+  ],
   "bench": [
    "auto"
   ],
@@ -37,7 +43,10 @@
   "reps": 3,
   "iterations": 2,
   "search": "diskann",
-  "ref": "own",
+  "ref": [
+   "own",
+   "tagore"
+  ],
   "own_tol": 0.05,
   "bench": [
    "auto"
@@ -49,7 +58,10 @@
   "reps": 3,
   "iterations": 6,
   "search": "cagra",
-  "ref": "cagra",
+  "ref": [
+   "cagra",
+   "tagore"
+  ],
   "bench": [
    "auto"
   ],
@@ -66,7 +78,10 @@
   "reps": 3,
   "iterations": 4,
   "search": "cagra",
-  "ref": "cagra",
+  "ref": [
+   "cagra",
+   "tagore"
+  ],
   "bench": [
    "auto"
   ],
@@ -83,10 +98,11 @@
   "reps": 3,
   "iterations": 2,
   "search": "diskann",
-  "ref": "cagra",
-  "bench": [
-   "auto"
+  "ref": [
+   "cagra",
+   "tagore"
   ],
+  "bench": [],
   "params": {
    "NPROBE": 48
   }

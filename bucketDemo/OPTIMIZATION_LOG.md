@@ -34,8 +34,9 @@ CAGRA reference (cuVS 26.10, NN-Descent, intermediate degree 64 → graph degree
 Note: builds before 2026-10-21 02:00 had no `-O3` (CMake 4 left `CMAKE_BUILD_TYPE` empty); fixed, all numbers below are `-O3`.
 
 > **2026-10-29 (2nd) — skill extended:** learns from CAGRA **and CAGRA ACE**; bench set = SIFT1M auto/large,
-> SIFT10M, SIFT100M, msTuring1M, msTuring10M, msTuring100M (median of 3 each) with the TAGORE loop's judge.py
-> (±3% per config; search vs CAGRA, CAGRA ACE for msTuring100M, own best − 0.05 for SIFT100M). Next iteration re-baselines.
+> SIFT10M, SIFT100M, msTuring1M, msTuring10M (median of 3 each; msTuring100M ×3 at milestones, like the TAGORE loop)
+> with the TAGORE loop's judge.py (±3% per config). Search is gated against **both CAGRA and TAGORE** (resident − 0.01,
+> large − 0.05; SIFT100M: own best − 0.05 and TAGORE − 0.05; msTuring100M: CAGRA ACE and TAGORE). Next iteration re-baselines.
 >
 > **2026-10-29 — synced with `main`** (TAGORE loop #53–#89 merged into `opt/bucket2-loop`; skill scripts
 > replaced by the dataset-adaptive TAGORE versions, judge.py kept). The best below is the pre-sync

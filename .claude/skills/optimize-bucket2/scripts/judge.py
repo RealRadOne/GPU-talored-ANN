@@ -20,7 +20,8 @@ median of 3 runs like SIFT1M):
                path as its best entry (e.g. sift1M auto = resident).
   speed        ACCEPT needs the full bench set (datasets.json "bench"), at least one config >= 3% faster
                than best and no config > 3% slower (build_total = sum of all stages, median of reps).
-  quality      recall@10 at every itopk / DiskANN L, reference from datasets.json "ref":
+  quality      recall@10 at every itopk / DiskANN L, reference from datasets.json "ref" (one name, or a list
+               whose every entry must pass -- optimize-bucket2 gates against CAGRA and TAGORE, 2026-10-29):
                  tagore / cagra: state/<ref>_baseline.json[dataset] -- resident path >= ref - 0.01,
                                  large path >= ref - 0.05 (falls back to the other table, with a note)
                  own           : >= own best - own_tol (SIFT100M / msTuring100M 0.05, else 0.01)
@@ -104,11 +105,42 @@ if "--quick" not in flags and best:
                           + ", ".join(f"{k} {v * 100:+.1f}%" for k, v in speed.items()) + ")")
 
 # ---- quality
+# datasets.json "ref" is one name or a list (optimize-bucket2, user 2026-10-29: gate against CAGRA *and*
+# TAGORE); every listed reference must pass. A single name keeps the old fallback to the other table.
+def gate_own(k, m, reg, cr):
+    own = brun.get(k)
+    if not own:
+        notes.append(f"{k}: no own best yet, search quality recorded only")
+        return
+    tab, tol = recalls(own), reg.get("own_tol", 0.01)
+    for it, r in tab.items():
+        if it not in cr:
+            fail.append(f"{k}: missing itopk/L {it}")
+        elif cr[it] < r - tol:
+            fail.append(f"{k} itopk/L {it}: recall {cr[it]:.4f} < own best {r:.4f} - {tol}")
+
+def gate_ref(k, m, ds, cr, name, tab):
+    tol = REF_TOL["large" if m["path"] == "large" else "resident"]
+    for it, r in tab.items():
+        if it not in cr:
+            fail.append(f"{k}: missing itopk {it}")
+        elif cr[it] < r - tol:
+            fail.append(f"{k} itopk {it}: recall {cr[it]:.4f} < {name} floor {r - tol:.4f}")
+
 for k in KEYS:
     m = cand[k]; ds = m["dataset"]; reg = REG.get(ds, {})
     cr = recalls(m)
-    ref_name = reg.get("ref", "own")
-    tab = None
+    ref = reg.get("ref", "own")
+    if isinstance(ref, list):
+        for name in ref:
+            if name == "own":
+                gate_own(k, m, reg, cr)
+            elif "search" in REFS.get(name, {}).get(ds, {}):
+                gate_ref(k, m, ds, cr, name, REFS[name][ds]["search"])
+            else:
+                notes.append(f"{k}: no {name} reference for {ds}, not gated against it")
+        continue
+    ref_name, tab = ref, None
     if ref_name in REFS:
         for name in (ref_name, "cagra" if ref_name == "tagore" else "tagore"):
             if "search" in REFS[name].get(ds, {}):
@@ -121,23 +153,9 @@ for k in KEYS:
             notes.append(f"{k}: no external reference for {ds}, gated against own best")
             ref_name = "own"
     if ref_name == "own":
-        own = brun.get(k)
-        if not own:
-            notes.append(f"{k}: no own best yet, search quality recorded only")
-            continue
-        tab, tol = recalls(own), reg.get("own_tol", 0.01)
-        for it, r in tab.items():
-            if it not in cr:
-                fail.append(f"{k}: missing itopk/L {it}")
-            elif cr[it] < r - tol:
-                fail.append(f"{k} itopk/L {it}: recall {cr[it]:.4f} < own best {r:.4f} - {tol}")
+        gate_own(k, m, reg, cr)
     else:
-        tol = REF_TOL["large" if m["path"] == "large" else "resident"]
-        for it, r in tab.items():
-            if it not in cr:
-                fail.append(f"{k}: missing itopk {it}")
-            elif cr[it] < r - tol:
-                fail.append(f"{k} itopk {it}: recall {cr[it]:.4f} < {ref_name} floor {r - tol:.4f}")
+        gate_ref(k, m, ds, cr, ref_name, tab)
 
 # ---- memory (large path)
 for k in KEYS:

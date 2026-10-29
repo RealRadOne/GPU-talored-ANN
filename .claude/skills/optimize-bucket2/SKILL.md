@@ -1,6 +1,6 @@
 ---
 name: optimize-bucket2
-description: One iteration of the bucket2 build-pipeline optimization loop (bucket2 -> optimize | prune_windowed+optimize_chunked -> translate_ids) in bucketDemo/buildBucket, learning from cuVS CAGRA and CAGRA ACE (partitioned out-of-core CAGRA build) in the cuVS 26.12 source. Dataset-generic (datasets.json: uint8 / float32, size-adaptive params via dataset_env.py). Pick one idea, implement, build against cuVS 26.10, benchmark the bench set (SIFT1M auto/large, SIFT10M, SIFT100M, msTuring1M, msTuring10M, msTuring100M; median of 3 each) on GPU 0 under the shared bench lock, accept/reject with judge.py (same standards as optimize-bucket2-tagore: ±3% per config, search vs CAGRA / CAGRA ACE), log to bucketDemo/OPTIMIZATION_LOG.md. Run repeatedly with `/loop /optimize-bucket2`.
+description: One iteration of the bucket2 build-pipeline optimization loop (bucket2 -> optimize | prune_windowed+optimize_chunked -> translate_ids) in bucketDemo/buildBucket, learning from cuVS CAGRA and CAGRA ACE (partitioned out-of-core CAGRA build) in the cuVS 26.12 source. Dataset-generic (datasets.json: uint8 / float32, size-adaptive params via dataset_env.py). Pick one idea, implement, build against cuVS 26.10, benchmark the bench set (SIFT1M auto/large, SIFT10M, SIFT100M, msTuring1M, msTuring10M; msTuring100M at milestones; median of 3 each) on GPU 0 under the shared bench lock, accept/reject with judge.py (same standards as optimize-bucket2-tagore: ±3% per config; search gated against both CAGRA and TAGORE), log to bucketDemo/OPTIMIZATION_LOG.md. Run repeatedly with `/loop /optimize-bucket2`.
 ---
 
 # bucket2 optimization loop (CAGRA + CAGRA ACE) — one iteration per invocation
@@ -20,7 +20,7 @@ user stops it. Never stop the loop on your own.
 | toolchain | conda env `cuvs-build` (gcc 14, cmake 4, ninja, boost 1.87). Build: `cd bucketDemo/buildBucket && /home/lanlu/miniconda3/envs/cuvs-build/bin/ninja -C build` (reconfigure: `CONDA_PREFIX=/home/lanlu/miniconda3/envs/cuvs-bench /home/lanlu/miniconda3/envs/cuvs-build/bin/cmake -S . -B build -G Ninja -DCMAKE_MAKE_PROGRAM=/home/lanlu/miniconda3/envs/cuvs-build/bin/ninja -DCMAKE_BUILD_TYPE=Release`) |
 | eval tools | `bucketDemo/evalCuvs/build/cagra_eval` (cuVS 26.10 CAGRA build / search sweep, uint8 / int8 / float32), `scripts/diskann_search.py` (DiskANN CPU in-memory search, for the 100M sets that do not fit the GPU) |
 | datasets | `scripts/datasets.json`: `sift1M`, `sift10M`, `sift100M` (uint8, D=128), `msTuring1M`, `msTuring10M`, `msTuring100M` (float32, D=100); each dir holds `base.*`, `query.public.10K.*`, `groundtruth.ibin` (k=100), `base_knn_sample10K_k64.ibin` (exact KNN of 10K sampled base points; `scripts/prep_dataset.py` + `gen_gt.py` make them) |
-| references | `state/cagra_baseline.json` — CAGRA NN-Descent 64→32 for 1M / 10M sets, **CAGRA ACE** 64→32 for SIFT100M (738 s) and msTuring100M (1205 s), each with recall / QPS tables (from the TAGORE loop's P1). `state/tagore_baseline.json` — TAGORE graphs, reported in the tables only |
+| references | `state/cagra_baseline.json` — CAGRA NN-Descent 64→32 for 1M / 10M sets, **CAGRA ACE** 64→32 for SIFT100M (738 s) and msTuring100M (1205 s); `state/tagore_baseline.json` — TAGORE (GNN-Descent for 1M, largeIndex Vamana for 10M / 100M). Both with recall / QPS tables (from the TAGORE loop's step B / P1); judge.py gates search against **both** |
 | current best | `state/best.json` (written only by `judge.py --update`). Pre-sync history: `state/best_pre_main_sync_2026-10-29.json` (not comparable) |
 | log | `bucketDemo/OPTIMIZATION_LOG.md`; also read `bucketDemo/OPTIMIZATION_LOG_TAGORE.md` (the TAGORE loop's accepted + rejected ideas) so this loop does not repeat them |
 | branch | `opt/bucket2-loop` (commit every accepted iteration there; never push) |
@@ -66,19 +66,25 @@ The old best is archived; **the next invocation is the re-baseline** (step 0).
 
 **Make the build faster on every dataset, with the 100M sets as the main target**, at unchanged search quality.
 
-| config | reps | search tool | quality reference (judge.py) |
-|---|---|---|---|
-| `sift1M_auto` (resident) | 3 (median) | cuVS CAGRA (`cagra_eval`), itopk 32…512 | CAGRA − 0.01 |
-| `sift1M_large` (large path forced) | 3 | cuVS CAGRA | CAGRA − 0.05 |
-| `sift10M_auto` (→ large path, 2 rounds) | 3 | cuVS CAGRA | CAGRA − 0.05 |
-| `sift100M_auto` (2 rounds) | 3 | DiskANN CPU, L 32…512 | own best − 0.05 (CAGRA ACE reported) |
-| `msTuring1M_auto` (float32, resident) | 3 | cuVS CAGRA | CAGRA − 0.01 |
-| `msTuring10M_auto` (float32) | 3 | cuVS CAGRA | CAGRA − 0.05 |
-| `msTuring100M_auto` (float32, 2 rounds) | 3 | DiskANN CPU | CAGRA ACE − 0.05 |
+| config | when | reps | search tool | quality gates (judge.py; **all** must pass) |
+|---|---|---|---|---|
+| `sift1M_auto` (resident) | every iteration | 3 (median) | cuVS CAGRA (`cagra_eval`), itopk 32…512 | CAGRA − 0.01 **and** TAGORE − 0.01 |
+| `sift1M_large` (large path forced) | every iteration | 3 | cuVS CAGRA | CAGRA − 0.05 and TAGORE − 0.05 |
+| `sift10M_auto` (→ large path, 2 rounds) | every iteration | 3 | cuVS CAGRA | CAGRA − 0.05 and TAGORE − 0.05 |
+| `sift100M_auto` (2 rounds) | every iteration | 3 | DiskANN CPU, L 32…512 | own best − 0.05 and TAGORE − 0.05 (CAGRA ACE reported) |
+| `msTuring1M_auto` (float32, resident) | every iteration | 3 | cuVS CAGRA | CAGRA − 0.01 and TAGORE − 0.01 |
+| `msTuring10M_auto` (float32) | every iteration | 3 | cuVS CAGRA | CAGRA − 0.05 and TAGORE − 0.05 |
+| `msTuring100M_auto` (float32, 2 rounds) | **milestones only** | 3 | DiskANN CPU | CAGRA ACE − 0.05 and TAGORE − 0.05 |
 
-These are `datasets.json` (`bench`, `reps`, `search`, `ref`, `own_tol`); the only differences from the
-TAGORE loop's registry are `ref: cagra` for SIFT1M / SIFT10M (TAGORE uses its own graph there) and
-msTuring100M in the bench set every iteration (TAGORE: milestones only).
+Tolerance per path: resident − 0.01, large − 0.05 (same as the TAGORE loop). These live in `datasets.json`
+(`bench`, `reps`, `search`, `ref` = list of references, `own_tol`). Same tests and standards as the
+TAGORE loop; the only difference is that its registry gates each dataset against one reference, this
+loop against CAGRA *and* TAGORE (user 2026-10-29).
+
+**Milestones** (msTuring100M ×3, like the TAGORE loop): the re-baseline (step 0); before writing a summary
+for the user; when the user asks; and after an accepted change to the float32 large path (Step 4 / Step 6
+float kernels, chunked prune, `optimize_chunked`) — run it then as a check, judge it with the bench set
+plus `$R/msTuring100M_auto`; a failed check there reverts the change like any reject.
 
 **Rules (judge.py, identical to the TAGORE loop):**
 - **Every config: build_total (sum of all stages, median of 3) ≥ 3% faster than best = gain, > 3% slower = regression.**
@@ -115,7 +121,7 @@ Also:
 ## One iteration
 
 ### 0. Orient (cheap)
-- If `state/best.json` does not exist, this invocation is the **re-baseline**: skip steps 1–2, run the full bench set of step 3 into `runs/iter<N>/` (N = next free number, label "baseline after main sync"), then `judge.py <all 7 dirs> --update --add-new --md`, fill the log's **Current best** block, commit, and return.
+- If `state/best.json` does not exist, this invocation is the **re-baseline**: skip steps 1–2, run the full bench set of step 3 into `runs/iter<N>/` (N = next free number, label "baseline after main sync"), then `judge.py <all 7 dirs (msTuring100M included: the re-baseline is a milestone)> --update --add-new --md`, fill the log's **Current best** block, commit, and return.
 - `git -C /home/lanlu/microBenchmark status --short` on branch `opt/bucket2-loop`; the source tree must be clean (if a previous iteration was interrupted, `git checkout -- bucketDemo/buildBucket/src .claude/skills/optimize-bucket2/scripts/params.sh .claude/skills/optimize-bucket2/scripts/datasets.json` first and log it as "interrupted").
 - Read `OPTIMIZATION_LOG.md` (**Current best**, **Ideas backlog**, **Awaiting approval**, **Tried & rejected**) and the Tried & rejected list of `OPTIMIZATION_LOG_TAGORE.md`. Never retry a rejected idea unless you write down what is different this time.
 - Bench lock: `cat /home/lanlu/.bench_locks/bucket2_bench.lock.owner`. If the TAGORE loop is timing, edit / build / smoke-test gently and let the timed runs queue (run_pipeline blocks on the lock by itself).
@@ -145,15 +151,17 @@ bash $S/run_pipeline.sh -d msTuring10M -m auto  -o $R/msTuring10M_auto
 python3 $S/judge.py $R/sift1M_auto $R/sift1M_large $R/sift10M_auto $R/msTuring1M_auto $R/msTuring10M_auto --quick
 # only if the quick check passes:
 bash $S/run_pipeline.sh -d sift100M     -m auto -o $R/sift100M_auto
+# milestones only (see Goal):
 bash $S/run_pipeline.sh -d msTuring100M -m auto -o $R/msTuring100M_auto
 ```
-- Launch the chain detached (`setsid nohup bash $R/chain.sh > $R/chain.out 2>&1 &`) so a harness restart cannot kill it; wait for completion with a background until-loop / Monitor, never sleep-poll. A full iteration takes roughly 1.5–2 h (the two 100M sets × 3 dominate).
+- Launch the chain detached (`setsid nohup bash $R/chain.sh > $R/chain.out 2>&1 &`) so a harness restart cannot kill it; wait for completion with a background until-loop / Monitor, never sleep-poll. A normal iteration takes roughly 1 h (SIFT100M × 3 dominates); a milestone adds msTuring100M × 3 (~45 min).
 - Any non-zero exit / "FAILED" = reject (after checking it isn't an environment issue: GPU 0 used outside the lock, disk full — `df -h /home/lanlu` must keep > 50 GB free).
 - Quality per run: (a) `knn_similarity` (pre-prune index vs exact KNN, recall@1/10/32/64); (b) `search` — recall@10 **and** QPS at every itopk / L, graph defect counts. Keep both recall and QPS in the log.
 
 ### 4. Judge
 ```bash
-python3 $S/judge.py $R/sift1M_auto $R/sift1M_large $R/sift10M_auto $R/sift100M_auto $R/msTuring1M_auto $R/msTuring10M_auto $R/msTuring100M_auto --md
+python3 $S/judge.py $R/sift1M_auto $R/sift1M_large $R/sift10M_auto $R/sift100M_auto $R/msTuring1M_auto $R/msTuring10M_auto --md
+# at a milestone add $R/msTuring100M_auto
 ```
 Rules: see **Goal and bench set** and judge.py's docstring (config keys come from each run's metrics.json; order does not matter).
 
