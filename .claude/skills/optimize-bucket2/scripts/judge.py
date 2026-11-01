@@ -62,15 +62,9 @@ fail, speed_fail, notes = [], [], []
 for k, d in cand_dirs.items():   # SMOKE=1 runs (no bench lock, other GPU, niced) are never judged
     if os.path.exists(os.path.join(d, "SMOKE")):
         fail.append(f"{k}: {d} is a SMOKE run (not timed under the bench lock)")
-# Timings are only comparable on the same NUMA node (this machine: GPU 0, 1 = node 0; GPU 2, 3 = node 1;
-# run_pipeline moves to a free GPU when one is taken, user 2026-11-01). Entries without "gpus" ran on GPU 0.
-NUMA = {0: 0, 1: 0, 2: 1, 3: 1}
+# run_pipeline moves to a free GPU when one is taken (user 2026-11-01); timings count on any GPU, the GPU is only reported.
 for k, m in cand.items():
-    nodes = {NUMA.get(g, g) for g in m.get("gpus", [0])}
-    ref = {NUMA.get(g, g) for g in brun.get(k, {}).get("gpus", [0])}
-    if nodes != ref and k in brun:
-        fail.append(f"{k}: ran on GPU {m.get('gpus')} (NUMA {sorted(nodes)}), best on NUMA {sorted(ref)}: timing not comparable, rerun on the best's node")
-    elif m.get("gpus", [0]) != [0]:
+    if m.get("gpus", [0]) != [0]:
         notes.append(f"{k}: ran on GPU {m['gpus']}")
 recalls = lambda m: {str(p["itopk"]): p["recall"] for p in m.get("search", {}).get("points", [])}
 

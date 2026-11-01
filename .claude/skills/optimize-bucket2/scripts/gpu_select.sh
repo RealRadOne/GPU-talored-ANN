@@ -1,8 +1,7 @@
 # GPU selection for timed runs (user decision 2026-11-01), sourced by run_pipeline.sh / resume_large_tail.sh.
 # select_gpu keeps $GPU if it is free, else takes the first free GPU in $GPU_ORDER; if none is free it
 # waits, printing GPU_WAIT lines (the loop's Monitor turns them into a notification to the user).
-# Free = no compute process on it and < GPU_FREE_MIB used. Order: same NUMA node as GPU 0 first
-# (GPU 0, 1 = node 0; GPU 2, 3 = node 1), timings across nodes are not comparable (judge.py).
+# Free = no compute process on it and < GPU_FREE_MIB used.
 : "${GPU_ORDER:=0 1 2 3}"
 : "${GPU_FREE_MIB:=1000}"
 GPU_WAIT_MARK=/home/lanlu/.bench_locks/GPU_WAIT

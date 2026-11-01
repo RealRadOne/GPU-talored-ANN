@@ -68,7 +68,7 @@ Other users (e.g. vLLM) may take any GPU. **If the GPU in use is taken, rerun on
 - `run_pipeline.sh` does this itself before every rep (`select_gpu`): keeps the current GPU if free, else the first free one in order 0, 1, 2, 3 (free = no compute process and < 1000 MiB used). A rep during which another process is on its GPU at the end, or that failed while one is there, is discarded and rerun. The GPU of each rep is in `rep<i>/gpu.txt` and `metrics.json` `gpus`.
 - **Do not add a "wait for GPU 0" guard to chain.sh** (the old `gpu_wait` / `GPU0_BUSY`): it would block while other GPUs are free. Do not treat a GPU that is taken as a reject.
 - **No free GPU:** the run holds the lock and prints `GPU_WAIT ...` (again every 10 min), marker `/home/lanlu/.bench_locks/GPU_WAIT`. Every Monitor on a chain must match `GPU_WAIT` as well as `CHAIN_DONE|FAILED`. On the first `GPU_WAIT`, notify the user right away with PushNotification (load it with ToolSearch `select:PushNotification`) and say it in your text: which GPUs are taken, by whom (`nvidia-smi`, `ps`), what is waiting. Keep waiting; don't stop the loop.
-- **Comparability:** GPU 0 and 1 are on NUMA node 0, GPU 2 and 3 on node 1. judge.py rejects a timing whose node differs from its best entry ("timing not comparable"), because an earlier SIFT10M run on GPU 2 was noticeably slower than on GPU 0 (cause not isolated). Quality results from such a run are still valid. Say which GPU was used in the log entry, and rerun that config on node 0 as soon as a node 0 GPU is free before accepting.
+- **Timings on any GPU count** (user decision 2026-11-01): judge.py compares them with the best like any other run and only reports the GPU. Say in the log entry which GPU was used when it was not GPU 0.
 
 ## Current priority (user decision 2026-11-01) — read first
 
@@ -124,7 +124,7 @@ plus `$R/msTuring100M_auto`; a failed check there reverts the change like any re
 - **ACCEPT** iff the full bench set was run, at least one config gains, none regresses, search quality passes
   everywhere (recall@10 at every itopk / L vs the reference above), 0 graph defects, path selection unchanged,
   final degree 32 / pre-prune degree 64, large-path memory (host peak RSS per stage, GPU peak) ≤ 1.2× best.
-- **Quality-margin rule:** a parameter choice must clear the quality gate reliably (≥ 4 timed runs on the same NUMA node as the best, all
+- **Quality-margin rule:** a parameter choice must clear the quality gate reliably (≥ 4 timed runs, all
   above the floor; Step 4 is nondeterministic). A change that buys that robustness is accepted even if slower
   ("quality-margin, accepted by rule"; re-record with `--rebaseline`, put the multi-run spread table in the log).
 - `--quick` pre-checks a subset (correctness, regressions, quality, memory; no "needs a gain").
