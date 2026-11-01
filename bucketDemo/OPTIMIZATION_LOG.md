@@ -2476,6 +2476,15 @@ All runs on GPU 0.
 
 **Verdict:** ACCEPT — msTuring1M +10.2 % (10.05 → **9.02 s: 0.79× CAGRA 11.48, 0.96× TAGORE 9.35 — the Current-priority target "faster than both" is reached**), sift1M_auto +14.2 %, msTuring10M +12.2 %, sift10M +4.8 %, sift1M_large +3.5 %, SIFT100M +1.3 %.
 
+### #88 milestone — msTuring100M ×3 check of the accepted #88 (float large-path Step 1 host buffers)  (2026-11-01)
+| run | total s (reps) | bucket2 | prune | optimize_chunked | Step 1 | recall@10 L 32 / 64 / 128 / 256 / 512 |
+|---|---|---|---|---|---|---|
+| best (iter80) | 743.13 (739.0 / 743.1 / 748.1) | 608.8–614.5 | 82.2–85.4 | 48.2–52.2 | 12.0–13.7 | 0.6117 / 0.7151 / 0.8020 / … |
+| check 1 (`msTuring100M_auto`) | **770.85** (936.7 cold / 750.4 / 770.9) | 621.2 / 606.1 | 82.5 / 115.4 | 46.7 / 49.3 | 17.8 / 9.0 | 0.6087 / 0.7152 / 0.8016 / 0.8677 / 0.9159 |
+| check 2 (`msTuring100M_auto_rerun`) | **755.15** (757.9 / 755.2 / 745.8) | 607.5 / 601.8 / … | 104.6 / 106.6 / … | 45.9 / 46.8 / … | 9.0 | 0.6125 / 0.7175 / 0.8061 / 0.8703 / 0.9165 |
+Check 1 failed the speed band (+3.7 %): the excess was in `prune`'s chunk `load` (71.8 s vs ~40 s; plan / compute normal), a stage #88 does not change in code (`prune_windowed` reads through its own `pread_all`; the only `load::` reader it calls, `read_u8bin_chunk_to_f32`, is untouched). One logged confirmatory rerun: **755.15 s (−1.6 %), PASS**; quality passes everywhere, 0 graph defects; all on GPU 0. bucket2 itself is at or below the best (Step 1 9.0 s vs 12.0 s). msTuring100M best not overwritten (the check is slower).
+**Open question:** prune `load` was 59–72 s in 4 of 5 warm reps (vs 39–42 s at iter80). Not caused by prune's code; possibly page-cache state after bucket2 (#88 changes how bucket2 touches host memory) or other users' I/O (load average ~20 during check 1). Worth a controlled A/B (HEAD~1 vs HEAD bucket2, same prune) if msTuring100M becomes the target.
+
 <!-- template for an accepted entry:
 ### #N — <one-line idea>  (<date>, commit <hash>)
 **Idea / rationale:** what changed and why; cuVS 26.12 reference (file::function) it follows.
