@@ -54,12 +54,12 @@ mkdir -p "$OUT"
 # nice 19、OMP 8 线程、只用 node 1 的核，尽量不干扰另一个 loop 正在计时的运行。
 BENCH_LOCK=/home/lanlu/.bench_locks/bucket2_bench.lock
 if [[ ${SMOKE:-0} == 1 ]]; then
-  GPU=${SMOKE_GPU:-2}
+  GPU=${SMOKE_GPU:-2}; GPU_ORDER="${SMOKE_GPU_ORDER:-2 3 1}"   # never moves to GPU 0: timed runs live there
   renice -n 19 $$ >/dev/null; taskset -pc 1-79:2 $$ >/dev/null
   export OMP_NUM_THREADS=${SMOKE_THREADS:-8}
   touch "$OUT/SMOKE"
 else
-  GPU=0; rm -f "$OUT/SMOKE"
+  GPU=0; rm -f "$OUT/SMOKE"   # preferred GPU; select_gpu moves off it if it is taken
   mkdir -p "$(dirname "$BENCH_LOCK")"
   exec 9>>"$BENCH_LOCK"
   if ! flock -n 9; then
@@ -67,7 +67,7 @@ else
   fi
   echo "$$ $(date +%F_%T) $SKILL $* -> $OUT" > "$BENCH_LOCK.owner"
 fi
-export CUDA_VISIBLE_DEVICES=$GPU
+source "$SKILL/scripts/gpu_select.sh"
 
 TAG="k${KNN_K}p${NPROBE}m${NEIGHBORS_M}t${ITERATIONS}"
 timed() {  # timed NAME CMD... -> $OUT/rep$R/NAME.{log,time}; returns cmd exit code
@@ -76,9 +76,24 @@ timed() {  # timed NAME CMD... -> $OUT/rep$R/NAME.{log,time}; returns cmd exit c
   /usr/bin/time -f "%e %M" -o "$RD/$name.time" stdbuf -oL -eL "$@" > "$RD/$name.log" 2>&1
 }
 
+# 这一次运行作废重跑的条件：跑的过程中 GPU 上出现了别人的进程（我们自己的进程此时都已退出）。
+# 返回 0 = 重跑这次（调用方 continue），否则按 FAILED 退出
+GPU_RETRIES=0
+rep_retry_or_fail() {  # rep_retry_or_fail STAGE
+  kill "$SMI" 2>/dev/null; wait "$SMI" 2>/dev/null
+  if ! gpu_is_free "$GPU" && (( GPU_RETRIES < 10 )); then
+    GPU_RETRIES=$((GPU_RETRIES + 1))
+    echo "[gpu] GPU $GPU taken by another process during rep $R (stage $1): discarding this rep, rerunning"
+    rm -rf "$RD"; R=$((R - 1)); return 0
+  fi
+  echo "$1 FAILED"; exit 3
+}
+
 for ((R = 0; R < REPS; R++)); do
+  select_gpu
   RD=$OUT/rep$R; W=$RD/work; mkdir -p "$W"
-  echo "[$DS/$MODE rep $R] -> $RD"
+  echo "$GPU" > "$RD/gpu.txt"
+  echo "[$DS/$MODE rep $R, GPU $GPU] -> $RD"
   # GPU memory sampler (MiB), for the peak-memory guard
   nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -i "$GPU" -lms 200 > "$RD/gpu_mem.txt" 9>&- &
   SMI=$!
@@ -91,7 +106,7 @@ for ((R = 0; R < REPS; R++)); do
   # and writes final_graph.bin itself (user decision 2026-10-21); out-of-core ignores it
   [[ $MODE == auto ]] && B2_FLAGS+=(--fused-optimize-degree "$OUTPUT_DEGREE")
   # shellcheck disable=SC2086
-  timed bucket2 "$BIN/bucket2" "${B2_FLAGS[@]}" $BUCKET2_EXTRA || { echo "bucket2 FAILED"; kill $SMI; exit 3; }
+  timed bucket2 "$BIN/bucket2" "${B2_FLAGS[@]}" $BUCKET2_EXTRA || { rep_retry_or_fail bucket2; continue; }
   O=$W/$TAG
 
   PATH_USED=resident
@@ -104,7 +119,7 @@ for ((R = 0; R < REPS; R++)); do
       -o "$O/graph_new_ids.bin" --output-degree "$OUTPUT_DEGREE" $OPTIMIZE_EXTRA
     rc=$?
     if [[ $rc -eq 2 ]]; then PATH_USED=large; rm -f "$RD/optimize.time"
-    elif [[ $rc -ne 0 ]]; then echo "optimize FAILED"; kill $SMI; exit 3; fi
+    elif [[ $rc -ne 0 ]]; then rep_retry_or_fail optimize; continue; fi
   else
     PATH_USED=large
   fi
@@ -116,21 +131,26 @@ for ((R = 0; R < REPS; R++)); do
       --output-degree "$OUTPUT_DEGREE" --cache-mb "$PRUNE_CACHE_MB" $PRUNE_EXTRA \
       $( [[ ${A4_POOL:-0} == 1 ]] && echo --pool-graph "$O/centroid_pool.bin" ) \
       $( [[ ${B13_DISTS:-0} == 1 ]] && echo --dists "$O/vector_dists.bin" ) \
-      || { echo "prune FAILED"; kill $SMI; exit 3; }
+      || { rep_retry_or_fail prune; continue; }
     # shellcheck disable=SC2086
     timed optimize_chunked "$BIN/optimize_chunked" -g "$O/forward_graph_reordered.bin" \
       -o "$O/graph_new_ids.bin" -m E --bucket-offsets "$O/bucket_offsets.bin" \
       --gpu-budget-mb "$CHUNKED_GPU_BUDGET_MB" --edge-buffer-mb "$CHUNKED_EDGE_BUFFER_MB" \
       --tmp-dir "$W/tmp" --inverse-perm "$O/inverse_perm.bin" --final-output "$O/final_graph.bin" $CHUNKED_EXTRA \
-      || { echo "optimize_chunked FAILED"; kill $SMI; exit 3; }
+      || { rep_retry_or_fail optimize_chunked; continue; }
   fi
   # final_graph.bin already there: ids translated in-process (bucket2 resident path, or
   # optimize_chunked #79 when the translated graph fits its host budget)
   if [[ ! -f $O/final_graph.bin ]]; then
     timed translate "$BIN/translate_ids" -g "$O/graph_new_ids.bin" -p "$O/inverse_perm.bin" \
-      -o "$O/final_graph.bin" || { echo "translate FAILED"; kill $SMI; exit 3; }
+      -o "$O/final_graph.bin" || { rep_retry_or_fail translate; continue; }
   fi
   kill $SMI; wait $SMI 2>/dev/null
+  if ! gpu_is_free "$GPU" && (( GPU_RETRIES < 10 )); then   # timing shared with someone else: invalid
+    GPU_RETRIES=$((GPU_RETRIES + 1))
+    echo "[gpu] GPU $GPU taken by another process during rep $R: discarding this rep, rerunning"
+    rm -rf "$RD"; R=$((R - 1)); continue
+  fi
   echo "$PATH_USED" > "$RD/path.txt"
 
   # quality only on the last rep (seeded build -> reps produce the same graph)
