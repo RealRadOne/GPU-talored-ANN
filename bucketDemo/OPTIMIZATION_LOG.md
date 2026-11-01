@@ -51,11 +51,11 @@ After **#80 — optimize_chunked Phase 1 store partitions + pageable buffers** (
 | config | path | build total (s) | vs CAGRA / ACE | vs TAGORE | recall@10 at itopk / L 32 / 64 / 128 | QPS 32 / 64 |
 |---|---|---|---|---|---|---|
 | SIFT1M auto | resident | **4.90** | 0.43x | 0.54x | 0.9244 / 0.9754 / 0.9940 | 1948K / 1034K |
-| SIFT1M large | large | **7.31** | 0.65x | 0.81x | 0.9247 / 0.9757 / 0.9940 | 2224K / 1191K |
+| SIFT1M large | large | **7.52** (×5, #83a) | 0.65x | 0.81x | 0.9247 / 0.9757 / 0.9940 | 2224K / 1191K |
 | SIFT10M auto | large (2 rounds) | **39.37** | 0.33x | 0.19x | 0.8313 / 0.9204 / 0.9686 | 1870K / 1011K |
 | SIFT100M auto | large (2 rounds) | **447.66** | 0.61x ACE | 0.22x | 0.7268 / 0.8344 / 0.9113 (DiskANN) | 54K / 53K |
 | msTuring1M auto | resident | **16.00** | 1.39x | 1.71x | 0.6591 / 0.7888 / 0.8846 | 1454K / 755K |
-| msTuring10M auto | large | **96.66** | 0.82x | 0.42x | 0.6269 / 0.7676 / 0.8655 | 1435K / 750K |
+| msTuring10M auto | large | **104.20** (×5, #83a) | 0.82x | 0.42x | 0.6269 / 0.7676 / 0.8655 | 1435K / 750K |
 | msTuring100M auto | large (2 rounds) | **743.13** | 0.62x ACE | 0.36x | 0.6117 / 0.7151 / 0.8020 (DiskANN) | 5K* / 21K |
 
 \* msTuring100M DiskANN QPS at small L looks like a cold-start artifact of the search script; recall is what is gated.
@@ -2130,6 +2130,15 @@ SIFT10M is back in every iteration (`run_pipeline.sh -d sift10M -m auto -r 1`, t
 
 
 **Verdict:** ACCEPT — vs best: msTuring100M +4.9 % (781.3 → 743.1 s, 0.62× ACE), SIFT100M +4.1 % (467.0 → 447.7 s, 0.61× ACE), others within ±2.1 % (no regression).
+
+### #83a — measurement-rule change: sift1M_large and msTuring10M re-recorded as median of 5 (user decision 2026-11-01)  (2026-11-01)
+**What:** no code change (binaries = HEAD 6153e9c source, rebuilt with no other compile running). `datasets.json` now runs 5 reps for these two noisy configs (±3 % unchanged); their bests were medians of 3 (sift1M_large 7.31 s was a fast draw that rejected #82). Re-recorded only these two with `judge.py … --update --rebaseline`; other configs untouched.
+| config | old best (median of 3) | new best (median of 5) | reps (s) | GPU |
+|---|---|---|---|---|
+| sift1M_large | 7.31 (iter80) | **7.52** | 7.52 / 7.31 / 7.54 / 7.68 / 7.40 | 0 |
+| msTuring10M_auto | 96.66 (iter80) | **104.20** | 105.13 / 104.20 / 105.51 / 103.36 / 102.16 | 0 |
+**Note:** a first msTuring10M ×5 attempt was discarded: I linked a #83 work-in-progress `bucket2` into `build/` while it ran (reps 3+ would have used new code, and the compile competed for CPU). Rebuilt HEAD and reran. The accepted msTuring10M runs are all slower than its earlier medians (iter80–82: 95.5–102.4 s; Step 6 47.8 vs ~43.4–44.1 s) with unchanged binaries; the machine's load average was ~27 (other users' CPU load) during the run, so this reference is likely on the slow side.
+Quality (CAGRA itopk 32 / 64 / 128): sift1M_large 0.9255 / 0.9750 / 0.9937; msTuring10M 0.6259 / 0.7665 / 0.8661 (gates pass).
 
 <!-- template for an accepted entry:
 ### #N — <one-line idea>  (<date>, commit <hash>)
