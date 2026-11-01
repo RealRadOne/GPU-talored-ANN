@@ -8488,7 +8488,9 @@ int run_pipeline_impl(
 
         // 采样索引: sampled_indices[sample_idx] = raw_idx
         std::vector<int64_t> sampled_indices;
-        std::vector<float> X_sampled;
+        // #88: 不清零的分配器 (整份读盘 / 并行转换就是首次写入)
+        using HostF32Vec = std::vector<float, load::uninit_allocator<float>>;
+        HostF32Vec X_sampled;
         int64_t working_N = 0;  // X_sampled 的行数；Step 2 等 lambda 外的代码要用
         // 非空时: 当前坐标系 id → X_sampled 的行号 (round 1 重排后 X_sampled 仍是
         // 旧坐标系，只在 KMeans|| 抽训练子集时按它 gather，省掉整份重排)
@@ -8505,7 +8507,9 @@ int run_pipeline_impl(
         // （round 1 重排不改变点数/维度，只改变 ID 的物理排列），可以直接复用。
         // 原始 (N, D) 数据集的 host 副本 (DataT)：GPU-resident 路径建常驻数据集 /
         // round 1 重排时用，out-of-core 预算够时跨轮复用 (见下面 ooc_host_raw)。
-        std::vector<DataT> raw_host;
+        // #88: 不清零的分配器 (见 load::uninit_allocator)，读盘就是首次写入
+        using HostRawVec = std::vector<DataT, load::uninit_allocator<DataT>>;
+        HostRawVec raw_host;
         auto sample_from = [&](const std::string& path) {
             if (!mem_est.fits_in_gpu) {
                 // 只从 disk 读取采样行，不加载完整数据集
@@ -8597,7 +8601,7 @@ int run_pipeline_impl(
         std::future<void> reorder_write;
         auto join_reorder_write = [&] { if (reorder_write.valid()) reorder_write.get(); };
         auto write_reordered_async = [&](const std::string& path, const DataT* p, size_t n,
-                                         std::shared_ptr<std::vector<DataT>> holder) {
+                                         std::shared_ptr<void> holder) {   // holder: 写完之前保活缓冲 (任意类型)
             const int32_t n32 = static_cast<int32_t>(N), d32 = static_cast<int32_t>(D);
             // 文件在这里同步创建: blob 模式下 round 1 的 reader 不 join 就构造 (只 open、不读)，
             // 文件若还没被后台线程建出来就会 "cannot open" (SIFT1M large 偶发)
@@ -8654,7 +8658,7 @@ int run_pipeline_impl(
             std::cout << "  [HostRaw] out-of-core dataset kept in host memory: "
                       << raw_host.size() * sizeof(DataT) / 1e9 << " GB\n";
         } else if (!gres) {
-            raw_host = std::vector<DataT>();   // 预读了但用不上 (超预算)
+            raw_host = HostRawVec();   // 预读了但用不上 (超预算)
         }
 
         elapsed_step1 = std::chrono::duration<double>(Clock::now() - t1).count();
@@ -9027,7 +9031,7 @@ int run_pipeline_impl(
                 centroid_global_indices, assignments, *bucket_vecs_ptr,
                 512LL * 1024 * 1024, ooc_host_raw ? raw_host.data() : nullptr);
             // 最后一轮写完 bucket 之后 Step 6 只读 bucket_vecs，原始数据不再需要
-            if (ooc_host_raw && iter + 1 == iterations) { join_reorder_write(); raw_host = std::vector<DataT>(); }
+            if (ooc_host_raw && iter + 1 == iterations) { join_reorder_write(); raw_host = HostRawVec(); }
         }
         double t4_bucket_write = std::chrono::duration<double>(Clock::now() - t4_bw0).count();
 
@@ -9141,23 +9145,25 @@ int run_pipeline_impl(
             if (gres) {
                 // 原始数据已经在内存里: 按 inverse_perm 原地重排后一次顺序写出，
                 // 显存里的常驻数据集同步换到新坐标系。
-                std::vector<DataT> reordered(raw_host.size());
+                // #88: 重排缓冲不清零 (std::vector 的值初始化在单线程里把 400 MB 清零 + 缺页: msTuring1M 0.29 s，
+                // 计时见 OPTIMIZATION_LOG #88)，首次写入就是下面的并行拷贝。内容逐字节不变
+                const size_t n_el = raw_host.size();
+                std::shared_ptr<DataT[]> reordered(new DataT[n_el]);
                 #pragma omp parallel for schedule(static)
                 for (int64_t i = 0; i < N; ++i) {
-                    std::memcpy(reordered.data() + static_cast<size_t>(i) * D,
+                    std::memcpy(reordered.get() + static_cast<size_t>(i) * D,
                                 raw_host.data() + static_cast<size_t>(reorder_info.inverse_perm[i]) * D,
                                 static_cast<size_t>(D) * sizeof(DataT));
                 }
-                raw_host = std::vector<DataT>();
-                auto holder = std::make_shared<std::vector<DataT>>(std::move(reordered));
-                write_reordered_async(data_reordered_path, holder->data(), holder->size(), holder);
+                raw_host = HostRawVec();
+                write_reordered_async(data_reordered_path, reordered.get(), n_el, reordered);
                 gres->permute(reorder_info.inverse_perm);
             } else if (static_cast<size_t>(N) * D * sizeof(DataT) * 2 <= host_raw_budget) {
                 // out-of-core 但原始数据 (两份: 读入 + 重排后) 放得进 CPU 预算的
                 // 1/4: 跟 GPU-resident 一样整份读入、按 inverse_perm 并行重排、一次
                 // 顺序写出 (SIFT1M 128 MB: 1.0 s → ~0.3 s)。超预算时走下面按桶缓冲
                 // 散写的流式 writer (内存只占 bucket_vec_buffer)。
-                std::vector<DataT> raw_all;
+                HostRawVec raw_all;
                 if (ooc_host_raw) {
                     raw_all = std::move(raw_host);   // Step 1 已整份读入 (旧坐标系)
                 } else {
@@ -9167,21 +9173,21 @@ int run_pipeline_impl(
                 if (static_cast<int64_t>(raw_all.size()) != N * static_cast<int64_t>(D) ||
                     static_cast<int64_t>(reorder_info.inverse_perm.size()) != N)
                     throw std::runtime_error("Inline reorder: size mismatch in in-memory path");
-                std::vector<DataT> reordered(raw_all.size());
+                HostRawVec reordered(raw_all.size());
                 #pragma omp parallel for schedule(static)
                 for (int64_t i = 0; i < N; ++i) {
                     std::memcpy(reordered.data() + static_cast<size_t>(i) * D,
                                 raw_all.data() + static_cast<size_t>(reorder_info.inverse_perm[i]) * D,
                                 static_cast<size_t>(D) * sizeof(DataT));
                 }
-                raw_all = std::vector<DataT>();
+                raw_all = HostRawVec();
                 // 重排后的副本就是新坐标系下的原始数据集：round 2..t 继续用它 (后台写文件
                 // 直接用 raw_host 的缓冲，释放 raw_host 之前 join)；否则交给 holder 保活
                 if (ooc_host_raw && iterations > 1) {
                     raw_host = std::move(reordered);
                     write_reordered_async(data_reordered_path, raw_host.data(), raw_host.size(), nullptr);
                 } else {
-                    auto holder = std::make_shared<std::vector<DataT>>(std::move(reordered));
+                    auto holder = std::make_shared<HostRawVec>(std::move(reordered));
                     write_reordered_async(data_reordered_path, holder->data(), holder->size(), holder);
                 }
             } else {
@@ -9356,7 +9362,7 @@ int run_pipeline_impl(
                 // fits_in_gpu 时 X_sampled 就是整份数据集 (sampled_indices = iota)，
                 // 直接在内存里按 inverse_perm 重排，不用重新读盘。
                 auto tresample0 = Clock::now();
-                std::vector<float> X_new(X_sampled.size());
+                HostF32Vec X_new(X_sampled.size());
                 #pragma omp parallel for schedule(static)
                 for (int64_t i = 0; i < N; ++i) {
                     std::memcpy(X_new.data() + static_cast<size_t>(i) * D,

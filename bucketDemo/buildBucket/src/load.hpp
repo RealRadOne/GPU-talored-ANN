@@ -22,6 +22,8 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include <utility>
+#include <memory>
 #include <algorithm>
 #include <limits>
 
@@ -47,10 +49,26 @@ inline std::pair<int32_t,int32_t> read_bigann_header(std::ifstream& in) {
     return {N, D};
 }
 
+// #88: 默认初始化的分配器: std::vector<T, uninit_allocator<T>>::resize(n) 不把 T (平凡类型) 清零。
+// 大缓冲 (msTuring1M 400 MB) 用 std::allocator 时 resize 在单线程里清零 + 缺页 0.29 s，而读盘 / 并行拷贝
+// 马上会把每个元素写一遍；换成这个分配器后首次写入就是那次并行读写。只用于随后整份覆盖的缓冲
+template <typename T>
+struct uninit_allocator : std::allocator<T> {
+    template <typename U> struct rebind { using other = uninit_allocator<U>; };
+    uninit_allocator() noexcept = default;
+    template <typename U> uninit_allocator(const uninit_allocator<U>&) noexcept {}
+    template <typename U, typename... Args>
+    void construct(U* p, Args&&... args) {
+        if constexpr (sizeof...(Args) == 0) ::new (static_cast<void*>(p)) U;
+        else ::new (static_cast<void*>(p)) U(std::forward<Args>(args)...);
+    }
+};
+
 // ---------- data readers ----------
 // .fbin / .bin: header int32 N,D then N*D float32
+template <typename A = std::allocator<float>>
 inline void read_fbin_f32(const std::string& path,
-                          std::vector<float>& out,
+                          std::vector<float, A>& out,
                           int32_t& N, int32_t& D) {
     std::ifstream in(path, std::ios::binary);
     require(in.is_open(), "Cannot open file: " + path);
@@ -75,8 +93,9 @@ inline float byte_to_f32(uint8_t b, bool is_i8) {
 }
 
 // .u8bin / .i8bin: header int32 N,D then N*D uint8 / int8, convert to float32
+template <typename A = std::allocator<float>>
 inline void read_u8bin_to_f32(const std::string& path,
-                              std::vector<float>& out,
+                              std::vector<float, A>& out,
                               int32_t& N, int32_t& D) {
     std::ifstream in(path, std::ios::binary);
     require(in.is_open(), "Cannot open file: " + path);
@@ -125,9 +144,10 @@ inline std::pair<int32_t,int32_t> read_fbin_header(const std::string& path) {
 // indices 必须已排序（升序）；out 第 i 行 = sorted_indices[i]。
 // 跟 read_u8bin_sampled_to_f32 一样按 8 MB 行块并行 pread (OpenMP)，每块从块首读到块内最后一个
 // 采样行再挑行——原来单线程逐行 seekg + read (msTuring100M 10M 行: Step 1 ~50 s，Step 4.5 resample ~43 s)。
+template <typename A = std::allocator<float>>
 inline void read_fbin_sampled(const std::string& path,
                               const std::vector<int64_t>& sorted_indices,
-                              std::vector<float>& out,
+                              std::vector<float, A>& out,
                               int32_t& N, int32_t& D) {
     {
         std::ifstream in(path, std::ios::binary);
@@ -188,9 +208,10 @@ inline void read_fbin_sampled(const std::string& path,
 // static_cast<float>(uint8)，结果逐位相同)，不再整份读进 N×D 的 float 缓冲 (SIFT100M: 51 GB) 再挑行。
 // 文件按 8 MB 的行块并行 pread (OpenMP)，每块只转换落在块里的采样行；out 第 i 行 = sorted_indices[i]。
 // 参考 TAGORE prep: 只把需要的点从磁盘读进来。
+template <typename A = std::allocator<float>>
 inline void read_u8bin_sampled_to_f32(const std::string& path,
                                       const std::vector<int64_t>& sorted_indices,
-                                      std::vector<float>& out,
+                                      std::vector<float, A>& out,
                                       int32_t& N, int32_t& D) {
     {
         std::ifstream in(path, std::ios::binary);
@@ -394,10 +415,10 @@ inline void read_bigann_raw_sampled(const std::string& path,
 // 转换，element type = T）。一次 seek + 一次顺序 bulk read，用于"这批 id 基本
 // 连续"的场景 (比如按升序处理的 batch)，比逐行 seek 快得多。out 按行序排列，
 // 调用方自己按 (global_id - start_row) 换算行内偏移。
-template <typename T>
+template <typename T, typename A = std::allocator<T>>
 inline void read_bigann_raw_range(const std::string& path,
                                   int64_t start_row, int64_t num_rows,
-                                  std::vector<T>& out,
+                                  std::vector<T, A>& out,
                                   int32_t& N, int32_t& D) {
     std::ifstream in(path, std::ios::binary);
     require(in.is_open(), "Cannot open file: " + path);
