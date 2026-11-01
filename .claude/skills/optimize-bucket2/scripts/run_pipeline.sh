@@ -58,6 +58,8 @@ if [[ ${SMOKE:-0} == 1 ]]; then
   renice -n 19 $$ >/dev/null; taskset -pc 1-79:2 $$ >/dev/null
   export OMP_NUM_THREADS=${SMOKE_THREADS:-8}
   touch "$OUT/SMOKE"
+  # 冒烟测试可以用别的 build 目录 (改动中的代码不编进 build/，计时运行只用 build/)
+  [[ -n ${BUCKET2_BIN_DIR:-} ]] && BIN=$BUCKET2_BIN_DIR
 else
   GPU=0; rm -f "$OUT/SMOKE"   # preferred GPU; select_gpu moves off it if it is taken
   mkdir -p "$(dirname "$BENCH_LOCK")"
