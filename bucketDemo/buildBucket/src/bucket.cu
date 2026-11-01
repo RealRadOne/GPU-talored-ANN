@@ -4793,17 +4793,60 @@ __global__ void resident_gather_pool_kernel(
     GemmT*   __restrict__ pool,
     float*   __restrict__ pool_norms,
     int32_t* __restrict__ pool_ids,
-    int D)
+    int D,
+    // #84 (float + #83 s6): 顺手写 s6 的 fp16 pool (行宽 Dh，补零列不动) + ‖p‖ + 溢出标志，省掉
+    // s6_to_f16_kernel 再把整个 pool 读一遍 (同一 __float2half_rn / sqrtf(norms)，结果逐位相同)。
+    // 参考 large 路径 devcache_gather_pool_kernel (#84)
+    __half* __restrict__ Bh = nullptr, float* __restrict__ pn = nullptr, int* __restrict__ bad = nullptr, int Dh = 0)
 {
+    // #84: 一段 (一个 bucket) 的行按 blockIdx.y 分给 gridDim.y 个 block (原来一段一个 block: pool ~97 段
+    // = 97 个 block，每个串行拷 ~1000 行；msTuring1M 这个 kernel 占 Step 6 GPU 时间 26%)
     int b = seg_bucket[blockIdx.x];
     if (b < 0) return;
     int64_t lo = member_offsets[b];
     int64_t cnt = member_offsets[b + 1] - lo;
     int64_t dst0 = seg_ofs[blockIdx.x];
+    const int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.y;
+    const int64_t t0 = static_cast<int64_t>(blockIdx.y) * blockDim.x + threadIdx.x;
     size_t row_bytes = static_cast<size_t>(D) * sizeof(GemmT);
-    if (row_bytes % 16 == 0) {
+    if constexpr (std::is_same<GemmT, float>::value) {
+        // float + s6: 一个 warp 一行，float4 读 / 写 pool + 4 个 half 一次写 Bh (D % 4 == 0；没有逐元素的 64 位除法)
+        if (Bh && (D & 3) == 0 && (Dh & 3) == 0) {
+            const int lane = threadIdx.x & 31;
+            const int64_t wid = (static_cast<int64_t>(blockIdx.y) * blockDim.x + threadIdx.x) >> 5;
+            const int64_t nw = stride >> 5;
+            const int D4 = D >> 2;
+            for (int64_t r = wid; r < cnt; r += nw) {
+                const int64_t gid = members[lo + r];
+                const float4* src = reinterpret_cast<const float4*>(data + gid * D);
+                float4* dst = reinterpret_cast<float4*>(pool + (dst0 + r) * D);
+                uint2* dh = reinterpret_cast<uint2*>(Bh + (dst0 + r) * Dh);
+                bool ovf = false;
+                for (int c4 = lane; c4 < D4; c4 += 32) {
+                    const float4 x = src[c4];
+                    dst[c4] = x;
+                    const __half2 h01 = __halves2half2(__float2half_rn(x.x), __float2half_rn(x.y));
+                    const __half2 h23 = __halves2half2(__float2half_rn(x.z), __float2half_rn(x.w));
+                    uint2 u;
+                    u.x = *reinterpret_cast<const unsigned*>(&h01);
+                    u.y = *reinterpret_cast<const unsigned*>(&h23);
+                    dh[c4] = u;
+                    ovf |= !(fabsf(x.x) < 65504.0f) || !(fabsf(x.y) < 65504.0f) ||
+                           !(fabsf(x.z) < 65504.0f) || !(fabsf(x.w) < 65504.0f);
+                }
+                if (ovf) *bad = 1;
+                if (lane == 0) {
+                    pool_ids[dst0 + r]   = static_cast<int32_t>(gid);
+                    pool_norms[dst0 + r] = norms[gid];
+                    pn[dst0 + r]         = sqrtf(norms[gid]);
+                }
+            }
+            return;
+        }
+    }
+    if (row_bytes % 16 == 0 && !Bh) {
         int vec_per_row = static_cast<int>(row_bytes / 16);
-        for (int64_t t = threadIdx.x; t < cnt * vec_per_row; t += blockDim.x) {
+        for (int64_t t = t0; t < cnt * vec_per_row; t += stride) {
             int64_t r = t / vec_per_row;
             int v = static_cast<int>(t - r * vec_per_row);
             int64_t gid = members[lo + r];
@@ -4811,16 +4854,25 @@ __global__ void resident_gather_pool_kernel(
                 reinterpret_cast<const int4*>(data + gid * D)[v];
         }
     } else {
-        for (int64_t t = threadIdx.x; t < cnt * D; t += blockDim.x) {
+        for (int64_t t = t0; t < cnt * D; t += stride) {
             int64_t r = t / D;
             int64_t gid = members[lo + r];
-            pool[(dst0 + r) * D + (t - r * D)] = data[gid * D + (t - r * D)];
+            const int64_t c = t - r * D;
+            const GemmT x = data[gid * D + c];
+            pool[(dst0 + r) * D + c] = x;
+            if constexpr (std::is_same<GemmT, float>::value) {
+                if (Bh) {
+                    Bh[(dst0 + r) * Dh + c] = __float2half_rn(x);
+                    if (!(fabsf(x) < 65504.0f)) *bad = 1;   // fp16 溢出或 NaN (同 s6_to_f16_kernel)
+                }
+            }
         }
     }
-    for (int64_t r = threadIdx.x; r < cnt; r += blockDim.x) {
+    for (int64_t r = t0; r < cnt; r += stride) {
         int32_t gid = members[lo + r];
         pool_ids[dst0 + r]   = gid;
         pool_norms[dst0 + r] = norms[gid];
+        if (pn) pn[dst0 + r] = sqrtf(norms[gid]);
     }
 }
 
@@ -5142,6 +5194,11 @@ struct GpuResidentKnn {
         double t_setup = std::chrono::duration<double>(Clock::now() - t0).count();
 
         // ---- 3) bucket 循环: gather -> GEMM -> top-M (按 gid 写 cur)，无 host 同步 ----
+        // #84: gather 每段的 block 数 (BUCKET2_RES_GATHER_SPLIT，A/B 用)
+        static const unsigned gather_split = [] {
+            const char* e = std::getenv("BUCKET2_RES_GATHER_SPLIT");
+            return e ? static_cast<unsigned>(std::max(1, std::atoi(e))) : 8u;
+        }();
         auto t1 = Clock::now();
         int64_t launched = 0, s6_buckets = 0;
         for (int64_t c = 0; c < n_centroids; ++c) {
@@ -5153,18 +5210,21 @@ struct GpuResidentKnn {
             Slot& s = slots[launched % kStreams];
             ++launched;
 
-            resident_gather_pool_kernel<GemmT><<<static_cast<unsigned>(S), 256, 0, s.stream>>>(
+            const bool s6_this = use_s6 && actual_M == M;
+            if (s6_this) CUDA_CHECK(cudaMemsetAsync(s.s6_bad, 0, sizeof(int), s.stream));   // bh_ready: s6_launch 不再清零
+            resident_gather_pool_kernel<GemmT><<<dim3(static_cast<unsigned>(S), gather_split), 256, 0, s.stream>>>(
                 d_data, d_norms, d_members, d_member_offsets,
                 d_seg_bucket + c * S, d_seg_ofs + c * S,
-                s.pool, s.pool_norms, s.pool_ids, D);
+                s.pool, s.pool_norms, s.pool_ids, D,
+                s6_this ? s.s6_Bh : nullptr, s6_this ? s.s6_pn : nullptr, s6_this ? s.s6_bad : nullptr, s6_Dh);
             CUDA_CHECK(cudaGetLastError());
 
             if constexpr (!kHalf) {
-                if (use_s6 && actual_M == M) {
+                if (s6_this) {
                     const float* Bf = reinterpret_cast<const float*>(s.pool);
 #define RS6_LAUNCH(KV) s6_launch<KV>(s.stream, Bf, s.pool_norms, s.pool_ids, bucket_size, ps, D, s.s6_Bh, s.s6_pn, \
                                      s.s6_bad, s.s6_thr, s.s6_bits, s.s6_hist, has_run ? d_kth : nullptr, has_run ? N : 0, \
-                                     s.s6_oi, s.s6_od, num_sm)
+                                     s.s6_oi, s.s6_od, num_sm, /*bh_ready=*/true)
                     if      (M == 32) RS6_LAUNCH(32);
                     else if (M == 64) RS6_LAUNCH(64);
                     else              RS6_LAUNCH(128);
