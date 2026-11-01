@@ -2487,6 +2487,76 @@ All runs on GPU 0.
 Check 1 failed the speed band (+3.7 %): the excess was in `prune`'s chunk `load` (71.8 s vs ~40 s; plan / compute normal), a stage #88 does not change in code (`prune_windowed` reads through its own `pread_all`; the only `load::` reader it calls, `read_u8bin_chunk_to_f32`, is untouched). One logged confirmatory rerun: **755.15 s (−1.6 %), PASS**; quality passes everywhere, 0 graph defects; all on GPU 0. bucket2 itself is at or below the best (Step 1 9.0 s vs 12.0 s). msTuring100M best not overwritten (the check is slower).
 **Open question:** prune `load` was 59–72 s in 4 of 5 warm reps (vs 39–42 s at iter80). Not caused by prune's code; possibly page-cache state after bucket2 (#88 changes how bucket2 touches host memory) or other users' I/O (load average ~20 during check 1). Worth a controlled A/B (HEAD~1 vs HEAD bucket2, same prune) if msTuring100M becomes the target.
 
+### #91 — out-of-core: round-1 reordered dataset kept in host memory (single-window Step 4.5, in-memory resample, round-1 Step 6 host blob), bundled with #89 (Step 4 uint8 CAGRA)  (2026-11-01)
+**Idea / rationale:** (1) **#89** (logged as rejected-by-rule): Step 4 CAGRA assignment on 8-bit data with > 32K centroids uses a uint8 copy of the (integer-checked) centroids + uint8 queries; 0 top-2 mismatches vs the float search; SIFT100M Step 4 120 → 102 s. (2) **#91**: when ≥ 2 rounds and the reordered dataset fits `--bucket-mem-mb` (SIFT100M 12.8 / 16 GB, msTuring100M 40 / 46 GB), Step 4.5's windowed reorder uses one window (input read once instead of twice) and keeps it as `r1_blob`; the round-2 KMeans sample is drawn from it (same seed / rows / conversion as `sample_from` — verified **IDENTICAL** with `BUCKET2_R1_BLOB_CHECK=1` on SIFT10M forced out-of-core); round 1's Step 6 reader uses it via `set_host_data` (round-1 "host get" 17 s → 0.13 s); released after round 1. `BUCKET2_R1_BLOB=0` off. `data_reordered == base[inverse_perm]` byte-equal.
+**CAGRA / ACE source:** CAGRA ACE `ace_check_use_disk_mode` (memory mode when it fits, disk otherwise) for #91; CAGRA native-dtype search for #89.
+**Class:** implementation (outputs identical).
+**What each part contributed (honest accounting):** #89 is the gain (SIFT100M Step 4 −18 s). #91 is neutral on totals: SIFT100M round-1 Step 6 stays ~87 s (GPU-bound; the host fetch was off the critical path), resample stays ~7.6 s (cost is index draw + sort, not the file read), pass3_write ~14 s. On msTuring100M #91 moves ~25–30 s out of bucket2 (578.8 / 585.0 s vs ~609–614) but prune's disk `load` grows to ~61 s (vs ~39 s): the 40 GB blob held during round 1 likely evicts prune's inputs from the page cache — the same pattern as #88's milestone. SIFT100M's +4.2 % is partly favourable prune variance (40.0 s here vs 46.6 s in iter89, where the same #89 gain gave +1.5 %).
+**Files:** `src/bucket.cu`. All runs on GPU 0.
+
+**Build time (s, median of reps; sum of all stages)**
+
+| config | path | reps | total | vs best | vs baseline | vs TAGORE | vs CAGRA | stages | GPU peak MiB | max RSS GB |
+|---|---|---|---|---|---|---|---|---|---|---|
+| sift1M_auto | resident | 3 | 3.92 | +0.0% | +18.8% | 0.43x | 0.34x | bucket2 3.92 | 4488 | 1.59 |
+| sift1M_large | large | 5 | 7.14 | +1.0% | +6.8% | 0.78x | 0.62x | bucket2 5.63, prune 0.74, optimize_chunked 0.77 | 1286 | 1.71 |
+| sift10M_auto | large | 3 | 37.98 | +1.4% | +12.1% | 0.18x | 0.31x | bucket2 30.50, prune 4.22, optimize_chunked 3.28 | 8996 | 9.66 |
+| sift100M_auto | large | 3 | 426.34 | +4.2% | +17.7% | 0.20x | 0.58x | bucket2 339.95, prune 40.04, optimize_chunked 44.60 | 14568 | 41.12 |
+| msTuring1M_auto | resident | 3 | 9.05 | -0.3% | +42.7% | 0.97x | 0.79x | bucket2 9.05 | 3514 | 1.63 |
+| msTuring10M_auto | large | 5 | 87.84 | +1.2% | +11.6% | 0.38x | 0.74x | bucket2 79.58, prune 4.97, optimize_chunked 3.34 | 8996 | 20.57 |
+| msTuring100M_auto | large | 3 | 741.00 | +0.3% | +8.9% | 0.34x | 0.61x | bucket2 585.02, prune 103.48, optimize_chunked 52.50 | 14728 | 52.73 |
+
+**bucket2 step breakdown (s)**
+
+| config | Step 1 (Load sampled data) | Step 2 (Select centroids) | Step 3 (Centroid KNN graph) | Step 3.5 (Load full dataset) | Step 4 (Batch assignment) | Step 4.5 (Inline reorder, round 1 only) | Step 5 (Write buckets) | Step 6 (Per-vector KNN, merge included) | Wait (final iteration's background merge) | Write (close + .npy convert) |
+|---|---|---|---|---|---|---|---|---|---|---|
+| sift1M_auto | 0.15 | 0.15 | 0.06 | 0.00 | 0.31 | 0.08 | 0.02 | 1.62 | 0.00 | 0.96 |
+| sift1M_large | 0.07 | 0.39 | 0.16 | 0.00 | 1.00 | 0.07 | 0.03 | 2.77 | 0.52 | 0.00 |
+| sift10M_auto | 0.18 | 1.67 | 0.17 | 0.00 | 7.21 | 0.67 | 0.18 | 14.68 | 4.19 | 0.00 |
+| sift100M_auto | 7.75 | 5.58 | 2.70 | 0.00 | 104.68 | 27.23 | 3.00 | 160.28 | 24.48 | 0.00 |
+| msTuring1M_auto | 0.46 | 0.31 | 0.03 | 0.00 | 0.43 | 0.14 | 0.02 | 5.09 | 0.00 | 0.92 |
+| msTuring10M_auto | 3.11 | 6.82 | 0.26 | 0.00 | 19.47 | 1.08 | 0.22 | 43.09 | 4.20 | 0.00 |
+| msTuring100M_auto | 10.73 | 16.73 | 4.27 | 0.00 | 259.05 | 54.89 | 4.02 | 199.68 | 29.61 | 0.00 |
+
+**(a) pre-prune index (degree 64) vs exact KNN, 10K sampled points**
+
+| config | recall@1 | recall@10 | recall@32 | recall@64 |
+|---|---|---|---|---|
+| sift1M_auto | 0.9362 | 0.9238 | 0.9111 | 0.9024 |
+| sift1M_large | 0.9371 | 0.9247 | 0.9119 | 0.9032 |
+| sift10M_auto | 0.7558 | 0.7212 | 0.6991 | 0.6826 |
+| sift100M_auto | 0.6532 | 0.6126 | 0.5887 | 0.5717 |
+| msTuring1M_auto | 0.9876 | 0.9748 | 0.9588 | 0.9416 |
+| msTuring10M_auto | 0.8114 | 0.7649 | 0.7349 | 0.7128 |
+| msTuring100M_auto | 0.7047 | 0.6527 | 0.6263 | 0.6062 |
+
+**(b) final graph (degree 32, original ids), recall@10 / QPS (10K queries); search per datasets.json (cagra: cuVS CAGRA itopk, diskann: DiskANN CPU L)**
+
+| graph | 32 | 64 | 128 | 256 | 512 |
+|---|---|---|---|---|---|
+| TAGORE GNN-Descent k=96 + CAGRA prune, sift1M | 0.9220 / 1947K | 0.9752 / 1033K | 0.9936 / 497K | 0.9985 / 186K | 0.9996 / 68K |
+| CAGRA , sift1M | 0.9305 / 1942K | 0.9782 / 1036K | 0.9948 / 533K | 0.9988 / 189K | 0.9998 / 68K |
+| TAGORE largeIndex Vamana, sift10M | 0.8448 / 1875K | 0.9238 / 1014K | 0.9662 / 482K | 0.9863 / 185K | 0.9950 / 68K |
+| CAGRA , sift10M | 0.8672 / 1868K | 0.9463 / 1013K | 0.9839 / 525K | 0.9959 / 187K | 0.9992 / 68K |
+| TAGORE largeIndex Vamana, sift100M | 0.7691 / 61K | 0.8615 / 55K | 0.9238 / 34K | 0.9616 / 20K | 0.9820 / 11K |
+| CAGRA CAGRA ACE 64->32, sift100M | 0.7672 / 63K | 0.8697 / 57K | 0.9374 / 34K | 0.9756 / 20K | 0.9917 / 11K |
+| TAGORE GNN-Descent k=96 + CAGRA prune (degree 32), msTuring1M | 0.6046 / 1495K | 0.7390 / 798K | 0.8454 / 371K | 0.9150 / 147K | 0.9572 / 47K |
+| CAGRA CAGRA NN-Descent 64->32, msTuring1M | 0.6628 / 1451K | 0.7924 / 735K | 0.8860 / 366K | 0.9449 / 147K | 0.9770 / 47K |
+| TAGORE largeIndex Vamana (degree 32), msTuring10M | 0.5838 / 1445K | 0.7300 / 769K | 0.8446 / 380K | 0.9135 / 152K | 0.9515 / 48K |
+| CAGRA CAGRA NN-Descent 64->32, msTuring10M | 0.6621 / 1418K | 0.7995 / 740K | 0.8922 / 370K | 0.9451 / 150K | 0.9741 / 47K |
+| TAGORE largeIndex Vamana (degree 32), msTuring100M | 0.5919 / 31K | 0.7199 / 20K | 0.8166 / 12K | 0.8862 / 7K | 0.9327 / 4K |
+| CAGRA CAGRA ACE 64->32, msTuring100M | 0.6295 / 39K | 0.7513 / 26K | 0.8456 / 16K | 0.9100 / 9K | 0.9511 / 5K |
+| ours sift1M_auto | 0.9266 / 1944K | 0.9761 / 1034K | 0.9937 / 491K | 0.9987 / 172K | 0.9997 / 68K |
+| ours sift1M_large | 0.9247 / 1950K | 0.9756 / 1034K | 0.9939 / 507K | 0.9986 / 187K | 0.9997 / 67K |
+| ours sift10M_auto | 0.8297 / 1866K | 0.9200 / 1022K | 0.9695 / 494K | 0.9897 / 185K | 0.9973 / 68K |
+| ours sift100M_auto | 0.7267 / 64K | 0.8344 / 64K | 0.9119 / 39K | 0.9605 / 22K | 0.9842 / 13K |
+| ours msTuring1M_auto | 0.6572 / 1493K | 0.7890 / 797K | 0.8843 / 371K | 0.9433 / 147K | 0.9759 / 47K |
+| ours msTuring10M_auto | 0.6274 / 1422K | 0.7700 / 748K | 0.8688 / 370K | 0.9254 / 150K | 0.9610 / 47K |
+| ours msTuring100M_auto | 0.6169 / 6K | 0.7212 / 19K | 0.8046 / 13K | 0.8695 / 8K | 0.9182 / 4K |
+
+
+**Verdict:** ACCEPT (rule) — SIFT100M +4.2 % (445.15 → 426.34 s, 0.58× ACE), msTuring100M +0.3 % (741.0 s, milestone pass), others within ±1.4 %. Follow-up idea: release `r1_blob` page-cache pressure (e.g. drop it before prune, or `posix_fadvise` / smaller blob) to recover prune's load time.
+
 <!-- template for an accepted entry:
 ### #N — <one-line idea>  (<date>, commit <hash>)
 **Idea / rationale:** what changed and why; cuVS 26.12 reference (file::function) it follows.

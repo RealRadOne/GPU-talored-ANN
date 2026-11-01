@@ -1497,6 +1497,25 @@ template <typename DataT>
 __global__ void gather_rows_int32(const DataT* __restrict__ src, const int32_t* __restrict__ idx,
                                   float* __restrict__ dst, int64_t n_dst_rows, int64_t D);
 
+// #82: uint8 行 gather (不转 float)，给 Step 4 的 uint8 CAGRA 搜索
+__global__ void gather_rows_u8(const uint8_t* __restrict__ src, const int32_t* __restrict__ idx,
+                               uint8_t* __restrict__ dst, int64_t n_dst_rows, int64_t D)
+{
+    const int64_t tid = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (tid >= n_dst_rows * D) return;
+    const int64_t row = tid / D, col = tid % D;
+    dst[tid] = src[static_cast<int64_t>(idx[row]) * D + col];
+}
+// float centroid (取自 8-bit 数据点) → uint8；不是 [0,255] 内的整数就记 bad (调用方退回 float 路径)
+__global__ void f32_to_u8_checked(const float* __restrict__ src, uint8_t* __restrict__ dst, int64_t n, int* bad)
+{
+    const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const float v = src[i];
+    if (!(v >= 0.f && v <= 255.f) || v != floorf(v)) { atomicExch(bad, 1); dst[i] = 0; return; }
+    dst[i] = static_cast<uint8_t>(v);
+}
+
 /**
  * 分批处理原始数据集，在 GPU 上基于 centroid KNN 图做 ANNS 检索，
  * 为每个非 centroid 数据点找到最近的 2 个 centroid，在 CPU 上做均衡分配。
@@ -1657,6 +1676,21 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
     sp.algo           = cuvs::neighbors::cagra::search_algo::SINGLE_CTA;
     (void)search_max_iters;  // CAGRA 自己决定 iter, 参数保留为接口兼容
 
+    // #82: uint8 数据走 CAGRA (centroid > 32K) 时，索引和 queries 都用 uint8 而不是 float 副本:
+    // 每跳读的字节少 4 倍 (cuVS 26.10 sift1M 同一张图 itopk 32: uint8 1.95M QPS vs float 1.39M，recall 相同)。
+    // centroid 就是数据点 (整数值)，整数平方 L2 在 float 里精确 (128 × 255² < 2^24)，距离与 float 路径
+    // 逐位相同。centroid 不全是 [0,255] 内整数时退回 float。BUCKET2_ASSIGN_U8=0 关掉；
+    // BUCKET2_ASSIGN_U8_CHECK=1 每批再跑一遍 float 搜索并统计 top-2 不一致 (验证用)。
+    // 参考 cuVS cagra_build.cuh / CAGRA 本身按原数据类型 (uint8/int8) 建索引、搜索。
+    constexpr bool kU8Data = !is_pq && std::is_same<T, uint8_t>::value && std::is_same<CentroidT, float>::value;
+    bool u8_cagra = false;
+    uint8_t* d_cent_u8 = nullptr;
+    std::unique_ptr<cuvs::neighbors::device_padded_dataset<uint8_t, int64_t>> padded_u8_owner;
+    std::optional<cuvs::neighbors::cagra::device_padded_index<uint8_t, uint32_t>> cagra_idx_u8;
+    uint8_t* d_queries_u8 = nullptr;
+    const bool u8_check = std::getenv("BUCKET2_ASSIGN_U8_CHECK") && std::getenv("BUCKET2_ASSIGN_U8_CHECK")[0] == '1';
+    int64_t u8_mismatch = 0;
+
     // ================================================================
     // Step 5: 分批处理
     // ================================================================
@@ -1788,6 +1822,36 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
             reinterpret_cast<const float*>(d_centroids), d_cnorm, n_centroids, static_cast<int>(D));
         CUDA_CHECK(cudaGetLastError());
     }
+    if constexpr (kU8Data) {
+        if (!exact_f16 && !gpu_query_loader &&
+            !(std::getenv("BUCKET2_ASSIGN_U8") && std::getenv("BUCKET2_ASSIGN_U8")[0] == '0')) {
+            const int64_t n_el = n_centroids * static_cast<int64_t>(D);
+            int* d_bad = nullptr;
+            CUDA_CHECK(cudaMalloc(&d_cent_u8, static_cast<size_t>(n_el)));
+            CUDA_CHECK(cudaMalloc(&d_bad, sizeof(int)));
+            CUDA_CHECK(cudaMemset(d_bad, 0, sizeof(int)));
+            f32_to_u8_checked<<<static_cast<unsigned>((n_el + 255) / 256), 256>>>(
+                reinterpret_cast<const float*>(d_centroids), d_cent_u8, n_el, d_bad);
+            CUDA_CHECK(cudaGetLastError());
+            int h_bad = 0;
+            CUDA_CHECK(cudaMemcpy(&h_bad, d_bad, sizeof(int), cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaFree(d_bad));
+            if (h_bad) {
+                std::cout << "[BatchAssign] centroids are not 8-bit integers -> float CAGRA search\n";
+                CUDA_CHECK(cudaFree(d_cent_u8)); d_cent_u8 = nullptr;
+            } else {
+                cagra_idx_u8.emplace(make_padded_cagra_index<uint8_t>(res,
+                    raft::make_device_matrix_view<const uint8_t, int64_t>(d_cent_u8, n_centroids, static_cast<int64_t>(D)),
+                    graph_view, padded_u8_owner));
+                // uint8 queries 放进 d_queries 的缓冲 (float 大小，够用)；验证模式另开一份
+                d_queries_u8 = reinterpret_cast<uint8_t*>(d_queries);
+                if (u8_check) CUDA_CHECK(cudaMalloc(&d_queries_u8, static_cast<size_t>(Nv) * D));
+                u8_cagra = true;
+                std::cout << "[BatchAssign] uint8 CAGRA index over " << n_centroids << " centroids (#82)"
+                          << (u8_check ? " + float cross-check" : "") << "\n";
+            }
+        }
+    }
     std::optional<cuvs::neighbors::brute_force::index<float, float>> bf_idx;
     int64_t* d_top2_i64 = nullptr;
     std::vector<int64_t> h_top2_i64;
@@ -1912,9 +1976,18 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
                                   cudaMemcpyHostToDevice));
             const int threads = 256;
             const int64_t total = batch_size * D;
-            gather_rows_int32<T><<<static_cast<unsigned>((total + threads - 1) / threads), threads>>>(
-                d_raw_range, d_local_rows, reinterpret_cast<float*>(d_queries), batch_size, D);
-            CUDA_CHECK(cudaGetLastError());
+            if constexpr (kU8Data) {
+                if (u8_cagra) {
+                    gather_rows_u8<<<static_cast<unsigned>((total + threads - 1) / threads), threads>>>(
+                        d_raw_range, d_local_rows, d_queries_u8, batch_size, D);
+                    CUDA_CHECK(cudaGetLastError());
+                }
+            }
+            if (!u8_cagra || u8_check) {
+                gather_rows_int32<T><<<static_cast<unsigned>((total + threads - 1) / threads), threads>>>(
+                    d_raw_range, d_local_rows, reinterpret_cast<float*>(d_queries), batch_size, D);
+                CUDA_CHECK(cudaGetLastError());
+            }
             // 只等默认 stream (gather 写完 d_queries、读完 d_raw_range)；cudaDeviceSynchronize
             // 会连后台 copy_stream 上下一批的 H2D 一起等
             CUDA_CHECK(cudaStreamSynchronize(cudaStreamLegacy));
@@ -2121,7 +2194,26 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
                 searched_bf = true;
             }
         }
-        if (!searched_bf && !searched_f16) {
+        if (!searched_bf && !searched_f16 && u8_cagra) {
+            cuvs::neighbors::cagra::search(res, sp, *cagra_idx_u8,
+                raft::make_device_matrix_view<const uint8_t, int64_t>(d_queries_u8, batch_size, static_cast<int64_t>(D)),
+                neighbors_view, distances_view);
+            if (u8_check) {   // 验证: float 搜索同一批，逐个比 top-2 id
+                uint32_t* d_ref = nullptr;
+                CUDA_CHECK(cudaMalloc(&d_ref, static_cast<size_t>(batch_size) * TOP_K * sizeof(uint32_t)));
+                float* d_refd = nullptr;
+                CUDA_CHECK(cudaMalloc(&d_refd, static_cast<size_t>(batch_size) * TOP_K * sizeof(float)));
+                cuvs::neighbors::cagra::search(res, sp, cagra_idx, queries_view,
+                    raft::make_device_matrix_view<uint32_t, int64_t>(d_ref, batch_size, static_cast<int64_t>(TOP_K)),
+                    raft::make_device_matrix_view<float, int64_t>(d_refd, batch_size, static_cast<int64_t>(TOP_K)));
+                CUDA_CHECK(cudaDeviceSynchronize());
+                std::vector<uint32_t> a(static_cast<size_t>(batch_size) * TOP_K), b(a.size());
+                CUDA_CHECK(cudaMemcpy(a.data(), d_top2, a.size() * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+                CUDA_CHECK(cudaMemcpy(b.data(), d_ref, b.size() * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+                for (size_t i = 0; i < a.size(); ++i) u8_mismatch += (a[i] != b[i]);
+                CUDA_CHECK(cudaFree(d_ref)); CUDA_CHECK(cudaFree(d_refd));
+            }
+        } else if (!searched_bf && !searched_f16) {
             cuvs::neighbors::cagra::search(res, sp, cagra_idx,
                 queries_view, neighbors_view, distances_view);
         }
@@ -2208,6 +2300,12 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
     // ================================================================
     // Step 6: 释放 per-batch GPU buffer（centroid 和 graph 保留）
     // ================================================================
+    if (u8_check && u8_cagra) {
+        std::cout << "[BatchAssign] #82 uint8 vs float CAGRA top-2 mismatches: " << u8_mismatch << "\n";
+        if (d_queries_u8) CUDA_CHECK(cudaFree(d_queries_u8));
+    }
+    cagra_idx_u8.reset(); padded_u8_owner.reset();
+    if (d_cent_u8)    CUDA_CHECK(cudaFree(d_cent_u8));
     if (d_queries)    CUDA_CHECK(cudaFree(d_queries));
     if (d_top2)       CUDA_CHECK(cudaFree(d_top2));
     if (d_distances)  CUDA_CHECK(cudaFree(d_distances));
@@ -8510,6 +8608,9 @@ int run_pipeline_impl(
         // #88: 不清零的分配器 (见 load::uninit_allocator)，读盘就是首次写入
         using HostRawVec = std::vector<DataT, load::uninit_allocator<DataT>>;
         HostRawVec raw_host;
+        // #91: round 1 重排后的整份数据集 (out-of-core、多轮、放得进 host 预算时 Step 4.5 单窗重排的窗缓冲)，
+        // 给 round 2 的重新采样和 round 1 的 Step 6 当 host blob 用，round 1 Step 6 之后释放
+        std::shared_ptr<char[]> r1_blob;
         auto sample_from = [&](const std::string& path) {
             if (!mem_est.fits_in_gpu) {
                 // 只从 disk 读取采样行，不加载完整数据集
@@ -9229,7 +9330,13 @@ int run_pipeline_impl(
                 const char* win_env = std::getenv("BUCKET2_REORDER_WIN_GB");   // A/B: 窗大小 (GB)，覆盖上面的规则
                 const int64_t win_bytes = win_env ? std::max<int64_t>(1, std::atoll(win_env)) << 30
                                                   : std::max<int64_t>(int64_t(4) << 30, static_cast<int64_t>(host_raw_budget / 2));
-                const int64_t win_rows = std::max<int64_t>(1, std::min<int64_t>(N, win_bytes / row_bytes));
+                // #91: 多轮、整份重排数据放得进 host 预算时单窗: 输入只读一遍 (原来 2 窗各读一遍)，窗缓冲留作
+                // r1_blob (round 2 的重新采样 + round 1 Step 6 直接用，不再从刚写的文件读回)。BUCKET2_R1_BLOB=0 关掉。
+                // 参考 cuVS cagra_ace.cuh::ace_check_use_disk_mode: 放得进内存就走内存模式，放不下才落盘再读
+                const bool keep_blob = iterations > 1 && !win_env &&
+                    static_cast<size_t>(N) * static_cast<size_t>(row_bytes) <= host_raw_budget &&
+                    !(std::getenv("BUCKET2_R1_BLOB") && std::getenv("BUCKET2_R1_BLOB")[0] == '0');
+                const int64_t win_rows = keep_blob ? N : std::max<int64_t>(1, std::min<int64_t>(N, win_bytes / row_bytes));
                 const int64_t chunk_rows = std::max<int64_t>(1, (int64_t(8) << 20) / row_bytes);
                 const int64_t n_chunks = (N + chunk_rows - 1) / chunk_rows;
                 std::unique_ptr<char[]> win(new char[static_cast<size_t>(win_rows * row_bytes)]);
@@ -9277,6 +9384,11 @@ int run_pipeline_impl(
                 ::close(in_fd);
                 if (::close(out_fd) != 0) io_ok = false;
                 if (!io_ok) throw std::runtime_error("Inline reorder: I/O failed writing " + data_reordered_path);
+                if (keep_blob) {
+                    r1_blob = std::shared_ptr<char[]>(win.release());
+                    std::cout << "  [Step4.5] reordered dataset kept in host memory for round 1 / resample: "
+                              << static_cast<double>(N) * row_bytes / 1e9 << " GB (#91)\n";
+                }
             }
             std::cout << "  Wrote " << data_reordered_path << "\n";
             {
@@ -9375,10 +9487,43 @@ int run_pipeline_impl(
                 std::cout << "  Re-sampling for rounds 2.." << iterations
                           << " from the reordered dataset...\n";
                 auto tresample0 = Clock::now();
+                if (r1_blob && !mem_est.fits_in_gpu) {
+                    // #91: 跟 sample_from 的 !fits_in_gpu 分支同一组采样行 (同 seed、排序)，同样转 float，
+                    // 只是从内存里的重排数据集取，不再读刚写的 data_reordered (结果逐位相同)
+                    working_N = mem_est.sampled_data_rows;
+                    sampled_indices = sample_without_replacement(N, working_N, config.seed);
+                    auto sorted_order = sampled_indices;
+                    std::sort(sorted_order.begin(), sorted_order.end());
+                    const DataT* src = reinterpret_cast<const DataT*>(r1_blob.get());
+                    X_sampled.resize(static_cast<size_t>(working_N) * D);
+                    int64_t n_bad = 0;
+                    #pragma omp parallel for schedule(static) reduction(+:n_bad)
+                    for (int64_t i = 0; i < working_N; ++i) {
+                        const int64_t r = sorted_order[static_cast<size_t>(i)];
+                        if (r < 0 || r >= N) { ++n_bad; continue; }   // bounds check
+                        const DataT* srow = src + static_cast<size_t>(r) * D;
+                        float* drow = X_sampled.data() + static_cast<size_t>(i) * D;
+                        for (int64_t d = 0; d < D; ++d) drow[d] = static_cast<float>(srow[d]);
+                    }
+                    if (n_bad > 0) throw std::runtime_error("Step 4.5: sampled row out of range");
+                    sampled_indices = std::move(sorted_order);
+                    std::cout << "  Sampled " << working_N << " rows from the in-memory reordered dataset ("
+                              << X_sampled.size() * sizeof(float) / 1e9 << " GB, #91)\n";
+                    if (std::getenv("BUCKET2_R1_BLOB_CHECK") && std::getenv("BUCKET2_R1_BLOB_CHECK")[0] == '1') {
+                        // 验证: 原来的读文件采样 → 逐字节比较 X_sampled / sampled_indices
+                        auto x_mem = X_sampled; auto i_mem = sampled_indices;
+                        join_reorder_write();
+                        sample_from(working_input_path);
+                        const bool same = x_mem.size() == X_sampled.size() &&
+                            std::memcmp(x_mem.data(), X_sampled.data(), x_mem.size() * sizeof(float)) == 0 && i_mem == sampled_indices;
+                        std::cout << "  [Step4.5] #91 in-memory resample vs file resample: " << (same ? "IDENTICAL" : "DIFFERENT") << "\n";
+                    }
+                } else {
                 // data_reordered 可能还在后台写 (上面的内存重排分支 write_reordered_async)：读之前必须写完，
                 // 否则读到半截文件 (msTuring10M 不带 --kmeans-train-fraction 时 "Failed to read float payload")
                 join_reorder_write();
                 sample_from(working_input_path);
+                }
                 t45_resample = std::chrono::duration<double>(Clock::now() - tresample0).count();
             }
 
@@ -9481,6 +9626,8 @@ int run_pipeline_impl(
                 // raw_host 这时是重排后的整份数据集 (ooc_host_raw 且多轮时) → blob 模式
                 if (ooc_host_raw && static_cast<int64_t>(raw_host.size()) == N * static_cast<int64_t>(D))
                     reader.set_host_data(raw_host.data(), N);
+                else if (r1_blob)   // #91: Step 4.5 单窗重排留下的整份数据 (data_reordered 已同步写完)
+                    reader.set_host_data(reinterpret_cast<const DataT*>(r1_blob.get()), N);
                 build_vector_knn_with_tensorcore<DataT>(
                     N, D, reader, graph_ptr,
                     n_centroids, graph_K, neighbors_m,
@@ -9488,6 +9635,7 @@ int run_pipeline_impl(
                     centroid_knn_graph_host.data(), K,
                     order_window_arg, step6_cache_bytes,
                     &bucket_process_order_round1, config.gpu_bucket_cache_mb << 20);
+                r1_blob.reset();   // #91: round 2..t 用 BucketVectorAccumulator 的记录
             } else {
                 // bucket 处理顺序在 Step 3 之后已经在后台算好
                 std::vector<int32_t> order_rk = order_future.valid() ? order_future.get()
