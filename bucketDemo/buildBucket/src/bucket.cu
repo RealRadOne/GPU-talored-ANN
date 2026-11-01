@@ -1547,6 +1547,8 @@ __global__ void f32_to_u8_checked(const float* __restrict__ src, uint8_t* __rest
  *
  * @return  (N,) 每个点分配到的 local centroid index [0, n_centroids)
  */
+static void h2d_staged(void* d, const void* h, size_t bytes);   // #93 (定义在 build_vector_knn 前)
+
 template <typename T, typename CentroidT>
 std::vector<int64_t> batch_assign_with_cagra_anns(
     const std::string& input_path,
@@ -1969,9 +1971,17 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
                 h_local_rows[static_cast<size_t>(i)] = static_cast<int32_t>(local);
             }
             if (n_bad > 0) throw std::runtime_error("batch_assign: row offset out of read range");
-            if (!prefetch_io)
-                CUDA_CHECK(cudaMemcpy(d_raw_range, raw_ptr, raw_elems * sizeof(T),
-                                      cudaMemcpyHostToDevice));
+            if (!prefetch_io) {
+                // #93: 原始区间 (host 内存里的 raw_host / 读出的 raw_batch，都是 pageable) 经两块 64 MB pinned
+                // 暂存区双缓冲上传 (多线程拷进暂存 + 异步 DMA)，代替同步 pageable cudaMemcpy
+                // (msTuring10M round 2..4 每轮 4 GB: convert_upload 4.1 / 3.4 / 2.1 s，round 1 走 prefetch 0.7 s)。
+                // 字节相同，返回前已同步
+                const size_t bytes = raw_elems * sizeof(T);
+                // 只对大区间暂存 (≥ 512 MB): h2d_staged 每次调用分配 / 释放两块 64 MB pinned，小区间反而更慢
+                // (第一版阈值 64 MB: sift1M_large 每轮 128 MB 的 convert_upload 0.06–0.12 → 0.14–0.29 s，+5.5 %)
+                if (bytes >= (size_t(512) << 20)) h2d_staged(d_raw_range, raw_ptr, bytes);
+                else CUDA_CHECK(cudaMemcpy(d_raw_range, raw_ptr, bytes, cudaMemcpyHostToDevice));
+            }
             CUDA_CHECK(cudaMemcpy(d_local_rows, h_local_rows.data(), batch_size * sizeof(int32_t),
                                   cudaMemcpyHostToDevice));
             const int threads = 256;
