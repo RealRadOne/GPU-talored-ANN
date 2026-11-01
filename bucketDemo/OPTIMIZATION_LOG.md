@@ -63,6 +63,7 @@ After **#80 — optimize_chunked Phase 1 store partitions + pageable buffers** (
 Where the 100M time goes (s): SIFT100M bucket2 364 (Step 4 ~120, Step 6 ~160, Wait ~41, Step 4.5 ~28, Step 1 ~22), prune 40, optimize_chunked 44. msTuring100M bucket2 620 (Step 4 ~262, Step 6 ~214, Step 4.5 ~60, Wait ~45), prune 88, optimize_chunked 48.
 
 ## Ideas backlog
+- **#90 investigation (2026-11-01, no change):** after #89 the SIFT100M bucket2 is Step 6 160 s (GPU-bound, 8-bit fused path already slower: TAGORE #81), Step 4 ~100 s (uint8 search 38–41 s/round; team_size sweep at 195K centroids: auto/8 4.0 / 3.75 s, 16 15.0 / 5.4 s, 4 fails → auto kept), Wait 27 s and Step 4.5 28 s (disk-bound), prune plan time is mostly a GPU-scatter wait (not the Belady sort). #89's Step 4 patch (−18 s, `patches/iter89_step4_u8_cagra_retry.patch`) waits for a bundle partner on SIFT100M.
 
 **From CAGRA ACE (`cuvs/cpp/src/neighbors/detail/cagra/cagra_ace.cuh`, added 2026-10-29) — implementation ideas, try first on the 100M sets:**
 - `ace_reorder_and_store_dataset`: pre-allocate output files and write each partition through its own buffer sized from free memory, ≤ 64 MB per write → Step 4.5 reorder write / bucket-vector write / `data_reordered`.
@@ -174,7 +175,7 @@ Bit-exact vs the batched GPU path on SIFT1M (forced 105 MB budget, 27 chunks). S
 
 ## Awaiting approval
 
-_(algorithm / semantic proposals `A<k>` go here; none yet in this loop — see `OPTIMIZATION_LOG_TAGORE.md` for the TAGORE loop's A1–A9)_
+- **A10 (proposed 2026-11-01, #90):** out-of-core rounds 2..t: train KMeans‖ on round 1's sampled rows remapped to the new ids (`perm[old]`) instead of re-sampling 10 % of `data_reordered` from disk (Step 4.5 `resample`: SIFT100M 7.6 s, msTuring100M ~9 s per build; the resident path already does the equivalent via `x_row_of`). **Semantic change:** round 2 trains on the same points as round 1 rather than a fresh draw with the same seed over the new id order, so round-2 centroids differ. Quality must be re-gated (quality-margin rule on the 100M sets). Not implemented.
 
 ## Tried & rejected
 
