@@ -62,6 +62,31 @@ loop (A2: avg bucket 512 + NPROBE rule; A7: unwindowed batched GPU prune on SIFT
 2 rounds on SIFT10M / the 100M sets; A1 local join on msTuring1M) — treat them as the design baseline.
 The old best is archived; **the next invocation is the re-baseline** (step 0).
 
+## Current priority (user decision 2026-11-01) — read first
+
+**1. One-time re-record (do this first, then commit).** sift1M_large and msTuring10M are the noisy configs and
+now use the median of 5 (±3% unchanged). Their recorded bests are medians of 3 (sift1M_large 7.31 s was a fast
+draw that rejected #82, a change that does not even run on SIFT1M), so re-record only these two on the current
+code, as a measurement-rule change:
+`run_pipeline.sh -d sift1M -m large -o $R/sift1M_large`, `run_pipeline.sh -d msTuring10M -m auto -o $R/msTuring10M_auto`
+(reps come from datasets.json), then `judge.py $R/sift1M_large $R/msTuring10M_auto --update --rebaseline --md`.
+Log it under the iteration as "measurement-rule change", with the old and new values. Do not re-record other configs.
+
+**2. Top optimization target: msTuring1M is slower than both references.** `msTuring1M_auto` 16.00 s vs CAGRA
+11.48 s and TAGORE 9.35 s. Pick ideas for it first, until it is faster than **both** (≤ 9.35 s), search gates
+unchanged. Where the time goes (`runs/iter80`): **Step 6 11.4 s of 16.0 s** (6 rounds × ~1.9 s, `gemm=FP32`, pool
+~100K rows; SIFT1M's whole Step 6 is 1.9 s), Write 1.0, Step 1 0.9, A1 local join 0.68, FusedOptimize 0.69. Order:
+- **Implementation first: port the float32 fp16 Tensor Core scan + exact fp32 re-rank to the resident Step 6.** The
+  large path has it (TAGORE-loop #72, #84, #85: msTuring10M Step 6 63.8 → 45.6 s); the resident path still runs FP32
+  GEMM. Output must stay identical to the fp32 path, as on the large path.
+- Then other implementation work on the resident float path: GEMM + top-M fused kernel, row tile sizing, Step 1 / Write.
+- **Parameters** (`datasets.json` msTuring1M: 6 rounds, NPROBE 96, A1 1 pass, B 512) only with the quality-margin rule.
+  The margin is small: recall@10 at itopk 32 is 0.659 vs CAGRA floor 0.6528; TAGORE's graph is much weaker there (0.605),
+  so the CAGRA gate binds and we may not trade down to TAGORE's quality. Read `optimize-bucket2-tagore/docs/dataset_tuning_params.md`
+  (the earlier msTuring1M calibration) so already-failed points are not rerun.
+- Anything that changes what is computed (e.g. skipping pairs seen in earlier rounds) is an algorithm change: propose under **Awaiting approval**.
+Normal acceptance still applies (gain ≥ 3% on msTuring1M is a gain; no config > 3% slower). The other backlog items, including the #82 retry, come after this target.
+
 ## Goal and bench set (user decision 2026-10-29: same tests and standards as the TAGORE loop)
 
 **Make the build faster on every dataset, with the 100M sets as the main target**, at unchanged search quality.
@@ -69,11 +94,11 @@ The old best is archived; **the next invocation is the re-baseline** (step 0).
 | config | when | reps | search tool | quality gates (judge.py; **all** must pass) |
 |---|---|---|---|---|
 | `sift1M_auto` (resident) | every iteration | 3 (median) | cuVS CAGRA (`cagra_eval`), itopk 32…512 | CAGRA − 0.01 **and** TAGORE − 0.01 |
-| `sift1M_large` (large path forced) | every iteration | 3 | cuVS CAGRA | CAGRA − 0.05 and TAGORE − 0.05 |
+| `sift1M_large` (large path forced) | every iteration | **5** (median) | cuVS CAGRA | CAGRA − 0.05 and TAGORE − 0.05 |
 | `sift10M_auto` (→ large path, 2 rounds) | every iteration | 3 | cuVS CAGRA | CAGRA − 0.05 and TAGORE − 0.05 |
 | `sift100M_auto` (2 rounds) | every iteration | 3 | DiskANN CPU, L 32…512 | own best − 0.05 and TAGORE − 0.05 (CAGRA ACE reported) |
 | `msTuring1M_auto` (float32, resident) | every iteration | 3 | cuVS CAGRA | CAGRA − 0.01 and TAGORE − 0.01 |
-| `msTuring10M_auto` (float32) | every iteration | 3 | cuVS CAGRA | CAGRA − 0.05 and TAGORE − 0.05 |
+| `msTuring10M_auto` (float32) | every iteration | **5** (median) | cuVS CAGRA | CAGRA − 0.05 and TAGORE − 0.05 |
 | `msTuring100M_auto` (float32, 2 rounds) | **milestones only** | 3 | DiskANN CPU | CAGRA ACE − 0.05 and TAGORE − 0.05 |
 
 Tolerance per path: resident − 0.01, large − 0.05 (same as the TAGORE loop). These live in `datasets.json`
@@ -96,7 +121,7 @@ plus `$R/msTuring100M_auto`; a failed check there reverts the change like any re
   ("quality-margin, accepted by rule"; re-record with `--rebaseline`, put the multi-run spread table in the log).
 - `--quick` pre-checks a subset (correctness, regressions, quality, memory; no "needs a gain").
 - Pre-prune KNN similarity (degree-64 index vs exact KNN, recall@10 / @64) is recorded, not gated.
-- Pick ideas by the 100M stage times first (`state/best.json` → `sift100M_auto` / `msTuring100M_auto`
+- After **Current priority**, pick ideas by the 100M stage times first (`state/best.json` → `sift100M_auto` / `msTuring100M_auto`
   `stages_s`, `bucket2_steps_s`), then the 10M sets. Ideas must scale with N.
 
 ## Design invariants — never violate

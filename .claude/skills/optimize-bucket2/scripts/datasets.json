@@ -1,5 +1,5 @@
 {
- "_note": "Benchmark datasets (user decision 2026-10-23). dir holds base.<N>.<ext>, query.public.10K.<ext>, groundtruth.ibin (k=100), base_knn_sample10K_k64.ibin (prep_dataset.py). ext: .u8bin uint8, .i8bin int8, .fbin float32. reps: default timing repetitions (median). iterations: build rounds (null = params.sh ITERATIONS). search: cagra (cuVS CAGRA searcher, cagra_eval worktree build: uint8 / int8 / float32, needs the data on the GPU) or diskann (DiskANN CPU in-memory searcher). ref: search-quality reference for judge.py: tagore / cagra (state/<ref>_baseline.json, resident -0.01 / large -0.05) or own (own best - own_tol). bench: part of the per-iteration bench set. params: per-dataset calibrated overrides of dataset_env.py values (CENTROID_RATIO, NPROBE, ...; step C, A2 bounds: avg bucket 128-512). | optimize-bucket2 (CAGRA / CAGRA ACE loop, user 2026-10-29): same tests and standards as optimize-bucket2-tagore; search quality is gated against every reference in \"ref\" (CAGRA and TAGORE; SIFT100M own best and TAGORE); msTuring100M only at milestones, like the TAGORE loop.",
+ "_note": "Benchmark datasets (user decision 2026-10-23). dir holds base.<N>.<ext>, query.public.10K.<ext>, groundtruth.ibin (k=100), base_knn_sample10K_k64.ibin (prep_dataset.py). ext: .u8bin uint8, .i8bin int8, .fbin float32. reps: default timing repetitions (median). iterations: build rounds (null = params.sh ITERATIONS). search: cagra (cuVS CAGRA searcher, cagra_eval worktree build: uint8 / int8 / float32, needs the data on the GPU) or diskann (DiskANN CPU in-memory searcher). ref: search-quality reference for judge.py: tagore / cagra (state/<ref>_baseline.json, resident -0.01 / large -0.05) or own (own best - own_tol). bench: part of the per-iteration bench set. params: per-dataset calibrated overrides of dataset_env.py values (CENTROID_RATIO, NPROBE, ...; step C, A2 bounds: avg bucket 128-512). | optimize-bucket2 (CAGRA / CAGRA ACE loop, user 2026-10-29): same tests and standards as optimize-bucket2-tagore; search quality is gated against every reference in \"ref\" (CAGRA and TAGORE; SIFT100M own best and TAGORE); msTuring100M only at milestones, like the TAGORE loop. | reps_large: reps for -m large when it differs from reps (user 2026-11-01: sift1M large and msTuring10M are the noisy configs, median of 5; \u00b13% unchanged).",
  "sift1M": {
   "dir": "/home/lanlu/microBenchmark/dataset/sift1M",
   "base": "base.1M.u8bin",
@@ -17,7 +17,8 @@
   "params": {
    "A7_UNWIN": "1"
   },
-  "params_note": "#56 (A7): unwindowed batched prune (large path only; resident path unaffected)"
+  "params_note": "#56 (A7): unwindowed batched prune (large path only; resident path unaffected)",
+  "reps_large": 5
  },
  "sift10M": {
   "dir": "/home/lanlu/microBenchmark/dataset/sift10M",
@@ -75,7 +76,7 @@
  "msTuring10M": {
   "dir": "/home/lanlu/microBenchmark/dataset/msTuring10M",
   "base": "base.10M.fbin",
-  "reps": 3,
+  "reps": 5,
   "iterations": 4,
   "search": "cagra",
   "ref": [

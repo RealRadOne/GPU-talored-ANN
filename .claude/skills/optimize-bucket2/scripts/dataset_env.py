@@ -72,7 +72,8 @@ for k, v in d.get("params", {}).items():
     adaptive[k] = str(v)
 
 out = {"DS_DIR": d["dir"], "BASE": base, "EXT": ext, "DTYPE": dtype, "N": str(n), "DIM": str(dim),
-       "DEF_REPS": str(d.get("reps", 1)), "SEARCH": d.get("search", "diskann")}
+       "DEF_REPS": str(d.get("reps", 1)), "DEF_REPS_LARGE": str(d.get("reps_large", d.get("reps", 1))),
+       "SEARCH": d.get("search", "diskann")}
 for k, v in adaptive.items():
     out[k] = os.environ.get(k) or v     # explicit environment value wins
 for k, v in out.items():

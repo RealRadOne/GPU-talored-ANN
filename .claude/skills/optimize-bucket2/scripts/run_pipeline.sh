@@ -38,6 +38,7 @@ done
 ENV_OUT=$("$PY" -I "$SKILL/scripts/dataset_env.py" "$DS") || { echo "$ENV_OUT"; exit 1; }
 eval "$ENV_OUT"
 DSDIR=$DS_DIR
+[[ $MODE == large ]] && DEF_REPS=$DEF_REPS_LARGE
 : "${REPS:=$DEF_REPS}"
 [[ ${B13_DISTS:-0} == 1 ]] && BUCKET2_EXTRA="${BUCKET2_EXTRA/--skip-dists/}"   # B13: prune reads vector_dists.bin
 BUCKET2_EXTRA="$BUCKET2_EXTRA --kmeans-train-fraction $KMEANS_TRAIN_FRACTION --cache-mb $CACHE_MB --bucket-mem-mb $BUCKET_MEM_MB --gpu-bucket-cache-mb $GPU_BUCKET_CACHE_MB"
