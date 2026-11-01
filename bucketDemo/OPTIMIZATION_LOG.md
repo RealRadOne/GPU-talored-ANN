@@ -54,7 +54,7 @@ After **#80 — optimize_chunked Phase 1 store partitions + pageable buffers** (
 | SIFT1M large | large | **7.52** (×5, #83a) | 0.65x | 0.81x | 0.9247 / 0.9757 / 0.9940 | 2224K / 1191K |
 | SIFT10M auto | large (2 rounds) | **39.37** | 0.33x | 0.19x | 0.8313 / 0.9204 / 0.9686 | 1870K / 1011K |
 | SIFT100M auto | large (2 rounds) | **447.66** | 0.61x ACE | 0.22x | 0.7268 / 0.8344 / 0.9113 (DiskANN) | 54K / 53K |
-| msTuring1M auto | resident | **11.14** (#84) | 0.97x | 1.19x | 0.6591 / 0.7888 / 0.8846 | 1454K / 755K |
+| msTuring1M auto | resident | **10.70** (#85) | 0.93x | 1.14x | 0.6591 / 0.7888 / 0.8846 | 1454K / 755K |
 | msTuring10M auto | large | **104.20** (×5, #83a) | 0.82x | 0.42x | 0.6269 / 0.7676 / 0.8655 | 1435K / 750K |
 | msTuring100M auto | large (2 rounds) | **743.13** | 0.62x ACE | 0.36x | 0.6117 / 0.7151 / 0.8020 (DiskANN) | 5K* / 21K |
 
@@ -2269,6 +2269,79 @@ Quality (CAGRA itopk 32 / 64 / 128): sift1M_large 0.9255 / 0.9750 / 0.9937; msTu
 
 
 **Verdict:** ACCEPT — msTuring1M +3.8 % (11.58 → 11.14 s; 0.97× CAGRA 11.48, 1.19× TAGORE 9.35 — still the top target), SIFT100M +1.5 % (449.8 s), others within ±2.3 %.
+
+### #85 — msTuring1M parameters: 5 rounds × NPROBE 96 + 2 A1 local-join passes (was 6 × 96 + 1, #48)  (2026-11-01)
+**Idea / rationale:** after #83 / #84 a resident round costs ~1.1 s while an A1 pull-join pass costs 0.67 s, so the rounds-vs-local-join trade of the TAGORE loop's #43 grid (measured when a round cost ~2.5 s) moved. Screen (SMOKE, GPU 2, 2 runs each; itopk 32 / build s): 6×96+1 0.6578 / 0.6570 (11.11 / 10.92), **5×96+2 0.6577 / 0.6567 (10.49 / 10.43)**, 5×112+1 0.6577 / 0.6557 (10.20 / 10.53), 4×128+2 0.6543 / 0.6571 (10.41 / 10.28), 4×96+3 **0.6499** / 0.6536 (9.97 / 9.97, fails). Not in #43's grid: 5×96+2, 5×112+1, 4×96+3, 4×128+2.
+**Class:** parameter tuning in `datasets.json` (approved A1 + the user's multi-round setting), quality-margin rule.
+**CAGRA / ACE source:** CAGRA NN-Descent `detail/nn_descent.cuh` local join (our A1-R pull join) vs extra bucket rounds.
+**Quality-margin spread (4 timed runs, GPU 0, `runs/iter85/spread`) + the bench run:**
+| run | build s | 32 | 64 | 128 | 256 | 512 |
+|---|---|---|---|---|---|---|
+| 1 | 10.83 | 0.6581 | 0.7874 | 0.8835 | 0.9434 | 0.9765 |
+| 2 | 10.60 | 0.6558 | 0.7862 | 0.8837 | 0.9429 | 0.9760 |
+| 3 | 10.66 | 0.6565 | 0.7859 | 0.8832 | 0.9428 | 0.9757 |
+| 4 | 10.68 | 0.6571 | 0.7856 | 0.8825 | 0.9434 | 0.9767 |
+| bench ×3 | 10.70 | 0.6557 | 0.7880 | — | — | — |
+| floor (CAGRA − 0.01) | | 0.6528 | 0.7824 | 0.8760 | 0.9349 | 0.9670 |
+Min margin +0.003 at itopk 32 / 64 (6×96+1 had +0.005, #48) — thinner; watch the msTuring1M gate in later benches.
+**Files:** `scripts/datasets.json` (msTuring1M `iterations` 6 → 5, `A1_PASSES` 1 → 2).
+
+**Build time (s, median of reps; sum of all stages)**
+
+| config | path | reps | total | vs best | vs baseline | vs TAGORE | vs CAGRA | stages | GPU peak MiB | max RSS GB |
+|---|---|---|---|---|---|---|---|---|---|---|
+| sift1M_auto | resident | 3 | 4.80 | +1.6% | +0.6% | 0.52x | 0.42x | bucket2 4.80 | 5028 | 1.60 |
+| sift1M_large | large | 5 | 7.41 | +0.4% | +3.3% | 0.81x | 0.64x | bucket2 5.90, prune 0.73, optimize_chunked 0.78 | 1286 | 1.71 |
+| sift10M_auto | large | 3 | 39.62 | +0.5% | +8.3% | 0.18x | 0.32x | bucket2 32.03, prune 4.26, optimize_chunked 3.32 | 8996 | 9.60 |
+| sift100M_auto | large | 3 | 450.98 | -0.3% | +12.9% | 0.21x | 0.61x | bucket2 363.02, prune 42.00, optimize_chunked 44.84 | 14568 | 41.12 |
+| msTuring1M_auto | resident | 3 | 10.70 | +3.9% | +32.3% | 1.14x | 0.93x | bucket2 10.70 | 3656 | 1.64 |
+| msTuring10M_auto | large | 5 | 101.25 | -1.8% | -1.8% | 0.44x | 0.85x | bucket2 92.83, prune 5.01, optimize_chunked 3.42 | 8996 | 20.74 |
+
+**bucket2 step breakdown (s)**
+
+| config | Step 1 (Load sampled data) | Step 2 (Select centroids) | Step 3 (Centroid KNN graph) | Step 3.5 (Load full dataset) | Step 4 (Batch assignment) | Step 4.5 (Inline reorder, round 1 only) | Step 5 (Write buckets) | Step 6 (Per-vector KNN, merge included) | Wait (final iteration's background merge) | Write (close + .npy convert) |
+|---|---|---|---|---|---|---|---|---|---|---|
+| sift1M_auto | 0.69 | 0.16 | 0.06 | 0.00 | 0.32 | 0.20 | 0.01 | 1.88 | 0.00 | 0.96 |
+| sift1M_large | 0.17 | 0.35 | 0.18 | 0.00 | 1.02 | 0.17 | 0.04 | 2.73 | 0.52 | 0.00 |
+| sift10M_auto | 1.15 | 1.86 | 0.14 | 0.00 | 6.75 | 1.65 | 0.19 | 14.67 | 4.47 | 0.00 |
+| sift100M_auto | 12.04 | 5.84 | 2.53 | 0.00 | 120.17 | 28.76 | 3.04 | 160.05 | 25.14 | 0.00 |
+| msTuring1M_auto | 0.91 | 0.34 | 0.03 | 0.00 | 0.43 | 0.51 | 0.01 | 5.67 | 0.00 | 0.94 |
+| msTuring10M_auto | 7.85 | 6.08 | 0.25 | 0.00 | 21.03 | 4.13 | 0.22 | 45.56 | 4.28 | 0.00 |
+
+**(a) pre-prune index (degree 64) vs exact KNN, 10K sampled points**
+
+| config | recall@1 | recall@10 | recall@32 | recall@64 |
+|---|---|---|---|---|
+| sift1M_auto | 0.9400 | 0.9255 | 0.9130 | 0.9038 |
+| sift1M_large | 0.9416 | 0.9229 | 0.9105 | 0.9015 |
+| sift10M_auto | 0.7473 | 0.7188 | 0.6970 | 0.6816 |
+| sift100M_auto | 0.6548 | 0.6145 | 0.5905 | 0.5731 |
+| msTuring1M_auto | 0.9880 | 0.9764 | 0.9595 | 0.9427 |
+| msTuring10M_auto | 0.8072 | 0.7637 | 0.7335 | 0.7123 |
+
+**(b) final graph (degree 32, original ids), recall@10 / QPS (10K queries); search per datasets.json (cagra: cuVS CAGRA itopk, diskann: DiskANN CPU L)**
+
+| graph | 32 | 64 | 128 | 256 | 512 |
+|---|---|---|---|---|---|
+| TAGORE GNN-Descent k=96 + CAGRA prune, sift1M | 0.9220 / 1947K | 0.9752 / 1033K | 0.9936 / 497K | 0.9985 / 186K | 0.9996 / 68K |
+| CAGRA , sift1M | 0.9305 / 1942K | 0.9782 / 1036K | 0.9948 / 533K | 0.9988 / 189K | 0.9998 / 68K |
+| TAGORE largeIndex Vamana, sift10M | 0.8448 / 1875K | 0.9238 / 1014K | 0.9662 / 482K | 0.9863 / 185K | 0.9950 / 68K |
+| CAGRA , sift10M | 0.8672 / 1868K | 0.9463 / 1013K | 0.9839 / 525K | 0.9959 / 187K | 0.9992 / 68K |
+| TAGORE largeIndex Vamana, sift100M | 0.7691 / 61K | 0.8615 / 55K | 0.9238 / 34K | 0.9616 / 20K | 0.9820 / 11K |
+| CAGRA CAGRA ACE 64->32, sift100M | 0.7672 / 63K | 0.8697 / 57K | 0.9374 / 34K | 0.9756 / 20K | 0.9917 / 11K |
+| TAGORE GNN-Descent k=96 + CAGRA prune (degree 32), msTuring1M | 0.6046 / 1495K | 0.7390 / 798K | 0.8454 / 371K | 0.9150 / 147K | 0.9572 / 47K |
+| CAGRA CAGRA NN-Descent 64->32, msTuring1M | 0.6628 / 1451K | 0.7924 / 735K | 0.8860 / 366K | 0.9449 / 147K | 0.9770 / 47K |
+| TAGORE largeIndex Vamana (degree 32), msTuring10M | 0.5838 / 1445K | 0.7300 / 769K | 0.8446 / 380K | 0.9135 / 152K | 0.9515 / 48K |
+| CAGRA CAGRA NN-Descent 64->32, msTuring10M | 0.6621 / 1418K | 0.7995 / 740K | 0.8922 / 370K | 0.9451 / 150K | 0.9741 / 47K |
+| ours sift1M_auto | 0.9248 / 1946K | 0.9752 / 1034K | 0.9934 / 533K | 0.9985 / 188K | 0.9996 / 68K |
+| ours sift1M_large | 0.9251 / 1840K | 0.9750 / 1034K | 0.9938 / 533K | 0.9985 / 186K | 0.9997 / 68K |
+| ours sift10M_auto | 0.8308 / 1839K | 0.9210 / 1007K | 0.9692 / 526K | 0.9895 / 186K | 0.9975 / 66K |
+| ours sift100M_auto | 0.7276 / 57K | 0.8334 / 50K | 0.9109 / 30K | 0.9591 / 17K | 0.9836 / 10K |
+| ours msTuring1M_auto | 0.6557 / 1491K | 0.7880 / 802K | 0.8836 / 371K | 0.9435 / 147K | 0.9762 / 47K |
+| ours msTuring10M_auto | 0.6251 / 1417K | 0.7683 / 760K | 0.8662 / 373K | 0.9277 / 150K | 0.9617 / 47K |
+
+
+**Verdict:** ACCEPT — msTuring1M +3.95 % (11.14 → 10.70 s; 0.93× CAGRA 11.48, 1.14× TAGORE 9.35), others within ±1.8 %; all on GPU 0.
 
 <!-- template for an accepted entry:
 ### #N — <one-line idea>  (<date>, commit <hash>)
