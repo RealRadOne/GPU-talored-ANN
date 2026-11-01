@@ -21,7 +21,9 @@ for rd in sorted(glob.glob(os.path.join(out, "rep*"))):
         for m in re.finditer(r"^\s+(Step [\d.]+|Wait|Write)\s+\(([^)]*)\).*?:\s+([\d.]+)s", txt, re.M):
             r["bucket2_steps"][f"{m.group(1)} ({m.group(2)})"] = float(m.group(3))
         # A1 local join (docs/A1_local_join.md §2.6): every "A1_stats: k=v ..." line, in order
-        a1 = [dict(kv.split("=", 1) for kv in m.group(1).split()) for m in re.finditer(r"^A1_stats:\s*(.*)$", txt, re.M)]
+        # 只取 k=v 形式的字段 (行尾的说明文字如 "(fp16 screen)" 跳过)
+        a1 = [dict(kv.split("=", 1) for kv in m.group(1).split() if "=" in kv)
+              for m in re.finditer(r"^A1_stats:\s*(.*)$", txt, re.M)]
         if a1:
             r["a1_stats"] = a1
     r["build_total_s"] = round(sum(r["stages"].values()), 3)

@@ -4647,7 +4647,15 @@ template <typename GemmT>
 __global__ void __launch_bounds__(256) a1_pull_join_kernel(
     const GemmT* __restrict__ data, const float* __restrict__ norms, int64_t N, int D,
     const int32_t* __restrict__ in_n, const float* __restrict__ in_d, int M, int S,
-    int32_t* __restrict__ out_n, float* __restrict__ out_d, A1Counters* __restrict__ ctr)
+    int32_t* __restrict__ out_n, float* __restrict__ out_d, A1Counters* __restrict__ ctr,
+    // #86: float 数据的 fp16 副本 (nullptr = 不筛)。每个候选先用 fp16 行 (half2 读，字节减半) 算近似距离，
+    // 只有近似距离 < kth + 严格误差界 的候选才走下面原来的精确 fp32 计算 (同一段代码、同一求和顺序，
+    // 结果逐位相同)；精确距离 < kth 的候选一定通过筛选，所以插入集合不变。
+    // 误差界: |q·p̃ − q·p| ≤ 2^-11 Σ|q_e p_e| + 2^-24 Σ|q_e| (fp16 舍入 / 次正规)，两边 fp32 累加各
+    // ≤ (D + 32)·2^-24 Σ|q_e p_e|，Σ|q_e p_e| ≤ ‖q‖‖p‖、Σ|q_e| ≤ √D ‖q‖；d = ‖a‖² + ‖v‖² − 2 q·p 的
+    // 两次加法 ≤ 2·2^-24 (‖a‖² + ‖v‖² + 2|q·p|) 每边。整体 × 1.25 余量。
+    // 参考 cuVS NN-Descent (nn_descent_gnnd.hpp) 用 fp16 算 local join 距离；这里加精确重算保持结果不变
+    const __half* __restrict__ data_h = nullptr)
 {
     const int64_t a = blockIdx.x;
     if (a >= N) return;
@@ -4672,12 +4680,30 @@ __global__ void __launch_bounds__(256) a1_pull_join_kernel(
         bool dup = false;                           // 已在 a 的表里
         for (int k = lane; k < M; k += 32) dup |= (s_old[k] == v);
         if (__any_sync(0xffffffffu, dup)) continue;
+        const float nv = norms[v];
+        if (data_h) {   // #86 筛选 (D 为偶数，调用方保证)
+            const __half2* ph = reinterpret_cast<const __half2*>(data_h + static_cast<int64_t>(v) * D);
+            float ap = 0.0f;
+            for (int e2 = lane; e2 < (D >> 1); e2 += 32) {
+                const float2 x = __half22float2(ph[e2]);
+                ap = fmaf(s_a[2 * e2], x.x, ap);
+                ap = fmaf(s_a[2 * e2 + 1], x.y, ap);
+            }
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1) ap += __shfl_xor_sync(0xffffffffu, ap, off);
+            const float qn = sqrtf(na), pnv = sqrtf(nv), qp = qn * pnv;
+            const float e_dot = (4.8828125e-4f + 2.0f * static_cast<float>(D + 32) * 5.9604645e-8f) * qp
+                              + 5.9604645e-8f * sqrtf(static_cast<float>(D)) * qn;
+            const float slack = 1.25f * (2.0f * e_dot + 4.0f * 5.9604645e-8f * (na + nv + 2.0f * fabsf(ap) + 2.0f * e_dot));
+            const float d_ap = na + nv - 2.0f * ap;
+            if (!(d_ap < kth + slack)) continue;   // 精确距离不可能 < kth (warp 一致: ap 已归约到所有 lane)
+        }
         float part = 0.0f;
         const GemmT* pv = data + static_cast<int64_t>(v) * D;
         for (int e = lane; e < D; e += 32) part += s_a[e] * static_cast<float>(pv[e]);
         #pragma unroll
         for (int off = 16; off > 0; off >>= 1) part += __shfl_xor_sync(0xffffffffu, part, off);
-        const float d = na + norms[v] - 2.0f * part;
+        const float d = na + nv - 2.0f * part;
         if (lane == 0 && d < kth) {
             const int p = atomicAdd(&s_np, 1);
             if (p < kA1MaxCand) { s_cid[p] = v; s_cd[p] = d; }
@@ -4916,6 +4942,94 @@ __global__ void resident_merge_kernel(
         }
     }
     for (; w < M; ++w) { on[w] = -1; od[w] = INFINITY; }
+}
+
+// #86: resident_merge_kernel 的 warp 版 (同一输出，逐位相同): 一个 warp 一个点，两边各 M ≤ 64 项合并读进
+// shared memory；new 侧每项查是否在 running 侧出现 (每 lane 2 项 × M 次比较)；每项的输出位置直接算 =
+// 自己在本侧的序号 + 另一侧排在它前面的项数 (平手时 running 先: running 项 i 前面是 bd < ad[i] 的 new 项，
+// new 项 j 前面是 ad ≤ bd[j] 的 running 项)，位置 < M 才写；剩下的位置补 -1 / inf。原来一线程一个点、
+// 行距 M 的非合并读 + 每个 new 项在全局内存里扫 M 个 running 项 (msTuring1M 每轮 0.11–0.12 s)。
+constexpr int kMergeWarps = 8;
+__global__ void __launch_bounds__(kMergeWarps * 32) resident_merge_warp_kernel(
+    const int32_t* __restrict__ run_n, const float* __restrict__ run_d,
+    const int32_t* __restrict__ new_n, const float* __restrict__ new_d,
+    int32_t* __restrict__ out_n, float* __restrict__ out_d,
+    int64_t N, int M)
+{
+    __shared__ int32_t s_an[kMergeWarps][64], s_bn[kMergeWarps][64];
+    __shared__ float   s_ad[kMergeWarps][64], s_bd[kMergeWarps][64];
+    __shared__ int     s_bk[kMergeWarps][64];   // new 项去重后的序号 (重复 = -1)
+    const int lane = threadIdx.x & 31, w = threadIdx.x >> 5;
+    const int64_t row = static_cast<int64_t>(blockIdx.x) * kMergeWarps + w;
+    if (row >= N) return;
+    const int32_t* an = run_n + row * M; const float* ad = run_d + row * M;
+    const int32_t* bn = new_n + row * M; const float* bd = new_d + row * M;
+    for (int k = lane; k < M; k += 32) { s_an[w][k] = an[k]; s_ad[w][k] = ad[k]; s_bn[w][k] = bn[k]; s_bd[w][k] = bd[k]; }
+    __syncwarp();
+    // na / nb: 第一个 -1 之前的项数 (同原 kernel 的 while 扫描)
+    int na = M, nb = M;
+    for (int k = lane; k < M; k += 32) {
+        if (s_an[w][k] < 0) na = min(na, k);
+        if (s_bn[w][k] < 0) nb = min(nb, k);
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        na = min(na, __shfl_xor_sync(0xffffffffu, na, off));
+        nb = min(nb, __shfl_xor_sync(0xffffffffu, nb, off));
+    }
+    // new 项去重标记
+    for (int j = lane; j < M; j += 32) {
+        bool dup = false;
+        if (j < nb) { const int32_t id = s_bn[w][j]; for (int k = 0; k < na; ++k) dup |= (s_an[w][k] == id); }
+        s_bk[w][j] = (j < nb && !dup) ? 1 : 0;
+    }
+    __syncwarp();
+    // 去重后的前缀序号 (M ≤ 64: 两段 ballot 前缀)
+    {
+        const int j0 = lane, j1 = lane + 32;
+        const unsigned b0 = __ballot_sync(0xffffffffu, j0 < M && s_bk[w][j0]);
+        const unsigned b1 = __ballot_sync(0xffffffffu, j1 < M && s_bk[w][j1]);
+        const unsigned lt = (1u << lane) - 1u;
+        const int r0 = __popc(b0 & lt), r1 = __popc(b0) + __popc(b1 & lt);
+        const int k0 = (j0 < M && s_bk[w][j0]) ? r0 : -1, k1 = (j1 < M && s_bk[w][j1]) ? r1 : -1;
+        __syncwarp();
+        if (j0 < M) s_bk[w][j0] = k0;
+        if (j1 < M) s_bk[w][j1] = k1;
+    }
+    __syncwarp();
+    int32_t* on = out_n + row * M; float* od = out_d + row * M;
+    int nbn = 0;   // 去重后的 new 项数
+    for (int j = 0; j < M; ++j) nbn += (s_bk[w][j] >= 0);
+    // running 项 i: 位置 = i + #{去重后的 new j : bd[j] < ad[i]}
+    for (int i = lane; i < na; i += 32) {
+        const float x = s_ad[w][i];
+        int c = 0;
+        for (int j = 0; j < nb; ++j) c += (s_bk[w][j] >= 0 && s_bd[w][j] < x);
+        const int pos = i + c;
+        if (pos < M) { on[pos] = s_an[w][i]; od[pos] = x; }
+    }
+    // new 项 j (去重后序号 k): 位置 = k + #{running i : ad[i] <= bd[j]}
+    for (int j = lane; j < nb; j += 32) {
+        const int k = s_bk[w][j];
+        if (k < 0) continue;
+        const float x = s_bd[w][j];
+        int c = 0;
+        for (int i = 0; i < na; ++i) c += (s_ad[w][i] <= x);
+        const int pos = k + c;
+        if (pos < M) { on[pos] = s_bn[w][j]; od[pos] = x; }
+    }
+    for (int p = na + nbn + lane; p < M; p += 32) { on[p] = -1; od[p] = INFINITY; }
+}
+
+// #86: A1 筛选用的 fp16 数据副本 (溢出 / NaN 记 bad → 不筛)
+__global__ void a1_to_f16_kernel(const float* __restrict__ X, __half* __restrict__ Xh, int64_t total, int* __restrict__ bad)
+{
+    for (int64_t t = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; t < total;
+         t += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+        const float x = X[t];
+        if (!(fabsf(x) < 65504.0f)) *bad = 1;
+        Xh[t] = __float2half_rn(x);
+    }
 }
 
 // #83 resident s6: running 表第 M 个距离 → 按 gid 的 seed (s6_launch 的 seed_gid 格式)
@@ -5282,10 +5396,34 @@ struct GpuResidentKnn {
             std::swap(d_run_n, d_cur_n); std::swap(d_run_d, d_cur_d);
             has_run = true;
         } else {
-            resident_merge_kernel<<<(N + 127) / 128, 128>>>(
-                d_run_n, d_run_d, d_cur_n, d_cur_d, d_tmp_n, d_tmp_d, N, M);
+            static const bool merge_warp = M <= 64 &&
+                !(std::getenv("BUCKET2_MERGE_WARP") && std::getenv("BUCKET2_MERGE_WARP")[0] == '0');
+            if (merge_warp)
+                resident_merge_warp_kernel<<<static_cast<unsigned>((N + kMergeWarps - 1) / kMergeWarps), kMergeWarps * 32>>>(
+                    d_run_n, d_run_d, d_cur_n, d_cur_d, d_tmp_n, d_tmp_d, N, M);
+            else
+                resident_merge_kernel<<<(N + 127) / 128, 128>>>(
+                    d_run_n, d_run_d, d_cur_n, d_cur_d, d_tmp_n, d_tmp_d, N, M);
             CUDA_CHECK(cudaGetLastError());
             CUDA_CHECK(cudaDeviceSynchronize());
+            if (merge_warp && std::getenv("BUCKET2_MERGE_CHECK") && std::getenv("BUCKET2_MERGE_CHECK")[0] == '1') {
+                // 验证: 原 kernel 写进 d_kth 不够大，借一份临时缓冲逐项比较
+                const size_t nm = static_cast<size_t>(N) * M;
+                int32_t* r_n = nullptr; float* r_d = nullptr;
+                CUDA_CHECK(cudaMalloc(&r_n, nm * sizeof(int32_t))); CUDA_CHECK(cudaMalloc(&r_d, nm * sizeof(float)));
+                resident_merge_kernel<<<(N + 127) / 128, 128>>>(d_run_n, d_run_d, d_cur_n, d_cur_d, r_n, r_d, N, M);
+                CUDA_CHECK(cudaGetLastError());
+                CUDA_CHECK(cudaDeviceSynchronize());
+                std::vector<int32_t> a_n(nm), b_n(nm); std::vector<float> a_d(nm), b_d(nm);
+                CUDA_CHECK(cudaMemcpy(a_n.data(), d_tmp_n, nm * sizeof(int32_t), cudaMemcpyDeviceToHost));
+                CUDA_CHECK(cudaMemcpy(b_n.data(), r_n, nm * sizeof(int32_t), cudaMemcpyDeviceToHost));
+                CUDA_CHECK(cudaMemcpy(a_d.data(), d_tmp_d, nm * sizeof(float), cudaMemcpyDeviceToHost));
+                CUDA_CHECK(cudaMemcpy(b_d.data(), r_d, nm * sizeof(float), cudaMemcpyDeviceToHost));
+                size_t mis = 0;
+                for (size_t i = 0; i < nm; ++i) mis += (a_n[i] != b_n[i]) || (std::memcmp(&a_d[i], &b_d[i], sizeof(float)) != 0);
+                std::cout << "  [GpuResidentKNN] #86 warp merge vs original: " << mis << " differing entries of " << nm << "\n";
+                cudaFree(r_n); cudaFree(r_d);
+            }
             std::swap(d_run_n, d_tmp_n); std::swap(d_run_d, d_tmp_d);
         }
         double t_merge = std::chrono::duration<double>(Clock::now() - t2).count();
@@ -5347,13 +5485,45 @@ struct GpuResidentKnn {
         if (D > 256 || S < 1 || S > 32 || S > M) throw std::runtime_error("A1-R: needs D <= 256 and 1 <= S <= min(32, M)");
         A1Counters* d_ctr = nullptr;
         CUDA_CHECK(cudaMalloc(&d_ctr, sizeof(A1Counters)));
+        // #86: float 数据先做一份 fp16 副本给 A1 筛选用 (BUCKET2_A1_F16=0 关掉；
+        // BUCKET2_A1_F16_CHECK=1 每趟再跑一遍纯精确版本，逐项比较输出)
+        __half* d_data_h = nullptr;
+        const bool a1_f16 = !kHalf && (D % 2 == 0) &&
+            !(std::getenv("BUCKET2_A1_F16") && std::getenv("BUCKET2_A1_F16")[0] == '0');
+        const bool a1_check = a1_f16 && std::getenv("BUCKET2_A1_F16_CHECK") && std::getenv("BUCKET2_A1_F16_CHECK")[0] == '1';
+        if (a1_f16) {
+            int* d_bad = nullptr; int h_bad = 0;
+            CUDA_CHECK(cudaMalloc(&d_data_h, static_cast<size_t>(N) * D * sizeof(__half)));
+            CUDA_CHECK(cudaMalloc(&d_bad, sizeof(int)));
+            CUDA_CHECK(cudaMemset(d_bad, 0, sizeof(int)));
+            a1_to_f16_kernel<<<1024, 256>>>(reinterpret_cast<const float*>(d_data), d_data_h, N * D, d_bad);
+            CUDA_CHECK(cudaGetLastError());
+            CUDA_CHECK(cudaMemcpy(&h_bad, d_bad, sizeof(int), cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaFree(d_bad));
+            if (h_bad) { CUDA_CHECK(cudaFree(d_data_h)); d_data_h = nullptr; std::cout << "  [A1-R] fp16 overflow -> exact only\n"; }
+        }
         for (int it = 0; it < passes; ++it) {
             auto t0 = std::chrono::high_resolution_clock::now();
             CUDA_CHECK(cudaMemset(d_ctr, 0, sizeof(A1Counters)));
             a1_pull_join_kernel<GemmT><<<static_cast<unsigned>(N), 256>>>(
-                d_data, d_norms, N, D, d_run_n, d_run_d, M, S, d_tmp_n, d_tmp_d, d_ctr);
+                d_data, d_norms, N, D, d_run_n, d_run_d, M, S, d_tmp_n, d_tmp_d, d_ctr, d_data_h);
             CUDA_CHECK(cudaGetLastError());
             CUDA_CHECK(cudaDeviceSynchronize());
+            if (a1_check && d_data_h) {   // 验证: 纯精确版本写进 cur 缓冲，逐项比较
+                a1_pull_join_kernel<GemmT><<<static_cast<unsigned>(N), 256>>>(
+                    d_data, d_norms, N, D, d_run_n, d_run_d, M, S, d_cur_n, d_cur_d, d_ctr, nullptr);
+                CUDA_CHECK(cudaGetLastError());
+                CUDA_CHECK(cudaDeviceSynchronize());
+                const size_t nm = static_cast<size_t>(N) * M;
+                std::vector<int32_t> a_n(nm), b_n(nm); std::vector<float> a_d(nm), b_d(nm);
+                CUDA_CHECK(cudaMemcpy(a_n.data(), d_tmp_n, nm * sizeof(int32_t), cudaMemcpyDeviceToHost));
+                CUDA_CHECK(cudaMemcpy(b_n.data(), d_cur_n, nm * sizeof(int32_t), cudaMemcpyDeviceToHost));
+                CUDA_CHECK(cudaMemcpy(a_d.data(), d_tmp_d, nm * sizeof(float), cudaMemcpyDeviceToHost));
+                CUDA_CHECK(cudaMemcpy(b_d.data(), d_cur_d, nm * sizeof(float), cudaMemcpyDeviceToHost));
+                size_t mis = 0;
+                for (size_t i = 0; i < nm; ++i) mis += (a_n[i] != b_n[i]) || (std::memcmp(&a_d[i], &b_d[i], sizeof(float)) != 0);
+                std::cout << "  [A1-R] #86 fp16-screened vs exact pass " << it + 1 << ": " << mis << " differing entries of " << nm << "\n";
+            }
             std::swap(d_run_n, d_tmp_n); std::swap(d_run_d, d_tmp_d);
             A1Counters h{};
             CUDA_CHECK(cudaMemcpy(&h, d_ctr, sizeof(A1Counters), cudaMemcpyDeviceToHost));
@@ -5362,9 +5532,11 @@ struct GpuResidentKnn {
                       << " points=" << N << " dist_computed_avg=" << static_cast<double>(h.cand) / N
                       << " cand_pass_avg=" << static_cast<double>(h.pass) / N
                       << " inserted_avg=" << static_cast<double>(h.inserted) / N
-                      << " seconds=" << std::fixed << std::setprecision(3) << s << "\n";
+                      << " seconds=" << std::fixed << std::setprecision(3) << s
+                      << (d_data_h ? " (fp16 screen)" : "") << "\n";
         }
         cudaFree(d_ctr);
+        if (d_data_h) cudaFree(d_data_h);
     }
 
     void release_device() {
