@@ -6286,6 +6286,9 @@ static void h2d_staged(void* d, const void* h, size_t bytes)
     cudaStreamDestroy(st);
 }
 
+// ---- per-task trace (BUCKET2_TASK_TRACE=<csv>): Step 6 call index across template instantiations ----
+static int g_task_trace_call = 0;
+
 template <typename DataT, typename BucketReaderT>
 void build_vector_knn_with_tensorcore(
     int64_t N,
@@ -6585,6 +6588,9 @@ void build_vector_knn_with_tensorcore(
             break;
         }
     }
+    if (const char* e = std::getenv("BUCKET2_SLOTS")) {   // task trace isolation run: cap streams
+        num_slots = std::max(1, std::min(num_slots, std::atoi(e)));
+    }
     if (bytes_global + bytes_per_slot > usable_bytes) {
         throw std::runtime_error(
             "[VectorKNN] Need at least " + std::to_string((bytes_global + bytes_per_slot) / 1e9)
@@ -6714,6 +6720,40 @@ void build_vector_knn_with_tensorcore(
     // 纯 GEMM 计时 (每桶 2 次 event record + elapsed 查询) 只在诊断时开:
     // 主线程每桶的 CUDA API 调用就是 out-of-core 循环的瓶颈 (gpu_submit)
     const bool gemm_timing = std::getenv("BUCKET2_GEMM_TIMING") != nullptr;
+    // ---- per-task trace: 3 events per bucket on its slot stream (data start / compute start / done) ----
+    const char* task_trace_path = std::getenv("BUCKET2_TASK_TRACE");
+    const bool task_trace = task_trace_path != nullptr;
+    const int task_trace_call = g_task_trace_call++;
+    struct TaskRec {
+        int32_t pos; int64_t bucket; int bucket_size, pool_size, pool_buckets, actual_M;
+        float data_ms = -1, compute_ms = -1, gpu_start_s = -1, gpu_end_s = -1;
+    };
+    std::vector<TaskRec> task_recs;
+    cudaEvent_t ev_t0[MAX_SLOTS] = {nullptr}, ev_t1[MAX_SLOTS] = {nullptr}, ev_t2[MAX_SLOTS] = {nullptr};
+    cudaEvent_t ev_trace_origin = nullptr;
+    int64_t trace_pending[MAX_SLOTS];
+    for (int s = 0; s < MAX_SLOTS; ++s) trace_pending[s] = -1;
+    if (task_trace) {
+        task_recs.reserve(static_cast<size_t>(n_centroids));
+        CUDA_CHECK(cudaEventCreate(&ev_trace_origin));
+        for (int s = 0; s < num_slots; ++s) {
+            CUDA_CHECK(cudaEventCreate(&ev_t0[s]));
+            CUDA_CHECK(cudaEventCreate(&ev_t1[s]));
+            CUDA_CHECK(cudaEventCreate(&ev_t2[s]));
+        }
+    }
+    // call only after streams[slot] has been synchronized
+    auto consume_task_trace = [&](int slot) {
+        if (!task_trace || trace_pending[slot] < 0) return;
+        TaskRec& r = task_recs[static_cast<size_t>(trace_pending[slot])];
+        float a = 0, b = 0, o0 = 0, o2 = 0;
+        CUDA_CHECK(cudaEventElapsedTime(&a, ev_t0[slot], ev_t1[slot]));
+        CUDA_CHECK(cudaEventElapsedTime(&b, ev_t1[slot], ev_t2[slot]));
+        CUDA_CHECK(cudaEventElapsedTime(&o0, ev_trace_origin, ev_t0[slot]));
+        CUDA_CHECK(cudaEventElapsedTime(&o2, ev_trace_origin, ev_t2[slot]));
+        r.data_ms = a; r.compute_ms = b; r.gpu_start_s = o0 / 1000.0f; r.gpu_end_s = o2 / 1000.0f;
+        trace_pending[slot] = -1;
+    };
     for (int s = 0; s < num_slots; ++s) {
         CUDA_CHECK(cudaEventCreate(&ev_gemm_start[s]));
         CUDA_CHECK(cudaEventCreate(&ev_gemm_stop[s]));
@@ -6899,6 +6939,10 @@ void build_vector_knn_with_tensorcore(
 
     int64_t processed_buckets = 0;
     auto loop_t0 = std::chrono::high_resolution_clock::now();
+    if (task_trace) {
+        CUDA_CHECK(cudaEventRecord(ev_trace_origin, streams[0]));
+        CUDA_CHECK(cudaEventSynchronize(ev_trace_origin));
+    }
     double t_setup_before_loop = std::chrono::duration<double>(loop_t0 - func_t0).count();
     double t_setup_gpu_alloc = t_setup_before_loop
         - t_setup_bucket_count - t_setup_order - t_setup_future_access - t_setup_cache_ctor;
@@ -7398,6 +7442,7 @@ void build_vector_knn_with_tensorcore(
         auto dt1 = diag_now();
         t_sync += diag_secs(dt0, dt1);
         consume_gemm_timing(slot);
+        consume_task_trace(slot);
         scatter_pending(slot);
         auto dt2 = diag_now();
         t_scatter += diag_secs(dt1, dt2);
@@ -7425,6 +7470,16 @@ void build_vector_knn_with_tensorcore(
         std::memcpy(h_ids_bucket[slot], staged_ids_bucket[slot].data(),
                     static_cast<size_t>(bucket_size) * sizeof(int32_t));
         auto dt3 = diag_now();
+        if (task_trace) {
+            int pb = 0;
+            for (uint32_t k = 0; k < K; ++k) {
+                const uint32_t nb = centroid_knn_graph[static_cast<size_t>(c) * K + k];
+                if (nb < static_cast<uint32_t>(n_centroids) && bucket_count[nb] > 0) ++pb;
+            }
+            trace_pending[slot] = static_cast<int64_t>(task_recs.size());
+            task_recs.push_back({pos, c, bucket_size, pool_size, pb, actual_M});
+            CUDA_CHECK(cudaEventRecord(ev_t0[slot], streams[slot]));
+        }
         t_wait_producer += diag_secs(dt2, dt3);
 
         if (use_dev_cache && d_blob) {
@@ -7517,6 +7572,7 @@ void build_vector_knn_with_tensorcore(
         }
         }   // !use_dev_cache
 
+        if (task_trace) CUDA_CHECK(cudaEventRecord(ev_t1[slot], streams[slot]));
         bool fused_out = false;   // block top-M 把 dists 写在 ids 后面 (见 3g)
         // dots 行宽: block top-M kernel (actual_M ≤ 256) 要 4 对齐; raft 回退路径按
         // pool_size 紧凑排布
@@ -7648,6 +7704,8 @@ void build_vector_knn_with_tensorcore(
                                        cudaMemcpyDeviceToHost, streams[slot]));
         }
 
+        if (task_trace) CUDA_CHECK(cudaEventRecord(ev_t2[slot], streams[slot]));
+
         if (use_dev_cache && d_blob) {   // 本桶全部发完，放出 slot 给 producer 发下一个 gather
             {
                 std::lock_guard<std::mutex> lk(stage_mtx);
@@ -7668,6 +7726,7 @@ void build_vector_knn_with_tensorcore(
     for (int s = 0; s < num_slots; ++s) {
         CUDA_CHECK(cudaStreamSynchronize(streams[s]));
         consume_gemm_timing(s);
+        consume_task_trace(s);
         scatter_pending(s);
     }
     // 等 scatter 线程把队列处理完 (acc 之后 finish_iteration_writes 才能安全用)
@@ -7691,6 +7750,27 @@ void build_vector_knn_with_tensorcore(
               << processed_buckets << " buckets ("
               << (loop_ms / std::max<int64_t>(1, processed_buckets))
               << " ms/bucket avg, slots=" << num_slots << ")\n";
+    if (task_trace) {
+        std::ifstream probe(task_trace_path);
+        const bool need_header = !probe.good() || probe.peek() == std::ifstream::traits_type::eof();
+        probe.close();
+        std::ofstream tf(task_trace_path, std::ios::app);
+        if (need_header)
+            tf << "call,pos,bucket,bucket_size,pool_size,pool_buckets,pool_bytes,actual_M,slots,"
+                  "data_ms,compute_ms,gpu_start_s,gpu_end_s\n";
+        for (const TaskRec& r : task_recs)
+            tf << task_trace_call << ',' << r.pos << ',' << r.bucket << ',' << r.bucket_size << ','
+               << r.pool_size << ',' << r.pool_buckets << ','
+               << static_cast<int64_t>(r.pool_size) * D * static_cast<int64_t>(sizeof(DataT)) << ','
+               << r.actual_M << ',' << num_slots << ',' << r.data_ms << ',' << r.compute_ms << ','
+               << r.gpu_start_s << ',' << r.gpu_end_s << '\n';
+        std::cout << "  [TaskTrace] call " << task_trace_call << ": " << task_recs.size()
+                  << " buckets -> " << task_trace_path << "\n";
+        cudaEventDestroy(ev_trace_origin);
+        for (int s = 0; s < num_slots; ++s) {
+            cudaEventDestroy(ev_t0[s]); cudaEventDestroy(ev_t1[s]); cudaEventDestroy(ev_t2[s]);
+        }
+    }
     if (use_s6 && std::getenv("BUCKET2_S6_STATS")) {
         unsigned long long cand = 0, rows = 0, zero = 0;
         CUDA_CHECK(cudaDeviceSynchronize());
