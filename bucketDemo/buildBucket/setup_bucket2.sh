@@ -9,6 +9,8 @@
 #   GPU=1 ./setup_bucket2.sh sift10M    (default GPU 0)
 #   KEEP=1 ...                          keep bucket2's intermediate files (default: delete after each run)
 #   RUNS="normal" ...                   only the normal run (default: "normal iso")
+#   LAN=1 ...                           use Lan's conda envs and datasets under /home/lanlu (read-only):
+#                                       skips the env setup and the download
 #
 # Outputs, per dataset:  ~/traces/<ds>_normal.csv + .log   (all streams, as Lan runs it)
 #                        ~/traces/<ds>_iso.csv + .log      (BUCKET2_SLOTS=1: one bucket at a time on the GPU)
@@ -24,6 +26,9 @@ WORK_DIR=$HOME/bucket2_work
 TRACE_DIR=$HOME/traces
 BB=$(cd "$(dirname "$0")" && pwd)
 JOBS=${JOBS:-16}
+LAN=${LAN:-0}
+LAN_ENVS=/home/lanlu/miniconda3/envs
+LAN_DATA=/home/lanlu/microBenchmark/dataset
 
 log() { echo "[$(date +%H:%M:%S)] $*"; }
 fail() {
@@ -46,6 +51,7 @@ case $DS in
   *) fail "usage: ./setup_bucket2.sh sift10M|sift100M|msTuring10M|msTuring100M" ;;
 esac
 BASE=$DATA_DIR/$DS/base.$EXT
+[ "$LAN" = 1 ] && BASE=$LAN_DATA/$DS/base.$(( N / 1000000 ))M.$EXT
 DATA_GB=$(( N * DIM * ITEM / 1000000000 ))
 
 log "==== $DS: $N x $DIM, ${DATA_GB} GB of vectors, GPU $GPU, runs: $RUNS"
@@ -53,6 +59,22 @@ log "Machine: $(hostname -s), user $USER, proxy: ${https_proxy:-none}"
 log "Free disk in home: $(df -h --output=avail "$HOME" | tail -1)"
 
 # ---- Step 1/4: conda env with cuVS 26.10, nvcc, gcc 14, Boost (what Lan builds with) ----
+if [ "$LAN" = 1 ]; then
+  log "==== Step 1/4: using Lan's envs in $LAN_ENVS (read-only)"
+  [ -x "$LAN_ENVS/cuvs-bench/bin/nvcc" ] || fail "cannot use $LAN_ENVS/cuvs-bench/bin/nvcc"
+  [ -x "$LAN_ENVS/cuvs-build/bin/x86_64-conda-linux-gnu-g++" ] || fail "cannot use Lan's g++ in $LAN_ENVS/cuvs-build"
+  CMAKE=$LAN_ENVS/cuvs-build/bin/cmake
+  [ -x "$CMAKE" ] || CMAKE=$LAN_ENVS/cuvs-bench/bin/cmake
+  [ -x "$CMAKE" ] || fail "no cmake in Lan's envs"
+  log "nvcc: $("$LAN_ENVS/cuvs-bench/bin/nvcc" --version | tail -1), cmake: $("$CMAKE" --version | head -1)"
+  log "==== Step 2/4: build bucket2 (CMake defaults = Lan's envs)"
+  if [ -x "$BB/build/bucket2" ] && [ "$BB/build/bucket2" -nt "$BB/src/bucket.cu" ]; then
+    log "bucket2 is up to date, skipping"
+  else
+    run "$CMAKE" -S "$BB" -B "$BB/build"
+    run make -C "$BB/build" -j"$JOBS" bucket2
+  fi
+else
 log "==== Step 1/4: conda env $ENV_NAME"
 [ -x "$CONDA_DIR/bin/conda" ] || fail "no conda at $CONDA_DIR (setup_ann.sh installs it)"
 source "$CONDA_DIR/etc/profile.d/conda.sh" || fail "could not load conda"
@@ -77,13 +99,16 @@ else
     -DCMAKE_CXX_COMPILER="$CONDA_PREFIX/bin/x86_64-conda-linux-gnu-g++"
   run make -C "$BB/build" -j"$JOBS" bucket2
 fi
+fi   # LAN
 grep -q BUCKET2_TASK_TRACE "$BB/src/bucket.cu" || fail "src/bucket.cu has no task-trace patch"
 
 # ---- Step 3/4: first N vectors of the 1B file, downloaded in 1 GB pieces (resumable) ----
 log "==== Step 3/4: dataset $BASE"
 WANT=$(( 8 + N * DIM * ITEM ))
 if [ -f "$BASE" ] && [ "$(stat -c %s "$BASE")" = "$WANT" ]; then
-  log "Already downloaded, skipping"
+  log "Present and the right size, skipping"
+elif [ "$LAN" = 1 ]; then
+  fail "$BASE is missing, unreadable, or not $WANT bytes"
 else
   run mkdir -p "$DATA_DIR/$DS/parts"
   run curl -fsSI --max-time 30 -o /dev/null "$URL"
