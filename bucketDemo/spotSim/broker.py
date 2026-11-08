@@ -23,12 +23,14 @@ class ShardTask:
                  shard_id: int,
                  rows: int,
                  dim: int,
-                 deg: int)->None:
+                 deg: int,
+                 duration_sec: Optional[float] = None)->None:
         self.task_id = task_id
         self.shard_id = shard_id
         self.rows = rows
         self.dim = dim
         self.deg = deg
+        self.duration_sec = duration_sec  # measured task time; None = use the simulator's heuristic
 
         self.status = TaskStatus.READY
         self.current_step = PipelineStep.UNINITIALIZED
@@ -60,7 +62,8 @@ class TaskBroker:
         shard_id: int,
         rows: int,
         dim: int,
-        deg: int
+        deg: int,
+        duration_sec: Optional[float] = None
         )-> None:
         tid = str(task_id)
         self.tasks[tid] = ShardTask(
@@ -68,7 +71,8 @@ class TaskBroker:
             shard_id=shard_id,
             rows=rows,
             dim=dim,
-            deg=deg
+            deg=deg,
+            duration_sec=duration_sec
         )
 
     def next_task(self)->str | None:

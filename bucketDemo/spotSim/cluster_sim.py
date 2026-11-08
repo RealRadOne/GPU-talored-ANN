@@ -102,17 +102,20 @@ class ClusterSimulator:
         log_filepath: str = "cluster_events.csv",
         time_scale: float = 1.0,
         poll_seconds: float = 0.05,
+        slots_per_gpu: int = 1,
     ) -> None:
         self.broker = broker
         # Sort events by ascending scenario timestamp
         self.events = sorted(events, key=lambda e: e.timestamp)
         self.time_scale = time_scale
         self.poll_seconds = poll_seconds
+        self.slots_per_gpu = slots_per_gpu  # max tasks running at once on one GPU (bucket2: 4)
         self.logger = EventLogger(log_filepath)
 
         self.start_wall_time = time.monotonic()
         self.active_gpus: set[int] = set()
-        self.worker_assignments: Dict[int, str] = {}  # gpu_id -> task_id
+        self.worker_assignments: Dict[int, List[str]] = {}  # gpu_id -> running task_ids
+        self.task_gpu: Dict[str, int] = {}  # task_id -> gpu_id
         self.active_runners: Dict[str, TaskRunner] = {}  # task_id -> TaskRunner
 
     def scenario_time(self) -> float:
@@ -130,9 +133,9 @@ class ClusterSimulator:
                 if event.gpu_id in self.active_gpus:
                     self.active_gpus.remove(event.gpu_id)
 
-                # Preempt active task running on evicted GPU
-                if event.gpu_id in self.worker_assignments:
-                    task_id = self.worker_assignments.pop(event.gpu_id)
+                # Preempt every task running on the evicted GPU
+                for task_id in self.worker_assignments.pop(event.gpu_id, []):
+                    self.task_gpu.pop(task_id, None)
                     runner = self.active_runners.pop(task_id, None)
                     if runner:
                         runner.terminate()
@@ -153,13 +156,11 @@ class ClusterSimulator:
 
         for task_id in finished_tasks:
             self.active_runners.pop(task_id)
-            # Find associated GPU worker
-            gpu_id = -1
-            for g_id, t_id in list(self.worker_assignments.items()):
-                if t_id == task_id:
-                    gpu_id = g_id
-                    del self.worker_assignments[g_id]
-                    break
+            gpu_id = self.task_gpu.pop(task_id, -1)
+            if gpu_id in self.worker_assignments:
+                self.worker_assignments[gpu_id].remove(task_id)
+                if not self.worker_assignments[gpu_id]:
+                    del self.worker_assignments[gpu_id]
 
             task = self.broker.get_task(task_id)
             npts = task.rows if task else 0
@@ -169,33 +170,43 @@ class ClusterSimulator:
             )
 
     def dispatch_idle_workers(self) -> None:
-        """Assigns READY tasks from TaskBroker to idle active GPUs."""
-        idle_gpus = [
-            gpu_id
-            for gpu_id in self.active_gpus
-            if gpu_id not in self.worker_assignments
-        ]
-        for gpu_id in idle_gpus:
+        """Least-busy scheduler: each READY task goes to the active GPU with a free slot that has the
+        fewest running tasks (ties: lowest GPU id)."""
+        while True:
+            free_gpus = [
+                gpu_id for gpu_id in self.active_gpus
+                if len(self.worker_assignments.get(gpu_id, [])) < self.slots_per_gpu
+            ]
+            if not free_gpus:
+                return  # every GPU is full
+            gpu_id = min(free_gpus, key=lambda g: (len(self.worker_assignments.get(g, [])), g))
             task_id = self.broker.next_task()
             if task_id is None:
-                break
+                return  # no READY task left
+            self.start_task(task_id, gpu_id)
 
-            task = self.broker.get_task(task_id)
-            npts = task.rows if task else 0
+    def start_task(self, task_id: str, gpu_id: int) -> None:
+        """Starts task_id on gpu_id with its measured (or heuristic) duration."""
+        task = self.broker.get_task(task_id)
+        npts = task.rows if task else 0
 
-            # Base duration heuristic: 1 second per 100k vectors
+        # Measured task time if the task has one, else heuristic: 1 second per 100k vectors
+        if task is not None and task.duration_sec is not None:
+            simulated_duration = task.duration_sec
+        else:
             simulated_duration = max(0.5, (npts / 100_000.0))
-            runner = FakeRunner(
-                task_id,
-                base_duration_sec=simulated_duration,
-                time_scale=self.time_scale,
-            )
+        runner = FakeRunner(
+            task_id,
+            base_duration_sec=simulated_duration,
+            time_scale=self.time_scale,
+        )
 
-            self.worker_assignments[gpu_id] = task_id
-            self.active_runners[task_id] = runner
-            self.logger.log_event(
-                self.scenario_time(), "START", task_id, gpu_id, npts
-            )
+        self.worker_assignments.setdefault(gpu_id, []).append(task_id)
+        self.task_gpu[task_id] = gpu_id
+        self.active_runners[task_id] = runner
+        self.logger.log_event(
+            self.scenario_time(), "START", task_id, gpu_id, npts
+        )
 
     def run(self) -> None:
         """Main simulation execution loop."""
@@ -211,6 +222,12 @@ class ClusterSimulator:
 
 
 if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Dry run of the cluster simulator with 5 fake tasks")
+    parser.add_argument("--slots", type=int, default=1, help="max tasks running at once per GPU")
+    arguments = parser.parse_args()
+
     # Self-contained dry-run validation using FakeRunner
     broker = TaskBroker(ordering_policy=DefaultOrderingPolicy())
 
@@ -228,12 +245,14 @@ if __name__ == "__main__":
         AvailabilityEvent(timestamp=3.0, event_type="ADD", gpu_id=0),
     ]
 
-    dry_run_log = os.path.join(os.path.dirname(os.path.abspath(__file__)), "out", "dry_run_events.csv")
+    dry_run_log = os.path.join(os.path.dirname(os.path.abspath(__file__)), "out",
+                               f"dry_run_events_slots{arguments.slots}.csv")
     sim = ClusterSimulator(
         broker=broker,
         events=events,
         log_filepath=dry_run_log,
         time_scale=1.0,
+        slots_per_gpu=arguments.slots,
     )
     print("=== Starting Cluster Simulator Dry Run ===")
     sim.run()
