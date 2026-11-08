@@ -1,0 +1,3 @@
+# Trace data stays local (Lan: only source and docs go to the repo)
+*
+!.gitignore
