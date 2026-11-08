@@ -12,8 +12,8 @@
 #   LAN=1 ...                           use Lan's conda envs and datasets under /home/lanlu (read-only):
 #                                       skips the env setup and the download
 #
-# Outputs, per dataset:  ~/traces/<ds>_normal.csv + .log   (all streams, as Lan runs it)
-#                        ~/traces/<ds>_iso.csv + .log      (BUCKET2_SLOTS=1: one bucket at a time on the GPU)
+# Outputs, per dataset:  ../traces/bucket2/<ds>_normal.csv + .log   (all streams, as Lan runs it)
+#                        ../traces/bucket2/<ds>_iso.csv + .log      (BUCKET2_SLOTS=1: one bucket at a time on the GPU)
 
 DS=$1
 GPU=${GPU:-0}
@@ -23,8 +23,8 @@ CONDA_DIR=$HOME/miniforge3
 ENV_NAME=bucket2-cuvs
 DATA_DIR=$HOME/data
 WORK_DIR=$HOME/bucket2_work
-TRACE_DIR=$HOME/traces
 BB=$(cd "$(dirname "$0")" && pwd)
+TRACE_DIR=${TRACE_DIR:-$(dirname "$BB")/traces/bucket2}
 JOBS=${JOBS:-16}
 LAN=${LAN:-0}
 LAN_ENVS=/home/lanlu/miniconda3/envs
