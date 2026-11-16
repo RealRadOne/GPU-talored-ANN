@@ -52,6 +52,9 @@
 #include <string>
 #include <vector>
 #include <type_traits>
+#include <thread>
+#include <mutex>
+#include <exception>
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -149,6 +152,8 @@ int main(int argc, char** argv)
                 "Visibility window size in buckets (0 = auto, 4*K -- MUST match the "
                 "--order-window used when producing bucket_process_order.bin via reorder, "
                 "or leave both at their auto default)")
+            ("num-gpus", po::value<int>()->default_value(1),
+                "chunked GPU prune: split the processing positions over visible CUDA devices 0..G-1 (rows written in place)")
             ("cache-mb", po::value<size_t>()->default_value(4000),
                 "Host memory budget (MB) for the Belady bucket cache (candidate rows + vectors)")
             ("pool-graph", po::value<std::string>()->default_value(""),
@@ -174,6 +179,7 @@ int main(int argc, char** argv)
         const int32_t output_degree   = vm["output-degree"].as<int32_t>();
         const int32_t order_window_arg= vm["order-window"].as<int32_t>();
         const size_t cache_mb         = vm["cache-mb"].as<size_t>();
+        const int num_gpus            = std::max(1, vm["num-gpus"].as<int>());
         const bool save_npy           = vm["save-npy"].as<bool>();
 
         using Clock = std::chrono::steady_clock;
@@ -564,12 +570,57 @@ int main(int argc, char** argv)
                 writer.write_rows(rows, row0, n);
                 t_sink += std::chrono::duration<double>(Clock::now() - tw0).count();
             };
+            // 多 GPU (--num-gpus G > 1): 位置按行数切成 G 段，每张卡一个线程跑 run_chunked (各自的桶池 / 规划 / 读盘)，
+            // 行按偏移直接写进输出文件 (段互不重叠)。每个点的剪枝只看它自己的窗口 → 输出跟单卡逐字节相同。
+            int G = num_gpus;
+            {
+                int ndev = std::max(1, prune_windowed_gpu::device_count());
+                if (G > ndev) throw std::runtime_error("prune_windowed: --num-gpus " + std::to_string(G) + " > visible devices");
+            }
             auto chunked = [&](auto* tag) {
                 using T = std::remove_pointer_t<decltype(tag)>;
-                prune_windowed_gpu::run_chunked<T>(N, M_in, D_all, offsets_new.data(), n_buckets, win, win_len, Wmax,
-                                                   output_degree, budget,
-                                                   [&](int64_t lo, int64_t n, int32_t* c, T* v) { load_rows(lo, n, c, v); },
-                                                   sink, &cst);
+                if (G == 1) {
+                    prune_windowed_gpu::run_chunked<T>(N, M_in, D_all, offsets_new.data(), n_buckets, win, win_len, Wmax,
+                                                       output_degree, budget,
+                                                       [&](int64_t lo, int64_t n, int32_t* c, T* v) { load_rows(lo, n, c, v); },
+                                                       sink, &cst);
+                    return;
+                }
+                std::vector<int> cut(static_cast<size_t>(G) + 1, n_buckets);
+                cut[0] = 0;
+                for (int g = 1, p = 0; g < G; ++g) {
+                    const uint64_t target = static_cast<uint64_t>(N) * g / G;
+                    while (p < n_buckets && offsets_new[static_cast<size_t>(p)] < target) ++p;
+                    cut[static_cast<size_t>(g)] = p;
+                }
+                std::vector<prune_windowed_gpu::ChunkStats> st(static_cast<size_t>(G));
+                std::vector<std::exception_ptr> exc(static_cast<size_t>(G));
+                std::vector<std::thread> th;
+                std::mutex sink_mtx;
+                for (int g = 0; g < G; ++g) {
+                    th.emplace_back([&, g] {
+                        try {
+                            prune_windowed_gpu::set_device(g);
+                            prune_windowed_gpu::run_chunked<T>(N, M_in, D_all, offsets_new.data(), n_buckets, win, win_len, Wmax,
+                                output_degree, budget / G,
+                                [&](int64_t lo, int64_t n, int32_t* c, T* v) { load_rows(lo, n, c, v); },
+                                [&](const uint32_t* rows, int64_t row0, int64_t n) {
+                                    auto tw0 = Clock::now();
+                                    writer.write_rows_at(rows, row0, n);
+                                    std::lock_guard<std::mutex> lk(sink_mtx);
+                                    t_sink += std::chrono::duration<double>(Clock::now() - tw0).count();
+                                },
+                                &st[static_cast<size_t>(g)], cut[static_cast<size_t>(g)], cut[static_cast<size_t>(g) + 1]);
+                        } catch (...) { exc[static_cast<size_t>(g)] = std::current_exception(); }
+                    });
+                }
+                for (auto& t : th) t.join();
+                prune_windowed_gpu::set_device(0);
+                for (auto& e : exc) if (e) std::rethrow_exception(e);
+                for (auto& x : st) { cst.chunks += x.chunks; cst.loaded_rows += x.loaded_rows; }
+                std::cout << "  multi-GPU prune: " << G << " devices, position cuts";
+                for (int c : cut) std::cout << " " << c;
+                std::cout << "\n";
             };
             if (dataset_ext == ".fbin") chunked(static_cast<float*>(nullptr));
             else if (dataset_ext == ".i8bin") chunked(static_cast<int8_t*>(nullptr));

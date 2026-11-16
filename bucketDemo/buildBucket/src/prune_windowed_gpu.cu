@@ -18,6 +18,7 @@
 // per node, detours counted against the node's sorted row in shared memory).
 
 #include <climits>
+#include <type_traits>
 #include <numeric>
 #include <functional>
 #include <cstdlib>
@@ -39,7 +40,8 @@ namespace {
 #define PWG_CHECK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) \
     throw std::runtime_error(std::string("prune_windowed_gpu: ") + cudaGetErrorString(e_)); } while (0)
 
-constexpr int kMaxM = 64;
+constexpr int kMaxM = 64;           // A7 refine kernel (M ≤ 64)；prune_kernel 本身按 MAXM 模板化 (≤ 1024)
+constexpr int kMaxMPrune = 1024;
 constexpr int kHash = 128;          // open-addressing id → rank table per warp
 constexpr int kWarpsPerBlock = 4;
 
@@ -175,8 +177,10 @@ __global__ void scatter_slots_kernel(const SlotJob* __restrict__ jobs, const int
 // 保留下来的边里，候选不在窗口里 (距离未知 = +inf、没做 detour 检查) 的条数 (A4 统计)
 __device__ unsigned long long g_unverified_kept = 0;
 
-template <typename T>
-__global__ void __launch_bounds__(kWarpsPerBlock * 32) prune_kernel(
+// 高度数 (2026-11-16, 1B / degree 256–512 目标): 按 MAXM (64…1024) 模板化，hash 表 KHASH = 2·MAXM，每 block
+// WPB 个 warp (shared 36·MAXM B/warp 放进 48 KB)。MAXM = 64 → WPB 4、KHASH 128，跟原来的 kernel 完全相同。
+template <typename T, int MAXM, int WPB>
+__global__ void __launch_bounds__(WPB * 32) prune_kernel(
     const int32_t* __restrict__ cand,      // (N, M)
     const T* __restrict__ vec,             // (N, D)
     const uint32_t* __restrict__ offsets,  // (n_buckets + 1)
@@ -192,16 +196,16 @@ __global__ void __launch_bounds__(kWarpsPerBlock * 32) prune_kernel(
     const float* __restrict__ cdist = nullptr,   // B13: 中心点候选的 Step 6 距离 (按 a - row0，行宽 M)
     const int32_t* __restrict__ slot_tab = nullptr)   // B12: 桶 q 的第 j 个 kSlotRows 行槽 = slot_tab[cbase[q] + j]
 {
-    __shared__ float   s_dist[kWarpsPerBlock][kMaxM];
-    __shared__ int32_t s_id  [kWarpsPerBlock][kMaxM];
-    __shared__ int32_t s_k   [kWarpsPerBlock][kMaxM];   // original column (tie-break)
-    __shared__ int32_t s_hkey[kWarpsPerBlock][kHash];
-    __shared__ int32_t s_hval[kWarpsPerBlock][kHash];
-    __shared__ int32_t s_cnt [kWarpsPerBlock][kMaxM];
-    __shared__ int32_t s_stamp[kWarpsPerBlock][kMaxM];
+    __shared__ float   s_dist[WPB][MAXM];
+    __shared__ int32_t s_id  [WPB][MAXM];
+    __shared__ int32_t s_k   [WPB][MAXM];   // original column (tie-break)
+    __shared__ int32_t s_hkey[WPB][(2 * MAXM)];
+    __shared__ int32_t s_hval[WPB][(2 * MAXM)];
+    __shared__ int32_t s_cnt [WPB][MAXM];
+    __shared__ int32_t s_stamp[WPB][MAXM];
 
     const int w = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    const int64_t a = row0 + static_cast<int64_t>(blockIdx.x) * kWarpsPerBlock + w;
+    const int64_t a = row0 + static_cast<int64_t>(blockIdx.x) * WPB + w;
     if (a >= row0 + n_rows) return;
     const uint32_t total = offsets[n_buckets];
     const int p = find_pos(offsets, n_buckets, static_cast<uint32_t>(a));
@@ -218,7 +222,7 @@ __global__ void __launch_bounds__(kWarpsPerBlock * 32) prune_kernel(
     const T* va = vec + arow * D;
 
     // ---- 1. distances ----
-    for (int k = lane; k < kMaxM; k += 32) {
+    for (int k = lane; k < MAXM; k += 32) {
         float dist = INFINITY;
         int32_t id = -1;
         bool valid = false;
@@ -244,7 +248,7 @@ __global__ void __launch_bounds__(kWarpsPerBlock * 32) prune_kernel(
         // padding / k >= M sorts after every valid entry (even +inf ones)
         s_dist[w][k] = dist;
         s_id[w][k]   = valid ? id : -1;
-        s_k[w][k]    = valid ? k : (kMaxM + k);
+        s_k[w][k]    = valid ? k : (MAXM + k);
     }
     __syncwarp();
 
@@ -255,9 +259,9 @@ __global__ void __launch_bounds__(kWarpsPerBlock * 32) prune_kernel(
         if (s_dist[w][i] != s_dist[w][j]) return s_dist[w][i] < s_dist[w][j];
         return s_k[w][i] < s_k[w][j];
     };
-    for (int size = 2; size <= kMaxM; size <<= 1) {
+    for (int size = 2; size <= MAXM; size <<= 1) {
         for (int stride = size >> 1; stride > 0; stride >>= 1) {
-            for (int t = lane; t < kMaxM / 2; t += 32) {
+            for (int t = lane; t < MAXM / 2; t += 32) {
                 int i = 2 * stride * (t / stride) + (t % stride);
                 int j = i + stride;
                 bool up = ((i & size) == 0);
@@ -272,14 +276,14 @@ __global__ void __launch_bounds__(kWarpsPerBlock * 32) prune_kernel(
     }
 
     // ---- hash: id → rank (duplicates kept as separate entries) ----
-    for (int h = lane; h < kHash; h += 32) s_hkey[w][h] = -1;
-    for (int k = lane; k < kMaxM; k += 32) { s_cnt[w][k] = 0; s_stamp[w][k] = -1; }
+    for (int h = lane; h < (2 * MAXM); h += 32) s_hkey[w][h] = -1;
+    for (int k = lane; k < MAXM; k += 32) { s_cnt[w][k] = 0; s_stamp[w][k] = -1; }
     __syncwarp();
     for (int r = lane; r < M; r += 32) {
         int32_t id = s_id[w][r];
         if (id < 0) continue;
-        uint32_t h = (static_cast<uint32_t>(id) * 2654435761u) & (kHash - 1);
-        while (atomicCAS(&s_hkey[w][h], -1, id) != -1) h = (h + 1) & (kHash - 1);
+        uint32_t h = (static_cast<uint32_t>(id) * 2654435761u) & ((2 * MAXM) - 1);
+        while (atomicCAS(&s_hkey[w][h], -1, id) != -1) h = (h + 1) & ((2 * MAXM) - 1);
         s_hval[w][h] = r;
     }
     __syncwarp();
@@ -295,8 +299,8 @@ __global__ void __launch_bounds__(kWarpsPerBlock * 32) prune_kernel(
         for (int kDB = lane; kDB < M; kDB += 32) {
             const int32_t b = drow[kDB];
             if (b < 0) continue;
-            uint32_t h = (static_cast<uint32_t>(b) * 2654435761u) & (kHash - 1);
-            for (int probes = 0; probes < kHash && s_hkey[w][h] >= 0; ++probes, h = (h + 1) & (kHash - 1)) {
+            uint32_t h = (static_cast<uint32_t>(b) * 2654435761u) & ((2 * MAXM) - 1);
+            for (int probes = 0; probes < (2 * MAXM) && s_hkey[w][h] >= 0; ++probes, h = (h + 1) & ((2 * MAXM) - 1)) {
                 if (s_hkey[w][h] != b) continue;
                 const int kAB = s_hval[w][h];
                 if (kAB > kAD && atomicExch(&s_stamp[w][kAB], kAD) != kAD)
@@ -326,9 +330,37 @@ __global__ void __launch_bounds__(kWarpsPerBlock * 32) prune_kernel(
     }
 }
 
+
+template <int MAXM> constexpr int prune_wpb() {
+    constexpr int per_warp = MAXM * 36;   // 5 × MAXM int/float + 2 × (2·MAXM) hash
+    constexpr int w = (48 * 1024) / per_warp;
+    return w >= 4 ? 4 : (w < 1 ? 1 : w);
+}
+// prune_kernel 的发射: 按 M 选 MAXM / WPB，grid 按 n_rows 算
+template <typename T, typename... Args>
+void launch_prune(int M, int64_t n_rows, cudaStream_t st, Args... args)
+{
+    if (n_rows <= 0) return;
+    auto go = [&](auto tag) {
+        constexpr int MX = decltype(tag)::value;
+        constexpr int W = prune_wpb<MX>();
+        const int64_t blocks = (n_rows + W - 1) / W;
+        prune_kernel<T, MX, W><<<static_cast<unsigned>(blocks), W * 32, 0, st>>>(args...);
+    };
+    if      (M <= 64)   go(std::integral_constant<int, 64>{});
+    else if (M <= 128)  go(std::integral_constant<int, 128>{});
+    else if (M <= 256)  go(std::integral_constant<int, 256>{});
+    else if (M <= 512)  go(std::integral_constant<int, 512>{});
+    else if (M <= 1024) go(std::integral_constant<int, 1024>{});
+    else throw std::runtime_error("prune_windowed_gpu: M_in > 1024");
+}
+
 }  // namespace
 
 namespace prune_windowed_gpu {
+
+int device_count() { int n = 0; if (cudaGetDeviceCount(&n) != cudaSuccess) return 0; return n; }
+void set_device(int dev) { PWG_CHECK(cudaSetDevice(dev)); }
 
 static std::function<void(int64_t, int64_t, float*)> g_center_dists;
 void set_center_dists(std::function<void(int64_t lo, int64_t n, float* out)> f) { g_center_dists = std::move(f); }
@@ -344,7 +376,7 @@ static void report_unverified(int64_t n_points, int out_deg)
 
 bool available(int64_t N, int M, int D, int n_buckets, int W, int out_deg, int elem_bytes)
 {
-    if (M > kMaxM) return false;
+    if (M > kMaxMPrune) return false;
     int dev_count = 0;
     if (cudaGetDeviceCount(&dev_count) != cudaSuccess || dev_count == 0) return false;
     size_t free_b = 0, total_b = 0;
@@ -455,6 +487,7 @@ void run(const int32_t* h_cand, const T* h_vec, int64_t N, int M, int D,
         // A7: BUCKET2_A7_SAMPLE = S (≤ 16) → 先做不受窗口限制的 local join；BUCKET2_A7_UNWIN=1 或 S > 0 → prune 不按窗口
         const char* a7e = std::getenv("BUCKET2_A7_SAMPLE");
         const int a7_S = a7e ? std::min(std::atoi(a7e), std::min(kA7MaxS, M)) : 0;
+        if (a7_S > 0 && M > kMaxM) throw std::runtime_error("prune_windowed_gpu: A7 refine needs M_in <= 64");
         const bool unwin = a7_S > 0 || (std::getenv("BUCKET2_A7_UNWIN") && std::getenv("BUCKET2_A7_UNWIN")[0] == '1');
         int32_t* d_own = nullptr;
         if (a7_S > 0) {
@@ -478,8 +511,10 @@ void run(const int32_t* h_cand, const T* h_vec, int64_t N, int M, int D,
                       << " cand_avg=" << h.cand / np_ << " inserted_avg=" << h.inserted / np_ << " seconds=" << ms / 1e3 << "\n";
         }
         if (unwin) std::cout << "  A7: prune without window restriction (all candidates scored)\n";
-        prune_kernel<<<static_cast<unsigned>(blocks), kWarpsPerBlock * 32, 0, stg.st>>>(
-            d_cand, d_vec, d_off, d_win, d_wl, d_cbase, 0, N, M, D, n_buckets, W, out_deg, d_out, d_err, unwin, d_own);
+        launch_prune<T>(M, N, stg.st,
+            (const int32_t*)d_cand, (const T*)d_vec, (const uint32_t*)d_off, (const int32_t*)d_win, (const int32_t*)d_wl,
+            (const int64_t*)d_cbase, (int64_t)0, (int64_t)N, M, D, n_buckets, W, out_deg, d_out, d_err, unwin,
+            (const int32_t*)d_own, (const float*)nullptr, (const int32_t*)nullptr);
         PWG_CHECK(cudaGetLastError());
         int h_err = 0;
         PWG_CHECK(cudaMemcpyAsync(&h_err, d_err, sizeof(int), cudaMemcpyDeviceToHost, stg.st));
@@ -532,8 +567,10 @@ void run_chunked(int64_t N, int M, int D, const uint32_t* h_offsets, int n_bucke
                  int out_deg, size_t budget_bytes,
                  const std::function<void(int64_t lo, int64_t n, int32_t* cand, T* vec)>& load_rows,
                  const std::function<void(const uint32_t*, int64_t, int64_t)>& sink,
-                 ChunkStats* stats)
+                 ChunkStats* stats, int pos_lo, int pos_hi)
 {
+    if (pos_hi < 0) pos_hi = n_buckets;
+    if (pos_lo < 0 || pos_lo > pos_hi || pos_hi > n_buckets) throw std::runtime_error("prune_windowed_gpu: bad position range");
     const size_t vec_row = static_cast<size_t>(D) * sizeof(T);
     const size_t row_bytes = static_cast<size_t>(M) * sizeof(int32_t) + vec_row;
     int64_t max_bucket = 0;
@@ -633,10 +670,10 @@ void run_chunked(int64_t N, int M, int D, const uint32_t* h_offsets, int n_bucke
             // ---- 先把所有块规划出来 (跟下面原来的规划完全一样)，记下每个桶被哪些块用到 ----
             struct Plan { int p0, p1; std::vector<int32_t> U; };
             std::vector<Plan> plans;
-            for (int p0 = 0; p0 < n_buckets; ++chunk_id) {
+            for (int p0 = pos_lo; p0 < pos_hi; ++chunk_id) {
                 Plan pl; pl.p0 = p0;
                 int64_t rows = 0; int p1 = p0;
-                while (p1 < n_buckets) {
+                while (p1 < pos_hi) {
                     const int32_t* wp = h_win.data() + static_cast<size_t>(p1) * W;
                     const int wl = h_win_len[static_cast<size_t>(p1)];
                     int64_t add = 0;
@@ -765,7 +802,6 @@ void run_chunked(int64_t N, int M, int D, const uint32_t* h_offsets, int n_bucke
                 }
                 t1 = omp_get_wtime(); t_load += t1 - t0; t0 = t1;
                 const int64_t row0 = h_offsets[pl.p0], n_rows = static_cast<int64_t>(h_offsets[pl.p1]) - row0;
-                const int64_t blocks = (n_rows + kWarpsPerBlock - 1) / kWarpsPerBlock;
                 if (d_cdist && n_rows > 0) {
                     if (n_rows > cap_rows) throw std::runtime_error("prune_windowed_gpu: B13 center rows exceed capacity");
                     h_cdist.resize(static_cast<size_t>(n_rows) * M);
@@ -786,10 +822,10 @@ void run_chunked(int64_t N, int M, int D, const uint32_t* h_offsets, int n_bucke
                 prev_off = ring_off; prev_hd = hd; ring_off += hd;
                 if (d_cdist && n_rows > 0)
                     PWG_CHECK(cudaMemcpyAsync(d_cdist, h_cdist.data(), h_cdist.size() * sizeof(float), cudaMemcpyHostToDevice, stg.st));
-                if (blocks > 0)
-                    prune_kernel<<<static_cast<unsigned>(blocks), kWarpsPerBlock * 32, 0, stg.st>>>(
-                        d_candP, d_vecP, d_off, d_win, d_wl, d_cbase, row0, n_rows, M, D, n_buckets, W, out_deg, d_outB[b], d_err,
-                        false, nullptr, d_cdist, d_tab);
+                launch_prune<T>(M, n_rows, stg.st,
+                    (const int32_t*)d_candP, (const T*)d_vecP, (const uint32_t*)d_off, (const int32_t*)d_win, (const int32_t*)d_wl,
+                    (const int64_t*)d_cbase, (int64_t)row0, (int64_t)n_rows, M, D, n_buckets, W, out_deg, d_outB[b], d_err,
+                    false, (const int32_t*)nullptr, (const float*)d_cdist, (const int32_t*)d_tab);
                 PWG_CHECK(cudaGetLastError());
                 PWG_CHECK(cudaEventRecord(ev_done[b], stg.st));
                 pend[b] = {row0, n_rows};
@@ -803,7 +839,7 @@ void run_chunked(int64_t N, int M, int D, const uint32_t* h_offsets, int n_bucke
             std::cout << "  [Chunked timing] plan=" << t_plan << "s load=" << t_load << "s center_dists=" << t_cdist
                       << "s gpu_wait=" << t_wait << "s d2h+sink=" << t_d2h << "s (pipelined)\n";
         } else
-        for (int p0 = 0; p0 < n_buckets; ++chunk_id) {
+        for (int p0 = pos_lo; p0 < pos_hi; ++chunk_id) {
             // ---- 并集 U(p0..p1): 加位置直到行数到上限 ----
             for (int q : prevU) prev_cbase[static_cast<size_t>(q)] = -1;
             for (int q : U) prev_cbase[static_cast<size_t>(q)] = cbase[static_cast<size_t>(q)];   // 上一块的布局
@@ -812,7 +848,7 @@ void run_chunked(int64_t N, int M, int D, const uint32_t* h_offsets, int n_bucke
             U.clear();
             int64_t rows = 0;
             int p1 = p0;
-            while (p1 < n_buckets) {
+            while (p1 < pos_hi) {
                 const int32_t* wp = h_win.data() + static_cast<size_t>(p1) * W;
                 const int wl = h_win_len[static_cast<size_t>(p1)];
                 int64_t add = 0;
@@ -881,7 +917,6 @@ void run_chunked(int64_t N, int M, int D, const uint32_t* h_offsets, int n_bucke
             int32_t* d_cand = d_candB[nb]; T* d_vec = d_vecB[nb];
             cur = nb;
             const int64_t row0 = h_offsets[p0], n_rows = static_cast<int64_t>(h_offsets[p1]) - row0;
-            const int64_t blocks = (n_rows + kWarpsPerBlock - 1) / kWarpsPerBlock;
             if (d_cdist && n_rows > 0) {
                 if (n_rows > cap_rows) throw std::runtime_error("prune_windowed_gpu: B13 center rows exceed capacity");
                 h_cdist.resize(static_cast<size_t>(n_rows) * M);
@@ -889,10 +924,10 @@ void run_chunked(int64_t N, int M, int D, const uint32_t* h_offsets, int n_bucke
                 PWG_CHECK(cudaMemcpyAsync(d_cdist, h_cdist.data(), h_cdist.size() * sizeof(float), cudaMemcpyHostToDevice, stg.st));
                 PWG_CHECK(cudaStreamSynchronize(stg.st));   // h_cdist 下一块会被重写
             }
-            if (blocks > 0)
-                prune_kernel<<<static_cast<unsigned>(blocks), kWarpsPerBlock * 32, 0, stg.st>>>(
-                    d_cand, d_vec, d_off, d_win, d_wl, d_cbase, row0, n_rows, M, D, n_buckets, W, out_deg, d_out, d_err,
-                    false, nullptr, d_cdist);
+            launch_prune<T>(M, n_rows, stg.st,
+                (const int32_t*)d_cand, (const T*)d_vec, (const uint32_t*)d_off, (const int32_t*)d_win, (const int32_t*)d_wl,
+                (const int64_t*)d_cbase, (int64_t)row0, (int64_t)n_rows, M, D, n_buckets, W, out_deg, d_out, d_err,
+                false, (const int32_t*)nullptr, (const float*)d_cdist, (const int32_t*)nullptr);
             PWG_CHECK(cudaGetLastError());
             int h_err = 0;
             PWG_CHECK(cudaMemcpyAsync(&h_err, d_err, sizeof(int), cudaMemcpyDeviceToHost, stg.st));
@@ -922,7 +957,7 @@ void run_chunked(int64_t N, int M, int D, const uint32_t* h_offsets, int n_bucke
     template void run_chunked<T>(int64_t, int, int, const uint32_t*, int, const std::vector<int32_t>&,  \
                                  const std::vector<int32_t>&, int, int, size_t,                          \
                                  const std::function<void(int64_t, int64_t, int32_t*, T*)>&,             \
-                                 const std::function<void(const uint32_t*, int64_t, int64_t)>&, ChunkStats*);
+                                 const std::function<void(const uint32_t*, int64_t, int64_t)>&, ChunkStats*, int, int);
 PWG_INSTANTIATE(uint8_t)
 PWG_INSTANTIATE(int8_t)
 PWG_INSTANTIATE(float)

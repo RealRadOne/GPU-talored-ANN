@@ -5,6 +5,9 @@
 #include <functional>
 
 namespace prune_windowed_gpu {
+// 多 GPU 辅助 (prune_windowed.cpp 不直接 include CUDA 头)
+int device_count();
+void set_device(int dev);
 // true if a CUDA device is present, M <= 64 and the working set fits in free GPU memory
 // (elem_bytes = sizeof the dataset element: 1 for uint8 / int8, 4 for float)
 bool available(int64_t N, int M, int D, int n_buckets, int W, int out_deg, int elem_bytes = 1);
@@ -35,5 +38,7 @@ void run_chunked(int64_t N, int M, int D, const uint32_t* offsets, int n_buckets
                  int out_deg, size_t budget_bytes,
                  const std::function<void(int64_t lo, int64_t n, int32_t* cand, T* vec)>& load_rows,
                  const std::function<void(const uint32_t* rows, int64_t row0, int64_t n)>& sink,
-                 ChunkStats* stats = nullptr);
+                 ChunkStats* stats = nullptr,
+                 // 多 GPU: 只处理位置 [pos_lo, pos_hi) (行 [offsets[pos_lo], offsets[pos_hi]))；调用方已 cudaSetDevice
+                 int pos_lo = 0, int pos_hi = -1);
 }

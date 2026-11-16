@@ -60,9 +60,18 @@ After **#80 — optimize_chunked Phase 1 store partitions + pageable buffers** (
 
 \* msTuring100M DiskANN QPS at small L looks like a cold-start artifact of the search script; recall is what is gated.
 
+Latest accepted: **#96** (2026-11-16, `runs/opt96b_after`): SIFT1M auto 3.81, SIFT1M large 7.34, SIFT10M 36.73, SIFT100M 429.56, msTuring1M 9.12, msTuring10M 81.19 s (state/best.json holds these).
+
 Where the 100M time goes (s): SIFT100M bucket2 364 (Step 4 ~120, Step 6 ~160, Wait ~41, Step 4.5 ~28, Step 1 ~22), prune 40, optimize_chunked 44. msTuring100M bucket2 620 (Step 4 ~262, Step 6 ~214, Step 4.5 ~60, Wait ~45), prune 88, optimize_chunked 48.
 
 ## Ideas backlog
+- **1B / high-degree readiness audit (2026-11-16, user: 1B datasets and output degree 256 / 512 are coming).** Probe = SIFT1M large path run directly (build_wip, GPU 3) with `--neighbors-m M --output-degree K`:
+  - M=64 / K=32: OK (bucket2 7.4 s, prune GPU 0.3 s, optimize 0.7 s).
+  - M=256 / K=128: correct graph (0 bad / self / dup), but **prune falls back to the CPU kernel: compute 51.9 s vs 0.29 s** (`prune_windowed_gpu.cu` `kMaxM = 64`, shared `s_dist[warps][kMaxM]`), and **optimize falls back to CPU Phase 2** (`kern_e_merge` KMAX ≤ 64): Phase 2 5.2 s vs 0.26 s. bucket2 16.2 s (top-256).
+  - M=512 / K=256: **bucket2 FATAL `VectorKNN: M > 256 needs bucket_size <= dots row tile`** (out-of-core Step 6: block top-M kernel stops at 256, the raft select_k fallback is not row-tiled).
+  - To do for high degree: (1) Step 6 M > 256: row-tiled select_k fallback or block top-M up to 1024; (2) prune GPU kernel for M_in up to 1024 (block per point, distances / detour counts in shared or global scratch); (3) optimize GPU Phase 2 merge for K_out > 64 and the #96 GpuReverseTopK 64-bit key + warp/block select (entry below).
+  - N = 1B: no 32-bit overflow found in the hot paths (ids < 2^31; kernels indexing by N use int64; the remaining `int` thread indices loop over batch / bucket sizes). Size rules in dataset_env.py already cover 1B (B = 512 → 1.95M centroids, KMeans fraction 1 %, host caches capped at 51 GB). Capacity is the real limit: pre-prune graph files scale with N × M — at 1B, `vector_knn.bin` is 256 GB (M=64) … 2 TB (M=512), the Step 6 running table 512 GB … 4 TB, plus per-round arrival files; the current `/` has 262 GB free at 0.29 GB/s (see disk memo). Step 3 centroid self-KNN is exact brute force (≈ N_c² — 2M centroids ≈ 100× the SIFT100M 1.2 s); replacing it with an approximate graph would be an algorithm change (needs approval).
+- **1B / high-degree readiness of the #96 GPU reverse top-K (user 2026-11-15, backlog):** #96's `GpuReverseTopK` (optimize_chunked -m E, multi-chunk case) packs each reverse edge into a 32-bit key `rank << src_bits | src` and selects each row's top-K_out with one thread per row (`kern_rev_select<LMAX>`, LMAX ≤ 64). Target scale is N = 1B (src 30 bits) with output degree 256 / 512 (rank 8 / 9 bits) → 38–39 bits: it falls back to the CPU `TopKReverseStore` (correct, but no speed-up). To support 1B: (1) a 64-bit key variant (`rank << 32 | src`, same order as the CPU store; 8 B/edge on GPU → more dst passes); (2) per-row selection by one warp or block per row instead of one thread (each row keeps up to 512 of possibly thousands of keys — per-thread insertion into a 512-entry local array is too slow / spills), e.g. block-wide radix select or warp-level bitonic sort of the row segment; (3) recheck host memory (1B × 512 × 8 B keys = 4 TB is impossible → keep the CSR-of-all-edges layout only if it fits, else stream dst passes straight into Phase 2's merge). Must stay byte-identical to the CPU store.
 - **#95 diagnosis (2026-11-01, no change):** msTuring100M SMOKE (GPU 1–3, niced) with a `prune_windowed` wrapper running `fincore` on prune's inputs just before it starts. `BUCKET2_R1_BLOB=1` (#91 on): vector_knn.bin 25.6 GB and data_reordered.fbin 40 GB **100 % resident**, prune load 34.1 s / prune 78.9 s. So #91's 40 GB blob does not evict prune's inputs on this 251 GB machine; the 59–72 s prune loads in the timed #88 / #91 runs are best explained by other users' I/O at the time (load average 20–30 then). Page-cache hypothesis rejected.
 - **#94 investigation (2026-11-01, no change):** after #93, msTuring10M Step 4 in SMOKE is a steady 2.26–2.34 s / round (search 1.12, upload 0.49–0.57, ~0.5 s untimed); the 13–15 s seen in timed runs is machine variance. Step 2 (KMeans‖): msTuring10M ~1.2–1.5 s / round (kmeans_parallel 0.8–0.9 s), msTuring100M 7.5 s / round (292K candidates) ≈ 2 % of the build — an fp16-screened + exact d(x, C) would be the next step but is a sizeable kernel for ~2 %. Remaining large items need decisions: A10 (round-1 sample reuse), msTuring100M prune disk load (59–72 s vs ~40 s, unexplained), Step 6 GPU-bound loops.
 - **#92 investigation (2026-11-01, no change):** prune chunk budget vs reload: msTuring10M forced chunked (A7 off), `--cache-mb` 1000 / 2000 / 4000 → budget 0.52 / 1.05 / 2.10 GB, 310 / 125 / 48 chunks, **rows loaded 1.00 × N in all** (load 0.88 / 0.60 / 0.44 s, total 3.96 / 3.99 / 4.62 s), outputs byte-identical. So the 100M reload factor (msTuring100M 8.8 × N, SIFT100M 4.5 × N) comes from the B12 GPU bucket-pool capacity (msTuring100M ~302K slots × 64 rows ≈ 12.7 GB of a 16 GB V100), not the 4 GB chunk cap — no cheap lever. Machine idle check: 251 GB RAM, 160 GB free → the "#91 blob evicts prune's page cache" idea is weak; prune's slower `load` since #88 is still unexplained (disk / other users' I/O most likely).
@@ -2623,6 +2632,78 @@ Check 1 failed the speed band (+3.7 %): the excess was in `prune`'s chunk `load`
 
 
 **Verdict:** ACCEPT — msTuring10M +4.4 % (87.84 → 84.00 s; Step 4 19.5 → 13.1 s), others within ±2.1 % (SIFT100M 422.08 s, +1.0 %).
+
+### #96 — GPU reverse top-K + merge for optimize_chunked multi-chunk, parallel Step 0 / bucket reorder, Step 4.5 reuses Step 1's sample rows; multi-GPU scaffolding (off by default)  (2026-11-16)
+**Idea / rationale:**
+- `optimize_chunked -m E`, multi-chunk case (SIFT100M): the reverse-edge top-K_out per destination and the merge into the forward rows now run on the GPU (`GpuReverseMerge`: in-degree count → CSR offsets on host; dst ranges sized to GPU memory; per segment fill keys `rank << src_bits | src` with atomic row cursors, per-row select (thread per row for K ≤ 64, cub segmented sort above), merge with the same rule as `merge_rank_ordered_into_row`). Output byte-identical to the CPU `TopKReverseStore` path (keys in a row are distinct → independent of atomic arrival order). 64-bit keys when `src_bits + rank_bits > 32` (1B / degree 512), K ≤ 512. `OC_GPU_REV=0` falls back to CPU.
+- bucket2: Step 0 non-centroid list via flag array + two-pass parallel compaction (was 1e8 `unordered_set` lookups); `compute_bucket_reorder` parallel per-thread old_id ranges (same inverse_perm / offsets); Step 4.5 in-memory resample reuses Step 1's sorted sample rows (same N / seed → same rows) instead of re-drawing.
+- Step 6 out-of-core raft `select_k` fallback (M > 256) now row-tiled by the dots tile (was a FATAL when bucket > tile).
+- **Multi-GPU scaffolding (user architecture 2026-11-15), `--num-gpus G`, default 1 = old paths:** Step 4 (query rows split, centroid index per GPU), Step 6 (processing order split into G contiguous ranges, one scatter thread per GPU, appends serialized by `append_mtx`), prune (row ranges per GPU, own `run_chunked`), optimize (`GpuReverseMerge` segments round-robin over GPUs). **Only optimize was run with G = 4** (SIFT100M forward graph: byte-identical to CPU, but 43.1 s vs 34.9 s with G = 1 — every GPU re-uploads the whole forward graph per segment, H2D 3.8 → 11.1 s). Step 4 / Step 6 / prune with G > 1 are untested.
+
+**First judge (2026-11-16 01:47, `runs/opt96_after*`): REJECT — SIFT100M 84452 self loops, recall below the TAGORE floor.** Root cause: the first `GpuReverseTopK` uploaded forward-graph batches into one `d_fwd` buffer on a `cudaStreamNonBlocking` staging stream while the count / fill kernels ran on the legacy default stream, which does not wait on non-blocking streams → the next batch overwrote `d_fwd` while the previous kernel still read it, so edges got the previous batch's `row0` (wrong src; src == dst shows up as a self loop, the rest are silent wrong edges, hence the recall drop). Localized with a SMOKE SIFT100M run of the rejected binary: vector_knn.bin 0 / forward_graph_reordered.bin 0 / final graph 43336 self edges, all in columns 16–31 (merged reverse edges), count differs run to run. Not reproducible at SIFT10M (forced multi-chunk, 7 runs). Fix: `cudaStreamSynchronize(cudaStreamLegacy)` after each batch's kernels before the next upload. Fixed binary on the same SIFT100M forward graph: byte-identical to `OC_GPU_REV=0`, 0 self loops.
+Also: two accumulator structs got a `std::mutex` member for multi-GPU, which made them non-movable (compile error at `return acc;`); now `std::unique_ptr<std::mutex>`.
+
+**CAGRA / ACE source:** cuVS `cagra/graph_core.cuh::optimize` (reverse-graph construction + `kern_make_rev_graph` merge on GPU).
+**Class:** implementation (same bytes).
+**Files:** `src/bucket.cu`, `src/optimize_chunked.cu`, `src/prune_windowed.cpp`, `src/prune_windowed_gpu.{cu,hpp}`, `src/graph_io.hpp`, `src/reordered_dataset_io.hpp`. All runs on GPU 0 (`runs/opt96b_after`; the session-killed chain was resumed from msTuring1M in `opt96b_resume.sh`).
+
+**Build time (s, median of reps; sum of all stages)**
+
+| config | path | reps | total | vs best | vs baseline | vs TAGORE | vs CAGRA | stages | GPU peak MiB | max RSS GB |
+|---|---|---|---|---|---|---|---|---|---|---|
+| msTuring10M_auto | large | 5 | 81.19 | +3.3% | +18.3% | 0.35x | 0.68x | bucket2 72.81, prune 5.04, optimize_chunked 3.36 | 8996 | 20.59 |
+| msTuring1M_auto | resident | 3 | 9.12 | +0.9% | +42.3% | 0.98x | 0.79x | bucket2 9.12 | 3646 | 1.63 |
+| sift100M_auto | large | 3 | 429.56 | -1.8% | +17.1% | 0.20x | 0.58x | bucket2 335.26, prune 55.78, optimize_chunked 39.47 | 14556 | 28.59 |
+| sift10M_auto | large | 3 | 36.73 | +1.2% | +15.0% | 0.17x | 0.30x | bucket2 29.09, prune 4.31, optimize_chunked 3.29 | 8996 | 9.65 |
+| sift1M_auto | resident | 3 | 3.81 | +4.0% | +21.1% | 0.42x | 0.33x | bucket2 3.81 | 4952 | 1.58 |
+| sift1M_large | large | 5 | 7.34 | -2.8% | +4.2% | 0.80x | 0.64x | bucket2 5.82, prune 0.74, optimize_chunked 0.78 | 1286 | 1.71 |
+
+**bucket2 step breakdown (s)**
+
+| config | Step 1 (Load sampled data) | Step 2 (Select centroids) | Step 3 (Centroid KNN graph) | Step 3.5 (Load full dataset) | Step 4 (Batch assignment) | Step 4.5 (Inline reorder, round 1 only) | Step 5 (Write buckets) | Step 6 (Per-vector KNN, merge included) | Wait (final iteration's background merge) | Write (close + .npy convert) |
+|---|---|---|---|---|---|---|---|---|---|---|
+| msTuring10M_auto | 2.95 | 6.16 | 0.27 | 0.00 | 13.50 | 0.72 | 0.22 | 43.01 | 4.26 | 0.00 |
+| msTuring1M_auto | 0.48 | 0.30 | 0.03 | 0.00 | 0.35 | 0.14 | 0.02 | 5.17 | 0.00 | 0.98 |
+| sift100M_auto | 8.00 | 5.35 | 3.05 | 0.00 | 101.63 | 14.92 | 3.15 | 159.76 | 33.81 | 0.00 |
+| sift10M_auto | 0.18 | 1.85 | 0.18 | 0.00 | 5.81 | 0.37 | 0.18 | 14.76 | 4.42 | 0.00 |
+| sift1M_auto | 0.16 | 0.15 | 0.07 | 0.00 | 0.23 | 0.06 | 0.02 | 1.61 | 0.00 | 0.99 |
+| sift1M_large | 0.07 | 0.38 | 0.20 | 0.00 | 0.99 | 0.04 | 0.04 | 2.80 | 0.52 | 0.00 |
+
+**(a) pre-prune index (degree 64) vs exact KNN, 10K sampled points**
+
+| config | recall@1 | recall@10 | recall@32 | recall@64 |
+|---|---|---|---|---|
+| msTuring10M_auto | 0.8083 | 0.7612 | 0.7327 | 0.7115 |
+| msTuring1M_auto | 0.9859 | 0.9746 | 0.9586 | 0.9421 |
+| sift100M_auto | 0.6543 | 0.6151 | 0.5893 | 0.5726 |
+| sift10M_auto | 0.7600 | 0.7227 | 0.6991 | 0.6829 |
+| sift1M_auto | 0.9386 | 0.9246 | 0.9127 | 0.9030 |
+| sift1M_large | 0.9336 | 0.9229 | 0.9110 | 0.9020 |
+
+**(b) final graph (degree 32, original ids), recall@10 / QPS (10K queries); search per datasets.json (cagra: cuVS CAGRA itopk, diskann: DiskANN CPU L)**
+
+| graph | 32 | 64 | 128 | 256 | 512 |
+|---|---|---|---|---|---|
+| TAGORE largeIndex Vamana (degree 32), msTuring10M | 0.5838 / 1445K | 0.7300 / 769K | 0.8446 / 380K | 0.9135 / 152K | 0.9515 / 48K |
+| CAGRA CAGRA NN-Descent 64->32, msTuring10M | 0.6621 / 1418K | 0.7995 / 740K | 0.8922 / 370K | 0.9451 / 150K | 0.9741 / 47K |
+| TAGORE GNN-Descent k=96 + CAGRA prune (degree 32), msTuring1M | 0.6046 / 1495K | 0.7390 / 798K | 0.8454 / 371K | 0.9150 / 147K | 0.9572 / 47K |
+| CAGRA CAGRA NN-Descent 64->32, msTuring1M | 0.6628 / 1451K | 0.7924 / 735K | 0.8860 / 366K | 0.9449 / 147K | 0.9770 / 47K |
+| TAGORE largeIndex Vamana, sift100M | 0.7691 / 61K | 0.8615 / 55K | 0.9238 / 34K | 0.9616 / 20K | 0.9820 / 11K |
+| CAGRA CAGRA ACE 64->32, sift100M | 0.7672 / 63K | 0.8697 / 57K | 0.9374 / 34K | 0.9756 / 20K | 0.9917 / 11K |
+| TAGORE largeIndex Vamana, sift10M | 0.8448 / 1875K | 0.9238 / 1014K | 0.9662 / 482K | 0.9863 / 185K | 0.9950 / 68K |
+| CAGRA , sift10M | 0.8672 / 1868K | 0.9463 / 1013K | 0.9839 / 525K | 0.9959 / 187K | 0.9992 / 68K |
+| TAGORE GNN-Descent k=96 + CAGRA prune, sift1M | 0.9220 / 1947K | 0.9752 / 1033K | 0.9936 / 497K | 0.9985 / 186K | 0.9996 / 68K |
+| CAGRA , sift1M | 0.9305 / 1942K | 0.9782 / 1036K | 0.9948 / 533K | 0.9988 / 189K | 0.9998 / 68K |
+| ours msTuring10M_auto | 0.6230 / 1416K | 0.7653 / 729K | 0.8654 / 369K | 0.9266 / 150K | 0.9614 / 47K |
+| ours msTuring1M_auto | 0.6578 / 1453K | 0.7875 / 735K | 0.8834 / 362K | 0.9428 / 146K | 0.9758 / 47K |
+| ours sift100M_auto | 0.7246 / 18K | 0.8306 / 45K | 0.9097 / 31K | 0.9583 / 21K | 0.9829 / 11K |
+| ours sift10M_auto | 0.8315 / 1866K | 0.9208 / 1041K | 0.9703 / 553K | 0.9901 / 180K | 0.9975 / 68K |
+| ours sift1M_auto | 0.9248 / 1855K | 0.9759 / 1032K | 0.9937 / 466K | 0.9986 / 177K | 0.9996 / 68K |
+| ours sift1M_large | 0.9259 / 1947K | 0.9761 / 1033K | 0.9941 / 505K | 0.9985 / 186K | 0.9997 / 67K |
+
+**Same-period before / after (HEAD binaries 2026-11-15 `runs/opt96_before` vs this):** SIFT100M 429.09 → 429.56 s, without prune 388.0 → 373.8 s (−3.7 %); msTuring10M 86.81 → 81.19 s (−6.5 %); SIFT10M 37.59 → 36.73 s (−2.3 %). Targeted SIFT100M stages vs best: Step 4.5 26.27 → 14.92 s, optimize_chunked 42.72 → 39.47 s. Offsetting: prune 40.89 → 55.78 s and Wait 24.99 → 33.81 s — environmental (disk): the rejected run's prune binary (built 2026-11-01, no #96 code) also took 55–65 s on 2026-11-16 (load 24–35 s, same 4.50 × N rows / 105 chunks).
+
+**Verdict:** ACCEPT by rule (sift1M_auto +4.0 %, msTuring10M +3.3 %; others within ±3 %: SIFT100M −1.8 %, sift1M_large −2.8 %). **End-to-end effectively neutral** — ~14 s of compute saved on SIFT100M is hidden by ±15 s disk variance; not claimed as a speed-up. Value: GPU reverse merge is the basis for 1B / multi-GPU optimize. best.json updated (note: SIFT100M best moves 422.08 → 429.56 s).
 
 <!-- template for an accepted entry:
 ### #N — <one-line idea>  (<date>, commit <hash>)
