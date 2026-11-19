@@ -6,7 +6,10 @@ Best: `.claude/skills/optimize-bucket2-scale/state/best_scale.json` (judge keys 
 
 ## Current best
 
-_Not recorded yet — the first `/optimize-bucket2-scale` invocation is the baseline (HEAD, MGPU=2 ×3, MGPU=4 ×3 if free)._
+**G = 2: 465.78 s** (baseline 2026-11-19, HEAD 6192de7, GPUs 0,1, reps 465.78 / 488.51 / 444.00) — bucket2 364.66
+(Step 4 63.1, Step 6 233.1, Wait 29.3, Step 4.5 15.2), prune 48.5, optimize 43.9; recall@10 L 32 / 64 / 128 =
+0.7276 / 0.8348 / 0.9112, 0 defects. Run `runs/scale0_base/sift100M_auto_g2`.
+**G = 4:** not measured yet (GPUs 2,3 held by wangcy07 at baseline time).
 
 Single-GPU reference (`optimize-bucket2/state/best.json`, #96): SIFT100M 429.56 s — Step 4 101.6, Step 6 159.8,
 Wait 33.8, Step 4.5 14.9, prune 55.8, optimize 39.5; recall@10 L 32 / 64 / 128 = 0.7246 / 0.8306 / 0.9097.
@@ -45,4 +48,23 @@ _(none)_
 - **S0 (2026-11-19) — Step 6 per-GPU arrival lanes** (`ChunkedKnnAccumulator::Lane`, lock per chunk file instead of global `append_mtx`). SIFT100M G = 2 A/B, same period, alternating (`runs/mgpu/ab_lanes.out`), bucket2 s: A1 lanes 334.39 (Step 6 112.6 + 72.1, Wait 45.5), B1 lock 289.34 (53.5 + 103.8, Wait 25.9), A2 lanes 346.79 (77.5 + 122.6, Wait 45.3), B2 lock 348.17 (75.0 + 144.1, Wait 27.2). Lanes are not faster (mean 340.6 vs 318.8; noisy disk, B2 slow too), and Wait is consistently +18 s: the parallel writes fill the dirty-page budget (`nr_dirty` ~33 GB vs `nr_dirty_threshold` ~38.7 GB) so Step 6 turns disk-bound (/ ~0.29 GB/s) instead of overlapping the flush with the next round. Patch `bucketDemo/patches/scale0_lanes.patch`.
 
 ## Iterations
+
+### Baseline (2026-11-19) — HEAD 6192de7, SIFT100M MGPU=2 ×3; G=4 skipped (GPU 2,3 used by wangcy07)
+
+| stage | 1 GPU (best #96) | 2 GPUs | speedup |
+|---|---|---|---|
+| Step 4 | 101.6 | 63.1 | 1.61x |
+| Step 6 | 159.8 | 233.1 | 0.69x |
+| Wait | 33.8 | 29.3 | 1.16x |
+| prune | 55.8 | 48.5 | 1.15x |
+| optimize | 39.5 | 43.9 | 0.90x |
+| total | 429.6 | 465.8 | 0.92x |
+
+Much slower than #97's single run (317.7 s, 2026-11-16) and the same-day lock A/B runs (289.3 / 348.2): Step 6
+rounds 134.8 + 110.2 / 82.9 + 150.2 / 77.1 + 136.1 s, per-GPU `function total` up to 149 s in round 2 (vs ~80 s per
+round at 1 GPU). Step 6 is disk-bound (arrival records ~35 GB / round through one appender, / ~0.29 GB/s, 94 % full);
+no other heavy writer or memory user seen after the run (`nr_dirty_threshold` 46.7 GB). **Noise is ±5–10 % at this
+scale right now → confirm any accept candidate with an alternating A/B against HEAD (`mgpu_run.sh`, `build_wip/`).**
+Quality same as 1 GPU (0.7276 / 0.8348 / 0.9112 vs 0.7246 / 0.8306 / 0.9097). Side fix: `summarize.py` `gpus`
+now lists every device of the reps (was the first one only).
 

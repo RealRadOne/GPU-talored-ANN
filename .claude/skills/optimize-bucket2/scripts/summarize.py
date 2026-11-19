@@ -47,7 +47,7 @@ med = lambda xs: round(st.median(xs), 3)
 stage_names = [s for s in STAGES if all(s in r["stages"] for r in reps)]
 res = {
     "dataset": ds, "mode": mode, "path": reps[-1]["path"], "reps": len(reps),
-    "gpus": sorted({r["gpu"] for r in reps}),
+    "gpus": sorted({g for r in reps for g in r["gpu_list"]}),
     "num_gpus": int(os.environ.get("MGPU", "1") or 1),   # run_pipeline MGPU=G (multi-GPU build)
     "build_total_s": med([r["build_total_s"] for r in reps]),
     "build_total_all_s": [r["build_total_s"] for r in reps],
