@@ -65,6 +65,13 @@ _(none)_
 
 ## Tried & rejected
 
+- **S8 (2026-11-19) — P1 prune multi-GPU: per-GPU async writers + parallel plan / load** (each GPU plans / loads concurrently and
+  writes its own rows through its own writer thread with `pwrite` to their offsets; byte-identical, det 2 EQUAL, guard ACCEPT
+  sift10M / sift1M_large). SIFT100M G = 2 ×3: total 304.06 s (+0.1 % vs best 304.42); prune 40.9 / 40.7 / 41.0 s (best 44.64,
+  same-period HEAD 42.22 → −2.8 %); prune visible write 11.8–18.5 s (HEAD 15.9). Not eligible for the compute-gain rule:
+  prune `compute(parallel)` median 25.3 s = HEAD 25.3 s (pure I/O overlap). Real gain expected at G = 4 (shared-sink contention,
+  writer time 67.8 s vs 30.6 s at G = 2), but G = 4 skipped (GPU 0 held by wangcy07). Patch kept for a G = 4 re-judge:
+  `bucketDemo/patches/scale8_prune_async_writers.patch`.
 - **S7 (2026-11-19) — compact vector_knn.bin** (zigzag varint of nbr − gid, 256-row groups + offset table; prune / optimize /
   knn_similarity read both formats; deterministic in-order offsets). Lossless: forward + final graph byte-identical with the
   compact input, 50 004 sampled rows decode identical, knn_similarity identical, det 2 EQUAL, guard ACCEPT (+1.9 / +1.2 %). At
