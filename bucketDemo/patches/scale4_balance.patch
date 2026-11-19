@@ -1,0 +1,78 @@
+diff --git a/bucketDemo/buildBucket/src/bucket.cu b/bucketDemo/buildBucket/src/bucket.cu
+index 6c89d31..a5b1562 100644
+--- a/bucketDemo/buildBucket/src/bucket.cu
++++ b/bucketDemo/buildBucket/src/bucket.cu
+@@ -9998,16 +9998,42 @@ int run_pipeline_impl(
+                 }
+                 const auto& ord = *order_in;
+                 const int32_t npos = static_cast<int32_t>(ord.size());
+-                int64_t tot = 0;
+-                for (int32_t p = 0; p < npos; ++p) tot += reader.count(ord[static_cast<size_t>(p)]);
+                 knn_acc->set_lanes(G6);   // S2: 每张卡一条写入 lane
++                // S3 (scale loop): 按估计代价切，不按点数切。桶 c 的代价 ≈ s_c × pool_c (pool = 自己 + K 个邻居桶，
++                // 跟 max_pool_size_ub 同一个上界) + 每桶固定开销 κ × 平均 s·pool。按点数切时大桶区段的卡慢得多
++                // (SIFT100M G=2 round 1: 51.4 vs 36.9 s，0.76 vs 0.28 ms/桶；S2 之后 50.2 vs 34.5 s)。κ 扫描 (G=2, round 1 / 2 的
++                // GPU0 vs GPU1 loop): κ=0.5 45.4/39.5、39.3/30.8 s；κ=0 36.1/48.6、31.8/38.8 s → 插值平衡点 0.34 / 0.23，取 0.3。
++                // 只改分工 → vector_knn 不变。BUCKET2_S6_CUT=points 退回按点数切；BUCKET2_S6_CUT_FIXED 改 κ。
++                const char* cut_env = std::getenv("BUCKET2_S6_CUT");
++                const bool cut_by_points = cut_env && std::string(cut_env) == "points";
++                double kappa = 0.3;
++                if (const char* e = std::getenv("BUCKET2_S6_CUT_FIXED")) kappa = std::max(0.0, std::atof(e));
++                std::vector<double> wcost(static_cast<size_t>(npos));
++                double tot = 0;
++                for (int32_t p = 0; p < npos; ++p) {
++                    const int32_t c = ord[static_cast<size_t>(p)];
++                    const double s = static_cast<double>(reader.count(c));
++                    double pool = s;
++                    if (!cut_by_points)
++                        for (uint32_t k = 0; k < graph_K; ++k) {   // nprobe 展开后的图 (pool 的真实成员)
++                            const uint32_t nb = graph_ptr[static_cast<size_t>(c) * graph_K + k];
++                            if (nb < static_cast<uint32_t>(n_centroids)) pool += static_cast<double>(reader.count(static_cast<int32_t>(nb)));
++                        }
++                    wcost[static_cast<size_t>(p)] = cut_by_points ? s : s * pool;
++                    tot += wcost[static_cast<size_t>(p)];
++                }
++                if (!cut_by_points && npos > 0) {   // 每桶固定开销
++                    const double fixed = kappa * tot / npos;
++                    for (auto& w : wcost) w += fixed;
++                    tot += fixed * npos;
++                }
+                 std::vector<int32_t> cut(static_cast<size_t>(G6) + 1, npos);
+                 cut[0] = 0;
+                 {
+-                    int64_t acc_pts = 0; int g = 1;
++                    double acc_w = 0; int g = 1;
+                     for (int32_t p = 0; p < npos && g < G6; ++p) {
+-                        acc_pts += reader.count(ord[static_cast<size_t>(p)]);
+-                        if (acc_pts * G6 >= tot * g) cut[static_cast<size_t>(g++)] = p + 1;
++                        acc_w += wcost[static_cast<size_t>(p)];
++                        if (acc_w * G6 >= tot * g) cut[static_cast<size_t>(g++)] = p + 1;
+                     }
+                 }
+                 int dev0 = 0;
+diff --git a/bucketDemo/buildBucket/src/optimize_chunked.cu b/bucketDemo/buildBucket/src/optimize_chunked.cu
+index 8747b31..770ca44 100644
+--- a/bucketDemo/buildBucket/src/optimize_chunked.cu
++++ b/bucketDemo/buildBucket/src/optimize_chunked.cu
+@@ -1701,14 +1701,19 @@ struct GpuReverseMerge {
+         const size_t per_edge = sizeof(KeyT) * (segsort ? 2 : 1);
+         const size_t per_row = 12 + (segsort ? 4 : 0);
+         const uint64_t max_seg_edges = segsort ? static_cast<uint64_t>(INT32_MAX) - 1 : ~0ull;   // cub 的 int 下标
+-        const uint64_t edge_share = (G > 1) ? (n_edges + G - 1) / G : ~0ull;                      // 多卡: 每段 ≤ 1/G 的边
++        // 多卡: 段按累计边数切在 k·E/G (k = 1..G-1)，最后一段收尾。原来每段 ≤ ceil(E/G) 条边、在超出前一行停 →
++        // G 段总差几行，多出一个只有几行的尾段轮到卡 0，卡 0 为它再传一遍整张前向图、扫一遍全部边
++        // (SIFT100M: G=2 passes=3, G=4 passes=5)。显存预算 / cub 上限照旧可以多切段 (轮流分给各卡)。
+         std::vector<std::pair<int64_t, int64_t>> segs;
+         for (int64_t lo = 0; lo < N; ) {
++            const uint64_t seg_end_target = (G > 1 && static_cast<int>(segs.size()) < G - 1)
++                ? n_edges * static_cast<uint64_t>(segs.size() + 1) / static_cast<uint64_t>(G) : ~0ull;
+             int64_t hi = lo; size_t need = 0; uint64_t e_acc = 0;
+             while (hi < N) {
+                 const uint64_t ce = off[static_cast<size_t>(hi) + 1] - off[static_cast<size_t>(hi)];
+                 const size_t add = static_cast<size_t>(ce) * per_edge + per_row;
+-                if (hi > lo && (need + add + (size_t(64) << 20) > budget || e_acc + ce > max_seg_edges || e_acc + ce > edge_share)) break;
++                if (hi > lo && (need + add + (size_t(64) << 20) > budget || e_acc + ce > max_seg_edges ||
++                                off[static_cast<size_t>(hi) + 1] > seg_end_target)) break;
+                 need += add; e_acc += ce; ++hi;
+             }
+             segs.emplace_back(lo, hi);

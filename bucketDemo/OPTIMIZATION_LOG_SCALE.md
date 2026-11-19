@@ -26,16 +26,14 @@ prune 44.7, optimize 35.8); 4 GPUs 347.79 s (Step 4 42.3, Step 6 121.8, Wait 50.
 
 Item names below are backlog labels, not iteration numbers (iterations are logged as `### S<N>` under Iterations).
 
-- **S1 — done** (arrival records in RAM). **S1b:** round 2 still spills ~16.7 GB (budget full with round 1's 37.3 GB
-  kept for the deferred final merge); try spilling round-1 blocks after the deferred kth pass (read once more) so
-  round 2 stays in RAM, or a larger budget if RAM allows (shared machine; msTuring100M peak RSS already 103 GB).
+- **S1 — done** (arrival records in RAM). **S1b (next):** round 2 still spills ~16.7 GB to disk (budget 51.2 GB full with
+  round 1's 37.3 GB kept for the deferred final merge). S4 showed the G = 2 total is bound by bytes written — the spill is
+  what the final merge's write runs into. Raise the budget so both rounds fit (~71 GB; bucket2 RSS ~80 → ~97 GB, msTuring100M
+  ~103 → ~120 GB; size-gated, disk fallback stays), then re-try `scale4_balance.patch` on top.
 - **S2 — done** (per-GPU arrival lanes).
-- **S3 — Step 6 cost-based cut: re-judge when G = 4 can be measured.** Implemented and tuned (κ = 0.3), rejected at
-  G = 2 only by the 3 % rule (details under Tried & rejected); G = 4 has the larger imbalance (per-GPU loops 18.6–30.3 s
-  after S2) and was busy both times. Next time all four GPUs are free at a test phase: `git apply
-  bucketDemo/patches/scale3_cost_cut_k03.patch` and run det 2 / 4 + G = 2 / 4 (single-GPU path unaffected: G = 1 makes
-  no cut). Or combine with the next Step 6 change.
-- **S4 — per-GPU setup.** `gpu_buffer_alloc` 0.2–0.9 s per GPU per round, `future_access` 0.16–0.68 s; Step 4
+- **S3 / S4 — load balance (Step 6 cost cut + optimize segment cut):** real per-stage gains, rejected because the disk-bound
+  Wait absorbs them at G = 2 (see Tried & rejected). Re-try `bucketDemo/patches/scale4_balance.patch` after S1b, and at G = 4.
+- **S8 — per-GPU setup.** `gpu_buffer_alloc` 0.2–0.9 s per GPU per round, `future_access` 0.16–0.68 s; Step 4
   per-GPU convert_upload doubling at G = 4 (shared H2D, NUMA). Pin host threads / staging to the GPU's NUMA node;
   allocate once for both rounds.
 - **S5 — prune multi-GPU.** 55.8 → 42.6 (G = 2) / 50.0 s (G = 4): per-GPU `load` and `d2h+sink` dominate; the sink
@@ -52,6 +50,16 @@ _(none)_
 
 ## Tried & rejected
 
+- **S4 (2026-11-19) — multi-GPU load balance = S3 cost cut (κ = 0.3) + optimize_chunked segment cut.** The segment fix:
+  dst segments were capped at ceil(E/G) edges and stopped one row short → a tiny extra segment went to GPU 0, which re-uploaded
+  the whole forward graph for a few rows (G = 2 passes 3 → 2, fill 9.3 → 5.3 s; byte-identical). det 2 EQUAL, guard ACCEPT.
+  Judged G = 2: 304.42 s (+1.0 % vs best 307.50; reps 304.4 / 299.4 / 365.0), same-period HEAD ref 325.6 s. Interleaved A/B
+  (`runs/scale4/ab.out`, HEAD / S4 total s): 311.0 / 312.1, 361.1 (optimize 82.7, disk) / 304.5, 306.5 / 302.1 → S4 wins 2 of 3,
+  median −2.1 % (bucket2 −3.6 %). **Why the gain does not reach the total:** Step 6 is ~14 s faster every time, but Wait grows by
+  about the same (A1 38.1 vs B1 25.4 s): finishing Step 6 earlier makes the final merge's 25.6 GB vector_knn write hit the
+  not-yet-flushed dirty pages (data_reordered 12.8 GB + round-2 arrival spill 16.7 GB) → G = 2 end-to-end is bound by bytes
+  written. optimize's GPU saving is hidden the same way (its tail is the 12.8 GB final write). G = 4 skipped (wangcy07).
+  Patch `bucketDemo/patches/scale4_balance.patch` (bucket.cu + optimize_chunked.cu). Re-try after fewer bytes go to disk (S1b).
 - **S3 (2026-11-19) — Step 6 cut by estimated cost** (s·pool over the nprobe-expanded graph + κ·mean, instead of point
   count). Balances the GPUs: G = 2 round-1 loops 50.2 / 34.6 s (points) → 42.4 / 42.6 s (κ = 0.3); Step 6 99.3 → 85.1 s.
   κ sweep (same period, timing only, `runs/scale3/ab.out`): HEAD 312.9, κ = 0.5 303.0, κ = 0 299.0 s (κ = 0 overshoots,
