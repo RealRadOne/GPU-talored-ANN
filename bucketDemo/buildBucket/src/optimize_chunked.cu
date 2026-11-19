@@ -107,6 +107,15 @@ static void parallel_pread_file(const std::string& path, off_t off, size_t bytes
 
 // 两块 64 MB pinned 暂存区双缓冲的 H2D / 按行块 D2H (DMA 跟 host 拷贝 / sink 重叠)，
 // 免掉整块 cudaMallocHost (1.28 GB 要 0.7 s) 或 pageable 整块拷贝
+// S10: staging memcpy 的 OpenMP 线程数。多卡时每张卡的线程各自开一个 team，默认 80 线程 × G 个 team 互相抢核 /
+// 内存带宽，H2D 掉到 ~2.4 GB/s/卡 (SIFT100M G=2 count 阶段)；每个 team 只用几个线程就够喂满 PCIe
+// (SIFT10M G=2: count h2d 0.23 → 0.10 s)。G = 1 不变 (0 = OpenMP 默认)。OC_STAGE_THREADS 覆盖 (测试用)。
+static int g_stage_threads = 0;
+static int stage_threads() {
+    static const int env = [] { const char* e = std::getenv("OC_STAGE_THREADS"); return e ? std::max(1, std::atoi(e)) : 0; }();
+    if (env > 0) return env;
+    return g_stage_threads > 0 ? g_stage_threads : omp_get_max_threads();
+}
 struct PinnedStaging {
     static constexpr size_t kChunk = size_t(64) << 20;
     void* pin[2] = {nullptr, nullptr};
@@ -132,7 +141,7 @@ struct PinnedStaging {
             const size_t n = std::min(kChunk, bytes - off);
             if (used[b]) CUDA_CHECK(cudaEventSynchronize(ev[b]));
             const int64_t pieces = static_cast<int64_t>((n + (size_t(1) << 20) - 1) >> 20);
-            #pragma omp parallel for schedule(static)
+            #pragma omp parallel for schedule(static) num_threads(stage_threads())
             for (int64_t i = 0; i < pieces; ++i) {
                 const size_t o = static_cast<size_t>(i) << 20;
                 std::memcpy(static_cast<char*>(pin[b]) + o, static_cast<const char*>(h) + off + o,
@@ -159,7 +168,7 @@ struct PinnedStaging {
             CUDA_CHECK(cudaEventSynchronize(ev[b]));
             const size_t n = std::min(kChunk, bytes - off);
             const int64_t pieces = static_cast<int64_t>((n + (size_t(1) << 20) - 1) >> 20);
-            #pragma omp parallel for schedule(static)
+            #pragma omp parallel for schedule(static) num_threads(stage_threads())
             for (int64_t i = 0; i < pieces; ++i) {
                 const size_t o = static_cast<size_t>(i) << 20;
                 std::memcpy(static_cast<char*>(h) + off + o, static_cast<const char*>(pin[b]) + o,
@@ -1670,7 +1679,11 @@ struct GpuReverseMerge {
         {
             std::vector<std::vector<uint32_t>> part(static_cast<size_t>(G));
             std::vector<double> th2d(static_cast<size_t>(G), 0.0);
+            std::vector<double> c_setup(static_cast<size_t>(G), 0.0), c_loop(static_cast<size_t>(G), 0.0), c_d2h(static_cast<size_t>(G), 0.0);
+            const auto q_spawn = Clock::now();
             run_on_gpus([&](int g) {
+                auto qg = Clock::now();
+                c_setup[static_cast<size_t>(g)] = std::chrono::duration<double>(qg - q_spawn).count();   // 线程启动 + setDevice (含 context 创建)
                 PinnedStaging stg;
                 uint32_t* d_fwd = nullptr; uint32_t* d_cnt = nullptr; unsigned long long* d_bad = nullptr;
                 CUDA_CHECK(cudaMalloc(&d_fwd, static_cast<size_t>(batch_rows) * K * sizeof(uint32_t)));
@@ -1679,12 +1692,14 @@ struct GpuReverseMerge {
                 CUDA_CHECK(cudaMemset(d_cnt, 0, static_cast<size_t>(N) * sizeof(uint32_t)));
                 CUDA_CHECK(cudaMemset(d_bad, 0, sizeof(unsigned long long)));
                 const int64_t r_lo = N * g / G, r_hi = N * (g + 1) / G;
+                c_setup[static_cast<size_t>(g)] += secs(qg); qg = Clock::now();
                 for_each_batch(stg, d_fwd, r_lo, r_hi, th2d[static_cast<size_t>(g)], [&](int64_t, uint32_t rows) {
                     const uint64_t ne = static_cast<uint64_t>(rows) * K;
                     kern_rev_count<<<static_cast<unsigned>((ne + 255) / 256), 256>>>(d_fwd, ne, static_cast<uint64_t>(N), d_cnt, d_bad);
                     CUDA_CHECK(cudaGetLastError());
                 });
                 CUDA_CHECK(cudaDeviceSynchronize());
+                c_loop[static_cast<size_t>(g)] = secs(qg); qg = Clock::now();
                 unsigned long long h_bad = 0;
                 CUDA_CHECK(cudaMemcpy(&h_bad, d_bad, sizeof(h_bad), cudaMemcpyDeviceToHost));
                 if (h_bad) throw std::runtime_error("GpuReverseMerge: " + std::to_string(h_bad) + " forward entries >= N");
@@ -1692,7 +1707,10 @@ struct GpuReverseMerge {
                 c.resize(static_cast<size_t>(N));
                 stg.d2h(c.data(), d_cnt, c.size() * sizeof(uint32_t));
                 CUDA_CHECK(cudaFree(d_fwd)); CUDA_CHECK(cudaFree(d_cnt)); CUDA_CHECK(cudaFree(d_bad));
+                c_d2h[static_cast<size_t>(g)] = secs(qg);
             });
+            const double c_gpu = secs(q_spawn);
+            auto qh = Clock::now();
             for (double x : th2d) t_h2d = std::max(t_h2d, x);
             if (G > 1) {
                 #pragma omp parallel for schedule(static)
@@ -1702,9 +1720,15 @@ struct GpuReverseMerge {
                     part[0][static_cast<size_t>(j)] = sum;
                 }
             }
+            const double c_sum = secs(qh); qh = Clock::now();
             const auto& cnt = part[0];
             off[0] = 0;
             for (int64_t j = 0; j < N; ++j) off[static_cast<size_t>(j) + 1] = off[static_cast<size_t>(j)] + cnt[static_cast<size_t>(j)];
+            const double c_pre = secs(qh);
+            std::cout << std::fixed << std::setprecision(2) << "  [Timing] GPU reverse count detail: alloc(off)+gpu=" << c_gpu
+                      << "s [per GPU setup/loop/d2h:";
+            for (int g = 0; g < G; ++g) std::cout << " " << c_setup[static_cast<size_t>(g)] << "/" << c_loop[static_cast<size_t>(g)] << "(h2d " << th2d[static_cast<size_t>(g)] << ")/" << c_d2h[static_cast<size_t>(g)];
+            std::cout << "] host sum=" << c_sum << "s prefix=" << c_pre << "s\n";
         }
         n_edges = off[static_cast<size_t>(N)];
         if (n_edges != n_elems) throw std::runtime_error("GpuReverseMerge: edge count mismatch");
@@ -2210,9 +2234,31 @@ static void run_method_E(
     GpuReverseMerge grev;
     std::unique_ptr<uint32_t[]> h_fwd_all;   // gpu_rev: 整张前向图 (反向边的源表 + 合并的底稿)
     if (gpu_rev) {
+        // S10: 多卡时读前向图 (磁盘, 数秒) 的同时在后台给每张卡建 CUDA context、打开 P2P，
+        // 免得 GpuReverseMerge 的 count 阶段第一次碰其他卡时才付这笔开销 (OC_GPU_WARMUP=0 关掉)
+        std::vector<std::thread> warm;
+        if (g_num_gpus > 1 && !(std::getenv("OC_GPU_WARMUP") && std::getenv("OC_GPU_WARMUP")[0] == '0')) {
+            int dev0 = 0;
+            CUDA_CHECK(cudaGetDevice(&dev0));
+            const int G = g_num_gpus;
+            for (int g = 0; g < G; ++g)
+                warm.emplace_back([g, G, dev0] {   // 设备映射同 GpuReverseMerge::dev_of
+                    auto dev_of = [dev0](int x) { return x == 0 ? dev0 : x; };
+                    if (cudaSetDevice(dev_of(g)) != cudaSuccess) { (void)cudaGetLastError(); return; }
+                    (void)cudaFree(nullptr);
+                    for (int h = 0; h < G; ++h) {
+                        if (h == g) continue;
+                        int can = 0;
+                        if (cudaDeviceCanAccessPeer(&can, dev_of(g), dev_of(h)) == cudaSuccess && can)
+                            (void)cudaDeviceEnablePeerAccess(dev_of(h), 0);
+                    }
+                    (void)cudaGetLastError();   // AlreadyEnabled 等无害错误清掉
+                });
+        }
         h_fwd_all.reset(new uint32_t[static_cast<size_t>(N) * K_out]);
         parallel_pread_file(fwd_path, static_cast<off_t>(sizeof(int64_t) + sizeof(int32_t)),
                             static_cast<size_t>(N) * K_out * sizeof(uint32_t), h_fwd_all.get());
+        for (auto& t : warm) t.join();
         const double t_phase1 = std::chrono::duration<double>(Clock::now() - tA).count();
         std::cout << "  [Timing] Phase 1 (read forward graph for the GPU reverse + merge) = " << std::fixed
                   << std::setprecision(2) << t_phase1 << "s\n";
@@ -2633,6 +2679,7 @@ int main(int argc, char** argv)
             int ndev = 0;
             if (cudaGetDeviceCount(&ndev) != cudaSuccess) ndev = 0;
             g_num_gpus = std::max(1, vm["num-gpus"].as<int>());
+            if (g_num_gpus > 1) g_stage_threads = std::max(4, omp_get_max_threads() / (4 * g_num_gpus));
             if (g_num_gpus > std::max(ndev, 1))
                 throw std::runtime_error("--num-gpus " + std::to_string(g_num_gpus) + " > visible CUDA devices");
         }

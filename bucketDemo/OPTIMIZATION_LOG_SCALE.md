@@ -10,7 +10,9 @@ as reference.
 
 ## Current best
 
-**G = 2: 304.42 s** (S4 re-judged 2026-11-19, "accepted (compute gain, disk-bound)"; reps 304.4 / 299.4 / 365.0, GPUs 0,1;
+**G = 2: 290.97 s** (S10, 2026-11-19, GPUs 2,3, `runs/scale10/sift100M_auto_g2`) — bucket2 214.1 (Step 4 61.4, Step 6 84.9,
+Wait 26.4), prune 46.3, optimize 30.0; recall@10 0.7267 / 0.8340 / 0.9109 (same-period HEAD ref 293.27 s — faster disk period).
+Previous: **304.42 s** (S4 re-judged 2026-11-19, "accepted (compute gain, disk-bound)"; reps 304.4 / 299.4 / 365.0, GPUs 0,1;
 `runs/scale4/sift100M_auto_g2`) — Step 6 85.2, Wait 33.5, optimize 35.0; recall@10 0.7272 / 0.8334 / 0.9120. Previous best
 307.50 (S1). S9 (optimize src-split) accepted under the compute-gain rule without a new best (311.50 s, slow-disk period). Compute metrics for the fast-disk re-check are in the S3 / S4 re-judge entry below.
 **G = 4: 259.46 s** (S2, 2026-11-19, GPUs 0–3, reps 258.90 / 259.46 / 259.76) — bucket2 171.94 (Step 4 42.4,
@@ -30,8 +32,10 @@ prune 44.7, optimize 35.8); 4 GPUs 347.79 s (Step 4 42.3, Step 6 121.8, Wait 50.
 
 Item names below are backlog labels, not iteration numbers (iterations are logged as `### S<N>` under Iterations).
 
-- **S10 — optimize count phase (4.2 s at G = 2):** each GPU D2Hs a full N×4 B count array and the host sums G arrays +
+- **S10 — done (partly: warm-up + staging threads; GPU-side count reduction not done).** optimize count phase (4.2 s at G = 2): each GPU D2Hs a full N×4 B count array and the host sums G arrays +
   serial prefix over N; reduce on GPU (peer add into GPU 0, or per-GPU dst-range counts) + parallel prefix.
+- **S12 — per-GPU OpenMP oversubscription elsewhere:** prune_windowed per-GPU load / sink and bucket2 per-GPU host loops
+  run `omp parallel` from G threads at once (as optimize staging did before S10); cap team sizes per GPU thread.
 - **S11 — re-judge S8 (prune async writers) at G = 4** when all four GPUs are free (patch kept).
 
 **User priority (2026-11-19): after S7 (compact vector_knn), do these two next, in this order. Both implementation-level;
@@ -250,3 +254,38 @@ reps that also slowed the unchanged prune). Expected larger at G = 4 (each GPU u
 | speedup vs 1 GPU (429.56 s) | Step 4 | Step 6 | Wait | prune | optimize | total |
 |---|---|---|---|---|---|---|
 | G = 2 (S9) | 1.65× | 1.87× | 1.18× | 1.05× | 1.02× | 1.38× |
+
+### S10 — optimize: GPU context warm-up + per-GPU staging threads — accepted (2026-11-19)
+
+**Idea.** Breakdown of the GpuReverseMerge count phase at SIFT100M G = 2 (new `[Timing] GPU reverse count detail` line):
+count 4.31 s = per-GPU loop 2.25–2.63 s (H2D only ~2.4 GB/s per GPU) + D2H 0.6–0.7 s + `off` alloc ~0.65 s + prefix 0.16 s;
+the first touch of GPU g ≠ 0 also paid its CUDA context (SIFT10M: setup 0.48 s). Two implementation fixes:
+(1) while the forward graph is read from disk, background threads create every GPU's context and enable P2P
+(`OC_GPU_WARMUP=0` disables); (2) `PinnedStaging` memcpy used one 80-thread OpenMP team *per GPU thread* → G × 80 threads
+fight for cores / memory bandwidth; microbenchmark: 2 concurrent stagings reach 4.5–9 GB/s per GPU with 4–16 threads.
+For G > 1 each staging now uses max(4, omp_max / (4G)) threads (G = 1 unchanged; `OC_STAGE_THREADS` overrides).
+Sources: TAGORE `large_index.cu` per-device threads set up before the pipeline; cuVS `cagra_build.cuh::build_knn_graph`
+pinned double buffers. Class: implementation (det byte-identical).
+
+**Correctness.** det 2 EQUAL plain / `OC_GPU_PHASE2=0` / `+ OC_GPU_REV_BUDGET_MB=300` (3 rounds). Guard ACCEPT.
+SIFT10M G = 2 probes: count 1.01 → 0.68 s (warm-up), count H2D 0.23 → 0.10 s (8 / 4 threads); G = 1: no change.
+G = 4 skipped (GPU 0,1 held by wangcy07).
+
+**SIFT100M G = 2 ×3 (GPUs 2,3).** **290.97 s, −4.4 % vs best 304.42 → ACCEPT (new best).** Reps bucket2 214.1 / 217.9 /
+214.0, prune 43.6 / 46.3 / 47.0, optimize 32.1 / 29.4 / 30.0. Recall@10 0.7267 / 0.8340 / 0.9109. Note: same-period HEAD
+ref (`OC_GPU_WARMUP=0 OC_STAGE_THREADS=80`) total 293.27 s (bucket2 215.2, prune 46.1, optimize 31.98) — most of the −4.4 %
+vs best is the faster disk period; the attributable gain is optimize −2.0 s (−6 %):
+
+| optimize GPU reverse + merge | same-period ref | S10 median of 3 |
+|---|---|---|
+| count | 4.33 s | 3.32 s (−23 %) |
+| fill | 4.51 s | 3.74 s (−17 %) |
+| count + fill + select | 9.68 s | 7.56 s (−22 %) |
+| count H2D (slow / fast GPU) | 2.26 / 1.54 s | 1.83 / 0.88 s |
+
+| speedup vs 1 GPU (429.56 s) | Step 4 | Step 6 | Wait | prune | optimize | total |
+|---|---|---|---|---|---|---|
+| G = 2 (S10) | 1.66× | 1.88× | 1.28× | 1.21× | 1.32× | 1.48× |
+
+Follow-up: the same per-GPU-thread OpenMP oversubscription may exist in prune_windowed's per-GPU loaders and bucket2's
+per-GPU Step 4 / Step 6 host loops (backlog S12).
