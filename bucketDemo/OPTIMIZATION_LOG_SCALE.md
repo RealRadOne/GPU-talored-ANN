@@ -37,6 +37,10 @@ Item names below are backlog labels, not iteration numbers (iterations are logge
   (forward graph write, 12.8 GB, disk-bound) is shared. Look at per-GPU sinks / output ranges.
 - **S6 — Wait (final merge) 25–26 s at G = 2 and 4:** reads ~37 GB in RAM + 16.7 GB spilled + writes vector_knn
   (25.6 GB, disk-bound). Tied to S1b; could stream the final rows straight to prune instead of the file (bigger change).
+- **S9 — compact vector_knn file (measured, not implemented).** sift10M vector_knn: varint(nbr − gid) 3.03 B/id, sorted deltas + order
+  permutation 2.67 B/id vs 4 B fixed → 25.6 GB → ~17–19 GB at 100M. Needs a block-indexed format read by prune_windowed (range loads)
+  and the eval script (knn_similarity); saving ~7 GB of a dirty-throttled write. Pattern from S3–S6: at G = 2 savings in one stage
+  move to another (disk / memory bandwidth) — only fewer total bytes help.
 - **S7 — optimize_chunked source-row split** (was S2). `GpuReverseMerge` re-uploads the whole forward graph per GPU
   per dst segment; but at G = 2 Phase 2 is 35.8 s of which GPU work ~20.7 s and the rest the in-process translate +
   12.8 GB final write (disk-bound) → at most a few seconds. Source: cuVS `mg/snmg.cuh` sharded build.
@@ -47,6 +51,11 @@ _(none)_
 
 ## Tried & rejected
 
+- **S6 (2026-11-19) — data_reordered (12.8 GB) written in the background in blob mode** (`write_reordered_async`, join before round-2
+  Step 4 and at exit) instead of synchronously in Step 4.5. Step 4.5 15.3 → 4.6 s, but round-1 Step 6 99 → 110.6 s (the background
+  write competes for memory bandwidth / page cache while Step 6 reads the host blob) → G = 2 323.11 s (−5.1 % vs best), same-period
+  HEAD ref 314.95 s (bucket2 231.2 vs 235.8). Quality unchanged (file intact). Guard: sift1M_large −3.5 % (noise-level; Step 4.5 is
+  0.04 s there), sift10M +2.2 %. det 2 EQUAL. G = 4 skipped. Patch `bucketDemo/patches/scale6_async_reorder_write.patch`.
 - **S5 (2026-11-19) — S1b: arrival budget 51.2 → 75 GB** (`dataset_env.py` ARRIVAL_MEM_MB = 3/8 HOST_BUDGET) so round 2 does not
   spill (33.0 of 33.0 GB in RAM, 70.7 GB held). G = 2 311.63 s (−1.3 % vs best; reps 311.3 / 316.1 / 311.6), same-period ref with
   51.2 GB: bucket2 230.95 vs 229.61 s → no gain; Step 6 99.2 s and Wait 27.6 s unchanged; peak RSS 80.4 → 92.8 GB. **Finding:** the
