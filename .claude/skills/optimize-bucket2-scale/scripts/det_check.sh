@@ -3,14 +3,15 @@
 # 1 GPU and with G GPUs on the same dataset; every artifact must be byte-identical.
 #   det_check.sh DATASET G [WORKROOT]      (DATASET: sift10M recommended, ~3 min for both builds)
 # Prints one line per artifact and a final "EQUAL" or "MISMATCH" line; exit 0 = EQUAL. Deletes its work dirs.
+# GPU_WAIT lines of mgpu_run.sh go to stderr (chains: `det_check.sh ... > det2.txt`, stderr to chain.out for the Monitor).
 # Only meaningful on free GPUs (Step 4 batch size follows free GPU memory); mgpu_run.sh waits for them.
 set -uo pipefail
 DS=$1; G=$2
 T=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 W=${3:-/home/lanlu/microBenchmark/bucketDemo/buildBucket/runs/det_check_$$}
 export BUCKET2_ASSIGN_DETERMINISTIC=1 BUCKET2_STEP4_CHECKSUM=1
-bash $T/mgpu_run.sh $DS 1 $W/g1 | tail -1 || { echo "MISMATCH (G=1 build failed)"; exit 1; }
-bash $T/mgpu_run.sh $DS $G $W/g$G | tail -1 || { echo "MISMATCH (G=$G build failed)"; rm -rf $W; exit 1; }
+bash $T/mgpu_run.sh $DS 1 $W/g1 | tee >(grep --line-buffered GPU_WAIT >&2) | tail -1 || { echo "MISMATCH (G=1 build failed)"; exit 1; }
+bash $T/mgpu_run.sh $DS $G $W/g$G | tee >(grep --line-buffered GPU_WAIT >&2) | tail -1 || { echo "MISMATCH (G=$G build failed)"; rm -rf $W; exit 1; }
 a=$(ls -d $W/g1/work/k*/ | head -1); b=$(ls -d $W/g$G/work/k*/ | head -1)
 ok=1
 for f in inverse_perm.bin bucket_offsets.bin vector_knn.bin forward_graph_reordered.bin final_graph.bin; do

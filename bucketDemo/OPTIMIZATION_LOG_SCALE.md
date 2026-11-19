@@ -30,10 +30,11 @@ Item names below are backlog labels, not iteration numbers (iterations are logge
   kept for the deferred final merge); try spilling round-1 blocks after the deferred kth pass (read once more) so
   round 2 stays in RAM, or a larger budget if RAM allows (shared machine; msTuring100M peak RSS already 103 GB).
 - **S2 — done** (per-GPU arrival lanes).
-- **S3 — Step 6 cost-based cut (next).** Point-count cuts leave GPU 0 (large buckets first in the order) GPU-bound:
-  G = 2 after S2 round 1 50.2 vs 34.5 s loop, G = 4 30.3 vs 18.6 s. Patch ready (built once, never timed):
-  `bucketDemo/patches/scale3_cost_cut_untested.patch` — cost = s·pool (nprobe-expanded graph) + κ·mean, κ = 0.5
-  (fitted 0.35 / 0.67 from #97 / S1 per-GPU times), env `BUCKET2_S6_CUT=points` / `BUCKET2_S6_CUT_FIXED`.
+- **S3 — Step 6 cost-based cut: re-judge when G = 4 can be measured.** Implemented and tuned (κ = 0.3), rejected at
+  G = 2 only by the 3 % rule (details under Tried & rejected); G = 4 has the larger imbalance (per-GPU loops 18.6–30.3 s
+  after S2) and was busy both times. Next time all four GPUs are free at a test phase: `git apply
+  bucketDemo/patches/scale3_cost_cut_k03.patch` and run det 2 / 4 + G = 2 / 4 (single-GPU path unaffected: G = 1 makes
+  no cut). Or combine with the next Step 6 change.
 - **S4 — per-GPU setup.** `gpu_buffer_alloc` 0.2–0.9 s per GPU per round, `future_access` 0.16–0.68 s; Step 4
   per-GPU convert_upload doubling at G = 4 (shared H2D, NUMA). Pin host threads / staging to the GPU's NUMA node;
   allocate once for both rounds.
@@ -51,6 +52,14 @@ _(none)_
 
 ## Tried & rejected
 
+- **S3 (2026-11-19) — Step 6 cut by estimated cost** (s·pool over the nprobe-expanded graph + κ·mean, instead of point
+  count). Balances the GPUs: G = 2 round-1 loops 50.2 / 34.6 s (points) → 42.4 / 42.6 s (κ = 0.3); Step 6 99.3 → 85.1 s.
+  κ sweep (same period, timing only, `runs/scale3/ab.out`): HEAD 312.9, κ = 0.5 303.0, κ = 0 299.0 s (κ = 0 overshoots,
+  0.5 undershoots). Judged runs: κ = 0.5 308.22 s (−0.2 %, GPUs 2,3, `runs/scale3`), κ = 0.3 **302.20 s (+1.7 % vs
+  best 307.50)** (`runs/scale3k`), same-period HEAD reference 311.3 s (−2.9 % total, bucket2 232.0 → 215.1). Below the
+  3 % bar because the untouched stages were slower in these runs (prune 47–48 vs 42.6, optimize 40 vs 34.9 s). det 2
+  EQUAL (κ 0.5 and 0.3); single-GPU guard ACCEPT (sift10M +3.5 %, sift1M +3.1 %). G = 4 skipped twice (wangcy07).
+  Patch `bucketDemo/patches/scale3_cost_cut_k03.patch` (κ = 0.3 default; env `BUCKET2_S6_CUT=points`, `BUCKET2_S6_CUT_FIXED`).
 - **S0 (2026-11-19) — Step 6 per-GPU arrival lanes** (`ChunkedKnnAccumulator::Lane`, lock per chunk file instead of global `append_mtx`). SIFT100M G = 2 A/B, same period, alternating (`runs/mgpu/ab_lanes.out`), bucket2 s: A1 lanes 334.39 (Step 6 112.6 + 72.1, Wait 45.5), B1 lock 289.34 (53.5 + 103.8, Wait 25.9), A2 lanes 346.79 (77.5 + 122.6, Wait 45.3), B2 lock 348.17 (75.0 + 144.1, Wait 27.2). Lanes are not faster (mean 340.6 vs 318.8; noisy disk, B2 slow too), and Wait is consistently +18 s: the parallel writes fill the dirty-page budget (`nr_dirty` ~33 GB vs `nr_dirty_threshold` ~38.7 GB) so Step 6 turns disk-bound (/ ~0.29 GB/s) instead of overlapping the flush with the next round. Patch `bucketDemo/patches/scale0_lanes.patch`.
 
 ## Iterations
