@@ -138,7 +138,7 @@ R=/home/lanlu/microBenchmark/bucketDemo/buildBucket/runs/scale<N>
 bash $T/det_check.sh sift10M 2 > $R/det2.txt          # + "4" if all four GPUs are free
 bash $S/run_pipeline.sh -d sift10M -m auto  -o $R/sift10M_auto     # single-GPU guard
 bash $S/run_pipeline.sh -d sift1M  -m large -o $R/sift1M_large
-python3 $S/judge.py $R/sift10M_auto $R/sift1M_large --quick        # vs optimize-bucket2 best.json
+python3 $S/judge.py $R/sift10M_auto $R/sift1M_large --quick --no-mem   # vs optimize-bucket2 best.json (RSS not gated)
 MGPU=2 bash $S/run_pipeline.sh -d sift100M -m auto -o $R/sift100M_auto_g2
 MGPU=4 bash $S/run_pipeline.sh -d sift100M -m auto -o $R/sift100M_auto_g4   # only if all 4 free at this point
 ```

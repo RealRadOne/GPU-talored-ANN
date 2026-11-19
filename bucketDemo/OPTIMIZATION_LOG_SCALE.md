@@ -9,7 +9,12 @@ Best: `.claude/skills/optimize-bucket2-scale/state/best_scale.json` (judge keys 
 **G = 2: 307.50 s** (S1, 2026-11-19, GPUs 0,1, reps 315.50 / 307.50 / 307.01) — bucket2 229.49 (Step 4 62.3,
 Step 6 99.4, Wait 25.1, Step 4.5 15.2), prune 42.9, optimize 37.4; recall@10 L 32 / 64 / 128 = 0.7254 / 0.8351 /
 0.9115, 0 defects; bucket2 peak RSS 80.4 GB. Run `runs/scale1/sift100M_auto_g2`. Baseline was 465.78 s (`runs/scale0_base`).
-**G = 4:** not measured yet (GPUs 2,3 held by wangcy07 at baseline time).
+**G = 4: 259.46 s** (S2, 2026-11-19, GPUs 0–3, reps 258.90 / 259.46 / 259.76) — bucket2 171.94 (Step 4 42.4,
+Step 6 63.3, Wait 25.9), prune 50.0, optimize 37.6; recall@10 0.7257 / 0.8324 / 0.9105; peak RSS 83.3 GB.
+Run `runs/scale2/sift100M_auto_g4`. (S1 HEAD G = 4: 294.57 s, `runs/scale1m/sift100M_auto_g4`.)
+**msTuring100M G = 2 (milestone, S1 HEAD, ×1): 607.54 s** (1 GPU best 741.0) — bucket2 453.8 (Step 4 151.3, Step 6
+127.3, Wait 29.2), prune 109.3, optimize 44.4; recall@10 L 32 / 64 / 128 = 0.6108 / 0.7186 / 0.8024 (1 GPU 0.6117 /
+0.7151 / 0.8020); peak RSS 102.7 GB. Run `runs/scale1m/msTuring100M_auto_g2`.
 
 Single-GPU reference (`optimize-bucket2/state/best.json`, #96): SIFT100M 429.56 s — Step 4 101.6, Step 6 159.8,
 Wait 33.8, Step 4.5 14.9, prune 55.8, optimize 39.5; recall@10 L 32 / 64 / 128 = 0.7246 / 0.8306 / 0.9097.
@@ -19,24 +24,26 @@ prune 44.7, optimize 35.8); 4 GPUs 347.79 s (Step 4 42.3, Step 6 121.8, Wait 50.
 
 ## Ideas backlog (largest multi-GPU gap first)
 
-- **S1 — done (S1, accepted):** arrival records in host memory up to `--arrival-mem-mb` (51.2 GB). Left over:
-  round 2 still spills ~16.7 GB (budget full with round 1's 37.3 GB kept for the deferred final merge) →
-  **S1b**: round-2 Step 6 46 s vs round-1 53 s; try a larger budget only if RAM allows (shared machine), or
-  give round 2 priority by spilling round-1 records after the deferred kth pass (they are read only once more).
-  Also still one appender thread (`append_mtx`) — now cheap (pointer swap per 256 KB), re-check its wait share.
-- **S2 — optimize_chunked source-row split.** `GpuReverseMerge` re-uploads the whole forward graph per GPU per
-  dst segment (H2D 3.8 / 7.9 / 12.1 s at G = 1 / 2 / 4). Each GPU uploads only its source rows once, scatters
-  edges to the dst owner over NVLink (peer copies), owner selects + merges. Byte-identical to CPU (top-K is
-  decomposable, keys distinct). Source: cuVS `mg/snmg.cuh` sharded build + `sharded_search_with_direct_merge`.
-- **S3 — Step 6 load balance.** Cuts by point count; per-GPU loop times 31 / 41 / 50 / 59 s at G = 4 (part of it
-  is lock waiting). Cut by estimated cost (bucket size × pool size) instead.
-- **S4 — per-GPU setup.** `gpu_buffer_alloc` 0.26–1.26 s per GPU per round, `future_access` 0.16–0.68 s;
-  Step 4 per-GPU index setup + convert_upload doubling at G = 4 (shared H2D, NUMA). Pin host threads / staging
-  to the GPU's NUMA node; allocate once for both rounds.
-- **S5 — prune multi-GPU.** 55.8 → 44.7 / 45.8 s: per-GPU `load` 4.9–8.8 s and `d2h+sink` 15.8–22 s dominate;
-  the sink (forward graph write) is shared. Look at per-GPU sinks / output ranges.
-- **S6 — Wait (background merge) grows with G** (25 → 51 s at G = 4): more dirty data to flush when the merge
-  runs. Tied to S1.
+Item names below are backlog labels, not iteration numbers (iterations are logged as `### S<N>` under Iterations).
+
+- **S1 — done** (arrival records in RAM). **S1b:** round 2 still spills ~16.7 GB (budget full with round 1's 37.3 GB
+  kept for the deferred final merge); try spilling round-1 blocks after the deferred kth pass (read once more) so
+  round 2 stays in RAM, or a larger budget if RAM allows (shared machine; msTuring100M peak RSS already 103 GB).
+- **S2 — done** (per-GPU arrival lanes).
+- **S3 — Step 6 cost-based cut (next).** Point-count cuts leave GPU 0 (large buckets first in the order) GPU-bound:
+  G = 2 after S2 round 1 50.2 vs 34.5 s loop, G = 4 30.3 vs 18.6 s. Patch ready (built once, never timed):
+  `bucketDemo/patches/scale3_cost_cut_untested.patch` — cost = s·pool (nprobe-expanded graph) + κ·mean, κ = 0.5
+  (fitted 0.35 / 0.67 from #97 / S1 per-GPU times), env `BUCKET2_S6_CUT=points` / `BUCKET2_S6_CUT_FIXED`.
+- **S4 — per-GPU setup.** `gpu_buffer_alloc` 0.2–0.9 s per GPU per round, `future_access` 0.16–0.68 s; Step 4
+  per-GPU convert_upload doubling at G = 4 (shared H2D, NUMA). Pin host threads / staging to the GPU's NUMA node;
+  allocate once for both rounds.
+- **S5 — prune multi-GPU.** 55.8 → 42.6 (G = 2) / 50.0 s (G = 4): per-GPU `load` and `d2h+sink` dominate; the sink
+  (forward graph write, 12.8 GB, disk-bound) is shared. Look at per-GPU sinks / output ranges.
+- **S6 — Wait (final merge) 25–26 s at G = 2 and 4:** reads ~37 GB in RAM + 16.7 GB spilled + writes vector_knn
+  (25.6 GB, disk-bound). Tied to S1b; could stream the final rows straight to prune instead of the file (bigger change).
+- **S7 — optimize_chunked source-row split** (was S2). `GpuReverseMerge` re-uploads the whole forward graph per GPU
+  per dst segment; but at G = 2 Phase 2 is 35.8 s of which GPU work ~20.7 s and the rest the in-process translate +
+  12.8 GB final write (disk-bound) → at most a few seconds. Source: cuVS `mg/snmg.cuh` sharded build.
 
 ## Awaiting approval
 
@@ -99,4 +106,30 @@ now lists every device of the reps (was the first one only).
 | prune | 55.8 | 42.9 | 1.30x |
 | optimize | 39.5 | 37.4 | 1.05x |
 | total | 429.6 | 307.5 | 1.40x |
+
+### S2 — per-GPU arrival lanes (lock only per chunk on flush)
+
+- **Idea:** all GPUs' scatter threads appended through one `append_mtx`. After S1, G = 4 showed 3 of 4 GPUs with
+  `scatter_pending` 19.6–25.9 s / round (waiting for the appender) and only 4–8 s `stream_sync`; Step 6 at G = 4
+  (100.8 s) was no faster than G = 2 (99.4 s). Now each GPU has its own lane of per-chunk write buffers (no lock on
+  append); a full buffer goes to `mem_arrival` / the chunk file under `chunk_mtx[c]` only; memory budget claimed
+  with a CAS loop. Same idea as the rejected scale0 lanes — **what is different:** after S1 the flush hands the
+  buffer to RAM instead of the page cache, so parallel flushes no longer hit the dirty-page throttle.
+- **Source:** cuVS `mg/snmg.cuh` (one rank = one device with its own resources, results merged afterwards); TAGORE
+  per-device threads with their own host buffers. Class: implementation (record order only; merge order-independent).
+- **Correctness:** `det_check.sh sift10M 2` **EQUAL**, `det_check.sh sift10M 4` **EQUAL**.
+- **Single-GPU guard** (`--quick --no-mem`): ACCEPT — sift10M_auto 36.15 s (+1.6 %), sift1M_large 7.49 s (−2.0 %).
+- **SIFT100M:** G = 2 309.42 s vs 307.50 (−0.6 %, neutral: `scatter_pending` 17 → 5 s but GPU 0's loop is now
+  GPU-bound, 50.2 vs 34.5 s → S3); **G = 4 259.46 s vs 294.57 (+11.9 %)**, Step 6 100.8 → 63.3 s (rounds 32.9 / 28.2,
+  per-GPU loops 18.6–30.3 s). Untouched stages match the G = 4 best (Step 4 42.4 vs 41.8, optimize 37.6 vs 38.0), so no
+  separate A/B. Quality G = 2 0.7275 / 0.8326 / 0.9109, G = 4 0.7257 / 0.8324 / 0.9105, 0 defects.
+
+| stage | 1 GPU (best #96) | 2 GPUs (S2) | 4 GPUs (S2) |
+|---|---|---|---|
+| Step 4 | 101.6 | 61.1 (1.66x) | 42.4 (2.39x) |
+| Step 6 | 159.8 | 99.3 (1.61x) | 63.3 (2.52x) |
+| Wait | 33.8 | 25.8 (1.31x) | 25.9 (1.30x) |
+| prune | 55.8 | 42.6 (1.31x) | 50.0 (1.12x) |
+| optimize | 39.5 | 34.9 (1.13x) | 37.6 (1.05x) |
+| total | 429.6 | 309.4 (1.39x) | 259.5 (1.66x) |
 

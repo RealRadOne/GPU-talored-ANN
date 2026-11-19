@@ -5962,21 +5962,44 @@ struct ChunkedKnnAccumulator {
         }
         return p;
     }
-    uint64_t arrival_bytes = 0;   // 本轮写出的 arrival 字节 (统计；只在写 arrival 的线程上累加)
-    std::unique_ptr<std::mutex> append_mtx = std::make_unique<std::mutex>();   // unique_ptr: 保持结构体可移动 (create() 按值返回)       // 多 GPU Step 6: 每张卡一个 scatter 线程，追加记录时串行 (merge 结果跟到达顺序无关)
-    // 诊断 (scatter worker 时间拆分): append_encoded 里 flush (file.write) 的耗时 / 次数 / 字节，
-    // 其余 = memcpy + 分派。只在写 arrival 的线程上累加，每轮由 Step 6 打印后清零。
-    double   diag_flush_s = 0;
-    uint64_t diag_flush_n = 0, diag_flush_bytes = 0, diag_append_n = 0;
+    uint64_t arrival_bytes = 0;   // 本轮写出的 arrival 字节 (统计；finish_iteration_writes 从各 lane 汇总)
 
     struct ChunkBuf {
-        std::unique_ptr<char[]> data;   // cap 字节 (≥ 一条最长的变长记录)；不清零 (放内存时整块交给 mem_arrival)
-        size_t cap = 0;
+        size_t cap = 0;             // 每条 lane 的写缓冲字节数 (≥ 一条最长的变长记录)
         size_t capacity_records = 0;
-        size_t count = 0;           // data 里已用的字节数
-        std::ofstream file;
+        std::ofstream file;         // 超出内存预算的部分写这里 (多 lane 时在 chunk_mtx[c] 下写)
     };
     std::vector<ChunkBuf> bufs;
+
+    // S2 (scale loop): 写入 lane。多 GPU Step 6 每张卡一个 scatter 线程 = 一条 lane，各有一套 per-chunk 写缓冲，
+    // 追加 (memcpy) 不加锁；缓冲满了交给 mem_arrival / 写 chunk 文件时只锁那一个 chunk (chunk_mtx[c])。
+    // 原来一把 append_mtx 把所有卡的追加串行 (SIFT100M G=4: 3 张卡 scatter_pending 20–26 s / 轮在等它)。
+    // #97 / scale0 试过同样的 lane，当时缓冲写盘 → 并行写顶满 dirty 页 (被拒)；S1 之后缓冲是交给内存，没有这个问题。
+    // 记录先后顺序变了，merge 结果跟顺序无关 → vector_knn 不变。G = 1: 一条 lane、不加锁。
+    struct LaneBuf { std::unique_ptr<char[]> data; size_t count = 0; };   // data 不清零
+    struct Lane {
+        std::vector<LaneBuf> buf;   // [chunk]
+        uint64_t arrival = 0, mem_written = 0;   // 本轮字节 (统计)
+        // 诊断 (scatter worker 时间拆分): flush 的耗时 / 次数 / 字节，其余 = memcpy + 分派；每轮由 Step 6 打印后清零
+        double   flush_s = 0;
+        uint64_t flush_n = 0, flush_bytes = 0, append_n = 0;
+    };
+    std::vector<Lane> lanes;
+    std::unique_ptr<std::mutex[]> chunk_mtx;   // [chunk] (unique_ptr: 结构体要能 move)
+    void set_lanes(int L) {
+        L = std::max(1, L);
+        for (auto& ln : lanes)
+            for (auto& lb : ln.buf)
+                if (lb.count != 0) throw std::runtime_error("ChunkedKnnAccumulator::set_lanes with buffered data");
+        lanes.resize(static_cast<size_t>(L));
+        for (auto& ln : lanes) {
+            if (ln.buf.size() == static_cast<size_t>(num_chunks)) continue;
+            ln.buf.resize(static_cast<size_t>(num_chunks));
+            for (int64_t c = 0; c < num_chunks; ++c)
+                ln.buf[static_cast<size_t>(c)].data.reset(new char[bufs[static_cast<size_t>(c)].cap]);
+        }
+        if (!chunk_mtx) chunk_mtx.reset(new std::mutex[static_cast<size_t>(num_chunks)]);
+    }
 
     // S1 (scale loop): arrival 记录放内存 (size-gated，超预算的 flush 照旧写 chunk_<c>_iter<t>.bin)。
     // SIFT100M 每轮 ~35 GB arrival 全部经 page cache 写到 ~0.29 GB/s 的盘上，round 1 的还要留到最终
@@ -5988,8 +6011,7 @@ struct ChunkedKnnAccumulator {
     struct MemBlock { std::unique_ptr<char[]> p; size_t n = 0, cap = 0; };
     std::vector<std::vector<MemBlock>> mem_arrival[3];
     size_t arrival_mem_budget = 0;
-    std::unique_ptr<std::atomic<size_t>> arrival_mem_bytes = std::make_unique<std::atomic<size_t>>(0);   // 只有追加线程加、merge 线程减
-    uint64_t arrival_mem_written = 0;   // 本轮放进内存的字节 (统计)
+    std::unique_ptr<std::atomic<size_t>> arrival_mem_bytes = std::make_unique<std::atomic<size_t>>(0);   // 追加线程 CAS 加、merge 线程减
     int cur_iter = 0;
     void set_arrival_mem_budget(size_t bytes) { arrival_mem_budget = bytes; }
 
@@ -6104,9 +6126,9 @@ struct ChunkedKnnAccumulator {
         for (auto& b : acc.bufs) {
             b.capacity_records = cap_records;
             b.cap = std::max(cap_records * rec_bytes, compact_record_max(M));
-            b.data.reset(new char[b.cap]);
         }
         for (auto& slot : acc.mem_arrival) slot.resize(static_cast<size_t>(acc.num_chunks));
+        acc.set_lanes(1);
 
         std::cout << "[ChunkedKNN] N=" << N << " M=" << M
                   << " num_chunks=" << acc.num_chunks
@@ -6120,7 +6142,7 @@ struct ChunkedKnnAccumulator {
         cur_iter = iter;
         for (int64_t c = 0; c < num_chunks; ++c) {
             auto& b = bufs[static_cast<size_t>(c)];
-            b.count = 0;
+            for (auto& ln : lanes) ln.buf[static_cast<size_t>(c)].count = 0;
             if (!mem_arrival[iter % 3][static_cast<size_t>(c)].empty())
                 throw std::runtime_error("ChunkedKnnAccumulator: in-memory arrival slot still in use for iter " + std::to_string(iter));
             b.file.open(iter_path(dir, c, iter),
@@ -6130,22 +6152,33 @@ struct ChunkedKnnAccumulator {
         }
     }
 
-    void flush_chunk(int64_t c) {
+    void flush_chunk(int64_t c, int lane = 0) {
         auto& b = bufs[static_cast<size_t>(c)];
-        if (b.count == 0) return;
-        arrival_bytes += b.count;
-        if (arrival_mem_bytes->load(std::memory_order_relaxed) + b.cap <= arrival_mem_budget) {
-            // S1: 整块挂到内存 (只有这一个线程加计数，先查后加不会超预算)
-            arrival_mem_bytes->fetch_add(b.cap, std::memory_order_relaxed);
-            arrival_mem_written += b.count;
-            mem_arrival[cur_iter % 3][static_cast<size_t>(c)].push_back(MemBlock{std::move(b.data), b.count, b.cap});
-            b.data.reset(new char[b.cap]);
-        } else {
-            b.file.write(b.data.get(), static_cast<std::streamsize>(b.count));
-            if (!b.file.good())
-                throw std::runtime_error("ChunkedKnnAccumulator: flush failed for chunk " + std::to_string(c));
+        auto& ln = lanes[static_cast<size_t>(lane)];
+        auto& lb = ln.buf[static_cast<size_t>(c)];
+        if (lb.count == 0) return;
+        ln.arrival += lb.count;
+        // S1: 预算内就整块挂到内存 (CAS 占预算: 几条 lane 同时 flush 也不会超)
+        bool to_mem = false;
+        size_t cur = arrival_mem_bytes->load(std::memory_order_relaxed);
+        while (cur + b.cap <= arrival_mem_budget)
+            if (arrival_mem_bytes->compare_exchange_weak(cur, cur + b.cap, std::memory_order_relaxed)) { to_mem = true; break; }
+        {
+            std::unique_lock<std::mutex> lk;
+            if (lanes.size() > 1) lk = std::unique_lock<std::mutex>(chunk_mtx[static_cast<size_t>(c)]);
+            if (to_mem) {
+                mem_arrival[cur_iter % 3][static_cast<size_t>(c)].push_back(MemBlock{std::move(lb.data), lb.count, b.cap});
+            } else {
+                b.file.write(lb.data.get(), static_cast<std::streamsize>(lb.count));
+                if (!b.file.good())
+                    throw std::runtime_error("ChunkedKnnAccumulator: flush failed for chunk " + std::to_string(c));
+            }
         }
-        b.count = 0;
+        if (to_mem) {
+            ln.mem_written += lb.count;
+            lb.data.reset(new char[b.cap]);
+        }
+        lb.count = 0;
     }
 
     // 一条 arrival 记录编码到 dst (≥ compact_record_max(M))，返回字节数。nbrs/dists 是按距离
@@ -6159,36 +6192,38 @@ struct ChunkedKnnAccumulator {
         return static_cast<size_t>(encode_compact(dst, rel, gid, cnt, nbrs, dists) - dst);
     }
 
-    // 只在写 arrival 的线程上调用 (Step 6 的 scatter 线程，按入队顺序)：把编码好的记录追加进
-    // gid 所在 chunk 的内存 write buffer，偶尔整块顺序 flush，没有 seek。
-    void append_encoded(int64_t gid, const char* rec, size_t len) {
+    // 只在 lane 自己的写线程上调用 (Step 6 的 scatter 线程，按入队顺序)：把编码好的记录追加进
+    // gid 所在 chunk 的这条 lane 的 write buffer，偶尔整块 flush，没有 seek。
+    void append_encoded(int64_t gid, const char* rec, size_t len, int lane = 0) {
         const int64_t c = std::min(gid / chunk_size, num_chunks - 1);
-        auto& b = bufs[static_cast<size_t>(c)];
-        ++diag_append_n;
-        if (b.count + len > b.cap) {
+        auto& ln = lanes[static_cast<size_t>(lane)];
+        auto& lb = ln.buf[static_cast<size_t>(c)];
+        ++ln.append_n;
+        if (lb.count + len > bufs[static_cast<size_t>(c)].cap) {
             const auto tf0 = std::chrono::steady_clock::now();
-            diag_flush_bytes += b.count;
-            flush_chunk(c);
-            diag_flush_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - tf0).count();
-            ++diag_flush_n;
+            ln.flush_bytes += lb.count;
+            flush_chunk(c, lane);
+            ln.flush_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - tf0).count();
+            ++ln.flush_n;
         }
-        std::memcpy(b.data.get() + b.count, rec, len);
-        b.count += len;
+        std::memcpy(lb.data.get() + lb.count, rec, len);
+        lb.count += len;
     }
 
     void finish_iteration_writes() {
         const auto tfin0 = std::chrono::steady_clock::now();
         for (int64_t c = 0; c < num_chunks; ++c) {
-            flush_chunk(c);
+            for (int l = 0; l < static_cast<int>(lanes.size()); ++l) flush_chunk(c, l);
             bufs[static_cast<size_t>(c)].file.close();
         }
+        uint64_t mem_written = 0;
+        for (auto& ln : lanes) { arrival_bytes += ln.arrival; mem_written += ln.mem_written; ln.arrival = 0; ln.mem_written = 0; }
         std::cout << "  [ChunkedKNN] arrival records written: " << arrival_bytes / 1e9 << " GB (in memory "
-                  << arrival_mem_written / 1e9 << " GB, held " << arrival_mem_bytes->load() / 1e9 << " / "
+                  << mem_written / 1e9 << " GB, held " << arrival_mem_bytes->load() / 1e9 << " / "
                   << arrival_mem_budget / 1e9 << " GB budget; fixed-width would be "
                   << static_cast<double>(N) * record_bytes(M) / 1e9 << " GB; final flush+close "
                   << std::chrono::duration<double>(std::chrono::steady_clock::now() - tfin0).count() << " s)\n";
         arrival_bytes = 0;
-        arrival_mem_written = 0;
     }
 
     // 把新算出的 M 个候选(new_*)就地合并进 running 位置的 M 个候选(run_*)，
@@ -6966,7 +7001,8 @@ void build_vector_knn_with_tensorcore(
     size_t gpu_cache_bytes = 0,
     const float* seed_kth = nullptr,   // (N,) 上一轮 merge 后每点 running 第 M 个距离 (#62)
     // 多 GPU: 只处理处理顺序里的 [pos_begin, pos_end) 段 (调用方每张卡一段，已 cudaSetDevice)；默认整段
-    int32_t pos_begin = 0, int32_t pos_end = -1)
+    int32_t pos_begin = 0, int32_t pos_end = -1,
+    int acc_lane = 0)   // 多 GPU: 写 arrival 用的 lane (= 卡号；调用方先 acc.set_lanes(G))
 {
     auto func_t0 = std::chrono::high_resolution_clock::now();
     constexpr bool want_distances = true;  // 合并去重总是需要距离
@@ -7508,11 +7544,10 @@ void build_vector_knn_with_tensorcore(
                 }
                 t_scatter_wait += std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - tw0).count();
                 auto ts0 = std::chrono::high_resolution_clock::now();
-                std::lock_guard<std::mutex> alk(*acc.append_mtx);
                 size_t beg = 0;
                 for (int i = 0; i < job->bs; ++i) {
                     const size_t end = job->enc_end[static_cast<size_t>(i)];
-                    acc.append_encoded(job->gid[static_cast<size_t>(i)], job->enc.data() + beg, end - beg);
+                    acc.append_encoded(job->gid[static_cast<size_t>(i)], job->enc.data() + beg, end - beg, acc_lane);
                     beg = end;
                 }
                 t_scatter_worker += std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - ts0).count();
@@ -8363,14 +8398,14 @@ void build_vector_knn_with_tensorcore(
                   << n_enc << " threads (tail drain "
                   << std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - tj0).count()
                   << "s)\n";
-        std::lock_guard<std::mutex> dlk(*acc.append_mtx);   // 多 GPU: 计数器跟追加共用一把锁
-        const double memcpy_s = t_scatter_worker - acc.diag_flush_s;
-        std::cout << "  [VectorKNN] scatter worker split: flush(file.write)=" << acc.diag_flush_s
-                  << "s (" << acc.diag_flush_n << " flushes, " << acc.diag_flush_bytes / 1e9 << " GB, "
-                  << (acc.diag_flush_s > 0 ? acc.diag_flush_bytes / 1e9 / acc.diag_flush_s : 0.0) << " GB/s)"
-                  << " memcpy+dispatch=" << memcpy_s << "s (" << acc.diag_append_n << " records)"
+        auto& dl = acc.lanes[static_cast<size_t>(acc_lane)];   // 这张卡自己的 lane 计数 (别的卡不碰)
+        const double memcpy_s = t_scatter_worker - dl.flush_s;
+        std::cout << "  [VectorKNN] scatter worker split (lane " << acc_lane << "): flush=" << dl.flush_s
+                  << "s (" << dl.flush_n << " flushes, " << dl.flush_bytes / 1e9 << " GB, "
+                  << (dl.flush_s > 0 ? dl.flush_bytes / 1e9 / dl.flush_s : 0.0) << " GB/s)"
+                  << " memcpy+dispatch=" << memcpy_s << "s (" << dl.append_n << " records)"
                   << " idle_wait=" << t_scatter_wait << "s\n";
-        acc.diag_flush_s = 0; acc.diag_flush_n = 0; acc.diag_flush_bytes = 0; acc.diag_append_n = 0;
+        dl.flush_s = 0; dl.flush_n = 0; dl.flush_bytes = 0; dl.append_n = 0;
     }
 
     auto loop_t1 = std::chrono::high_resolution_clock::now();
@@ -9942,7 +9977,7 @@ int run_pipeline_impl(
 
             // ---- 多 GPU Step 6 (--num-gpus G > 1): 处理顺序按点数切成 G 段连续区间，每张卡一个线程跑同一个
             // build_vector_knn_with_tensorcore (各自的 producer / GPU bucket 缓存 / slot / stream)，共用 arrival 累加器
-            // (追加串行化；merge 结果跟记录到达顺序无关 → vector_knn 跟单卡相同)。host 缓存预算按卡数平分。
+            // (每卡一条写入 lane，S2；merge 结果跟记录到达顺序无关 → vector_knn 跟单卡相同)。host 缓存预算按卡数平分。
             auto run_step6 = [&](auto& reader, const std::vector<int32_t>* order_in, const float* seed) {
                 const int G6 = std::max(1, g_num_gpus);
                 if (G6 == 1) {
@@ -9965,6 +10000,7 @@ int run_pipeline_impl(
                 const int32_t npos = static_cast<int32_t>(ord.size());
                 int64_t tot = 0;
                 for (int32_t p = 0; p < npos; ++p) tot += reader.count(ord[static_cast<size_t>(p)]);
+                knn_acc->set_lanes(G6);   // S2: 每张卡一条写入 lane
                 std::vector<int32_t> cut(static_cast<size_t>(G6) + 1, npos);
                 cut[0] = 0;
                 {
@@ -9986,7 +10022,7 @@ int run_pipeline_impl(
                                 N, D, reader, graph_ptr, n_centroids, graph_K, neighbors_m, *knn_acc,
                                 centroid_knn_graph_host.data(), K, order_window_arg, step6_cache_bytes / G6,
                                 order_in, config.gpu_bucket_cache_mb << 20, seed,
-                                cut[static_cast<size_t>(g)], cut[static_cast<size_t>(g) + 1]);
+                                cut[static_cast<size_t>(g)], cut[static_cast<size_t>(g) + 1], g);
                             CUDA_CHECK(cudaDeviceSynchronize());
                         } catch (...) { exc[static_cast<size_t>(g)] = std::current_exception(); }
                     });
