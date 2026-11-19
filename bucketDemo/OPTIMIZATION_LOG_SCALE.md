@@ -6,9 +6,9 @@ Best: `.claude/skills/optimize-bucket2-scale/state/best_scale.json` (judge keys 
 
 ## Current best
 
-**G = 2: 465.78 s** (baseline 2026-11-19, HEAD 6192de7, GPUs 0,1, reps 465.78 / 488.51 / 444.00) — bucket2 364.66
-(Step 4 63.1, Step 6 233.1, Wait 29.3, Step 4.5 15.2), prune 48.5, optimize 43.9; recall@10 L 32 / 64 / 128 =
-0.7276 / 0.8348 / 0.9112, 0 defects. Run `runs/scale0_base/sift100M_auto_g2`.
+**G = 2: 307.50 s** (S1, 2026-11-19, GPUs 0,1, reps 315.50 / 307.50 / 307.01) — bucket2 229.49 (Step 4 62.3,
+Step 6 99.4, Wait 25.1, Step 4.5 15.2), prune 42.9, optimize 37.4; recall@10 L 32 / 64 / 128 = 0.7254 / 0.8351 /
+0.9115, 0 defects; bucket2 peak RSS 80.4 GB. Run `runs/scale1/sift100M_auto_g2`. Baseline was 465.78 s (`runs/scale0_base`).
 **G = 4:** not measured yet (GPUs 2,3 held by wangcy07 at baseline time).
 
 Single-GPU reference (`optimize-bucket2/state/best.json`, #96): SIFT100M 429.56 s — Step 4 101.6, Step 6 159.8,
@@ -19,12 +19,11 @@ prune 44.7, optimize 35.8); 4 GPUs 347.79 s (Step 4 42.3, Step 6 121.8, Wait 50.
 
 ## Ideas backlog (largest multi-GPU gap first)
 
-- **S1 — Step 6 arrival appender.** One shared `ChunkedKnnAccumulator`; #97 (global `append_mtx`): one thread
-  writes ~35 GB / round, the other GPUs' threads wait 33–50 s on the lock. Per-GPU write lanes were tried and
-  rejected (see **Tried & rejected**, `patches/scale0_lanes.patch`): parallel writes only fill the kernel
-  dirty-page budget faster; the disk (~0.29 GB/s) is the limit, not the lock. Real fix = **fewer bytes to disk**:
-  keep arrival records in host memory when they fit (size-gated, disk fallback for 1B), or merge per round in
-  memory; or overlap the flush with the next round's Steps 1–4 (rate-shape writes so the final Wait shrinks).
+- **S1 — done (S1, accepted):** arrival records in host memory up to `--arrival-mem-mb` (51.2 GB). Left over:
+  round 2 still spills ~16.7 GB (budget full with round 1's 37.3 GB kept for the deferred final merge) →
+  **S1b**: round-2 Step 6 46 s vs round-1 53 s; try a larger budget only if RAM allows (shared machine), or
+  give round 2 priority by spilling round-1 records after the deferred kth pass (they are read only once more).
+  Also still one appender thread (`append_mtx`) — now cheap (pointer swap per 256 KB), re-check its wait share.
 - **S2 — optimize_chunked source-row split.** `GpuReverseMerge` re-uploads the whole forward graph per GPU per
   dst segment (H2D 3.8 / 7.9 / 12.1 s at G = 1 / 2 / 4). Each GPU uploads only its source rows once, scatters
   edges to the dst owner over NVLink (peer copies), owner selects + merges. Byte-identical to CPU (top-K is
@@ -67,4 +66,37 @@ no other heavy writer or memory user seen after the run (`nr_dirty_threshold` 46
 scale right now → confirm any accept candidate with an alternating A/B against HEAD (`mgpu_run.sh`, `build_wip/`).**
 Quality same as 1 GPU (0.7276 / 0.8348 / 0.9112 vs 0.7246 / 0.8306 / 0.9097). Side fix: `summarize.py` `gpus`
 now lists every device of the reps (was the first one only).
+
+### S1 — Step 6 arrival records in host memory (size-gated, disk fallback)
+
+- **Idea:** out-of-core Step 6 wrote every round's arrival records (SIFT100M ~37 + 33 GB) through the page cache to
+  `/` (~0.29 GB/s); round 1's files stay until the deferred final merge, so dirty pages hit `nr_dirty_threshold` and
+  the single appender (all GPUs' scatter threads behind `append_mtx`) was throttled by the kernel. Now a full
+  256 KB write buffer is handed to `ChunkedKnnAccumulator::mem_arrival[iter % 3][chunk]` (pointer move, no copy)
+  while the held bytes fit `--arrival-mem-mb`; past the budget the flush writes the chunk file as before.
+  `merge_iteration` decodes file part + memory blocks; frees blocks unless kept for the deferred final merge.
+- **Source:** TAGORE `large_index.cu` keeps sub-graph results in host buffers and only spills what does not fit
+  (GPU–CPU–disk pipeline); our code today: every arrival record goes to `chunk_<c>_iter<t>.bin`.
+- **Class:** implementation (merge result independent of where / in which order records are stored). Same for 1 and
+  G GPUs. Scripts: `dataset_env.py` `ARRIVAL_MEM_MB` = HOST_BUDGET_MB / 4 (51200); `run_pipeline.sh` / `mgpu_run.sh`
+  pass `--arrival-mem-mb` only when > 0 (`ARRIVAL_MEM_MB=0` = old behaviour, also for pre-S1 binaries in `build_wip/`).
+- **Correctness:** deterministic sift10M G = 1 with `ARRIVAL_MEM_MB` 0 / 300 (partial spill, 0.31 GB in RAM) / default
+  (6.8 GB in RAM): `vector_knn`, forward graph, final graph byte-identical; no leftover chunk files.
+  `det_check.sh sift10M 2`: **EQUAL** (Step 4 checksums equal).
+- **Single-GPU guard** (`--quick --no-mem`): ACCEPT — sift10M_auto 35.52 s (+3.3 %), sift1M_large 7.29 s (+0.7 %);
+  sift10M bucket2 peak RSS 9.65 → 12.94 GB (memory guard off, recorded).
+- **SIFT100M G = 2** (judge vs baseline): 307.50 s vs 465.78 (**+34.0 %**, ACCEPT); Step 6 233.1 → 99.4 s (rounds
+  53.0 / 45.0 s; round 1 37.3 GB all in RAM, round 2 16.2 of 33.0 GB in RAM). Quality 0.7254 / 0.8351 / 0.9115.
+  Peak RSS 33.6 → 80.4 GB. **G = 4 skipped** (GPU 3 used by wangcy07).
+- **Same-period A/B** (`runs/scale1/ab.out`, timing only): HEAD bucket2 289.78 / total 371.95 s vs S1 229.41 / 309.63 s
+  → **−20.8 % bucket2, −16.8 % total** (the +34 % vs best is inflated by the slow baseline period).
+
+| stage | 1 GPU (best #96) | 2 GPUs (S1) | speedup |
+|---|---|---|---|
+| Step 4 | 101.6 | 62.3 | 1.63x |
+| Step 6 | 159.8 | 99.4 | 1.61x |
+| Wait | 33.8 | 25.1 | 1.35x |
+| prune | 55.8 | 42.9 | 1.30x |
+| optimize | 39.5 | 37.4 | 1.05x |
+| total | 429.6 | 307.5 | 1.40x |
 

@@ -151,6 +151,8 @@ struct LoadConfig {
     size_t gpu_bucket_cache_mb;
     // round 2..t 的 bucket 记录 (BucketVectorAccumulator) 放内存的预算 (MB, 0 = cpu_limit/4)
     size_t bucket_mem_mb = 0;
+    // out-of-core Step 6 arrival 记录放内存的预算 (MB, 0 = 全部落盘)，见 ChunkedKnnAccumulator::mem_arrival
+    size_t arrival_mem_mb = 0;
 
     // Output
     bool save_dists;               // 写 vector_dists.bin (default true)；流水线后续阶段不读它
@@ -614,6 +616,9 @@ LoadConfig parse_load_config(const po::variables_map& vm) {
     }
     if (vm.count("bucket-mem-mb")) {
         config.bucket_mem_mb = vm["bucket-mem-mb"].as<size_t>();
+    }
+    if (vm.count("arrival-mem-mb")) {
+        config.arrival_mem_mb = vm["arrival-mem-mb"].as<size_t>();
     }
     if (vm.count("skip-dists")) {
         config.save_dists = !vm["skip-dists"].as<bool>();
@@ -5965,12 +5970,28 @@ struct ChunkedKnnAccumulator {
     uint64_t diag_flush_n = 0, diag_flush_bytes = 0, diag_append_n = 0;
 
     struct ChunkBuf {
-        std::vector<char> data;     // ≥ 一条最长的变长记录
+        std::unique_ptr<char[]> data;   // cap 字节 (≥ 一条最长的变长记录)；不清零 (放内存时整块交给 mem_arrival)
+        size_t cap = 0;
         size_t capacity_records = 0;
         size_t count = 0;           // data 里已用的字节数
         std::ofstream file;
     };
     std::vector<ChunkBuf> bufs;
+
+    // S1 (scale loop): arrival 记录放内存 (size-gated，超预算的 flush 照旧写 chunk_<c>_iter<t>.bin)。
+    // SIFT100M 每轮 ~35 GB arrival 全部经 page cache 写到 ~0.29 GB/s 的盘上，round 1 的还要留到最终
+    // merge (deferred)，dirty 页顶到阈值后 Step 6 的追加被内核限速 (多 GPU 时所有卡都在等这一个写线程)。
+    // 写满的 write buffer 整块挂到 mem_arrival[iter % 3][c] (不拷贝)，merge 直接解码这些块；同一 chunk 的
+    // 记录可以一部分在内存、一部分在文件——merge 结果跟到达顺序 / 存放位置无关 (逐位相同)。
+    // 槽位 iter % 3: 同时活着的只有 deferred 留下的 iter-1、正在 merge 的 iter、正在追加的 iter+1
+    // (下一轮 merge 发起前先等上一轮 merge 完)。预算 0 = 关闭 (原行为)；1B 规模超预算的部分自动落盘。
+    struct MemBlock { std::unique_ptr<char[]> p; size_t n = 0, cap = 0; };
+    std::vector<std::vector<MemBlock>> mem_arrival[3];
+    size_t arrival_mem_budget = 0;
+    std::unique_ptr<std::atomic<size_t>> arrival_mem_bytes = std::make_unique<std::atomic<size_t>>(0);   // 只有追加线程加、merge 线程减
+    uint64_t arrival_mem_written = 0;   // 本轮放进内存的字节 (统计)
+    int cur_iter = 0;
+    void set_arrival_mem_budget(size_t bytes) { arrival_mem_budget = bytes; }
 
     static std::string iter_path(const std::string& dir, int64_t c, int iter) {
         return dir + "/chunk_" + std::to_string(c) + "_iter" + std::to_string(iter) + ".bin";
@@ -6082,8 +6103,10 @@ struct ChunkedKnnAccumulator {
         acc.bufs.resize(static_cast<size_t>(acc.num_chunks));
         for (auto& b : acc.bufs) {
             b.capacity_records = cap_records;
-            b.data.resize(std::max(cap_records * rec_bytes, compact_record_max(M)));
+            b.cap = std::max(cap_records * rec_bytes, compact_record_max(M));
+            b.data.reset(new char[b.cap]);
         }
+        for (auto& slot : acc.mem_arrival) slot.resize(static_cast<size_t>(acc.num_chunks));
 
         std::cout << "[ChunkedKNN] N=" << N << " M=" << M
                   << " num_chunks=" << acc.num_chunks
@@ -6094,9 +6117,12 @@ struct ChunkedKnnAccumulator {
     }
 
     void start_iteration(int iter) {
+        cur_iter = iter;
         for (int64_t c = 0; c < num_chunks; ++c) {
             auto& b = bufs[static_cast<size_t>(c)];
             b.count = 0;
+            if (!mem_arrival[iter % 3][static_cast<size_t>(c)].empty())
+                throw std::runtime_error("ChunkedKnnAccumulator: in-memory arrival slot still in use for iter " + std::to_string(iter));
             b.file.open(iter_path(dir, c, iter),
                        std::ios::binary | std::ios::out | std::ios::trunc);
             if (!b.file.is_open())
@@ -6107,10 +6133,18 @@ struct ChunkedKnnAccumulator {
     void flush_chunk(int64_t c) {
         auto& b = bufs[static_cast<size_t>(c)];
         if (b.count == 0) return;
-        b.file.write(b.data.data(), static_cast<std::streamsize>(b.count));
         arrival_bytes += b.count;
-        if (!b.file.good())
-            throw std::runtime_error("ChunkedKnnAccumulator: flush failed for chunk " + std::to_string(c));
+        if (arrival_mem_bytes->load(std::memory_order_relaxed) + b.cap <= arrival_mem_budget) {
+            // S1: 整块挂到内存 (只有这一个线程加计数，先查后加不会超预算)
+            arrival_mem_bytes->fetch_add(b.cap, std::memory_order_relaxed);
+            arrival_mem_written += b.count;
+            mem_arrival[cur_iter % 3][static_cast<size_t>(c)].push_back(MemBlock{std::move(b.data), b.count, b.cap});
+            b.data.reset(new char[b.cap]);
+        } else {
+            b.file.write(b.data.get(), static_cast<std::streamsize>(b.count));
+            if (!b.file.good())
+                throw std::runtime_error("ChunkedKnnAccumulator: flush failed for chunk " + std::to_string(c));
+        }
         b.count = 0;
     }
 
@@ -6131,14 +6165,14 @@ struct ChunkedKnnAccumulator {
         const int64_t c = std::min(gid / chunk_size, num_chunks - 1);
         auto& b = bufs[static_cast<size_t>(c)];
         ++diag_append_n;
-        if (b.count + len > b.data.size()) {
+        if (b.count + len > b.cap) {
             const auto tf0 = std::chrono::steady_clock::now();
             diag_flush_bytes += b.count;
             flush_chunk(c);
             diag_flush_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - tf0).count();
             ++diag_flush_n;
         }
-        std::memcpy(b.data.data() + b.count, rec, len);
+        std::memcpy(b.data.get() + b.count, rec, len);
         b.count += len;
     }
 
@@ -6148,10 +6182,13 @@ struct ChunkedKnnAccumulator {
             flush_chunk(c);
             bufs[static_cast<size_t>(c)].file.close();
         }
-        std::cout << "  [ChunkedKNN] arrival records written: " << arrival_bytes / 1e9 << " GB (fixed-width would be "
+        std::cout << "  [ChunkedKNN] arrival records written: " << arrival_bytes / 1e9 << " GB (in memory "
+                  << arrival_mem_written / 1e9 << " GB, held " << arrival_mem_bytes->load() / 1e9 << " / "
+                  << arrival_mem_budget / 1e9 << " GB budget; fixed-width would be "
                   << static_cast<double>(N) * record_bytes(M) / 1e9 << " GB; final flush+close "
                   << std::chrono::duration<double>(std::chrono::steady_clock::now() - tfin0).count() << " s)\n";
         arrival_bytes = 0;
+        arrival_mem_written = 0;
     }
 
     // 把新算出的 M 个候选(new_*)就地合并进 running 位置的 M 个候选(run_*)，
@@ -6353,11 +6390,32 @@ struct ChunkedKnnAccumulator {
                 auto t3 = now();
                 for (int ai : {kept_iter, iter}) {
                 if (ai < 0) continue;
+                const bool keep = defer && ai == iter;   // 这一轮要留给最终 merge 的 arrival 不删
+                size_t n_file = 0;
+                auto merge_buf = [&](const char* rp, const char* const rend) {
+                    while (rp < rend) {
+                        ++n_file;
+                        // 紧凑记录 (见 encode_compact)，读回后补齐成 M 宽 (-1/+inf)；解码带边界检查
+                        int64_t gid;
+                        rp = decode_compact(rp, rend, chunk_start, M, gid, new_nbrs.data(), new_dists.data());
+                        if (!rp)
+                            throw std::runtime_error("ChunkedKnnAccumulator: bad arrival record in chunk " + std::to_string(c));
+                        int64_t pos = gid - chunk_start;
+                        if (pos < 0 || pos >= chunk_c_size) continue;  // 不应该发生，保险起见
+                        merge_one_record(
+                            run_nbrs.data() + static_cast<size_t>(pos) * M,
+                            run_dists.data() + static_cast<size_t>(pos) * M,
+                            new_nbrs.data(), new_dists.data(), M,
+                            scratch, id_sort_buf);
+                    }
+                };
+                // 落盘的部分: 整个 arrival 文件一次性读进内存 (一次 read 系统调用，而不是
+                // 每条记录一次)，读磁盘和后面逐条 merge 的 CPU 计算分开计时。
                 auto ta0 = now();
                 std::string ip = iter_path(dir, c, ai);
                 std::ifstream in(ip, std::ios::binary);
-                size_t n_file = 0;
-                if (in.is_open()) {
+                const bool had_file = in.is_open();
+                if (had_file) {
                     in.seekg(0, std::ios::end);
                     std::streamoff sz = in.tellg();
                     in.seekg(0, std::ios::beg);
@@ -6370,27 +6428,18 @@ struct ChunkedKnnAccumulator {
                 auto ta1 = now();
                 tm.read_arrival += secs_between(ta0, ta1);
                 t3 = ta1;
-
-                const char* rp = arrival_buf.data();
-                const char* const rend = rp + arrival_buf.size();
-                while (rp < rend) {
-                    ++n_file;
-                    // 紧凑记录 (见 encode_compact)，读回后补齐成 M 宽 (-1/+inf)；解码带边界检查
-                    int64_t gid;
-                    rp = decode_compact(rp, rend, chunk_start, M, gid, new_nbrs.data(), new_dists.data());
-                    if (!rp)
-                        throw std::runtime_error("ChunkedKnnAccumulator: bad arrival record in chunk " + std::to_string(c));
-                    int64_t pos = gid - chunk_start;
-                    if (pos < 0 || pos >= chunk_c_size) continue;  // 不应该发生，保险起见
-                    merge_one_record(
-                        run_nbrs.data() + static_cast<size_t>(pos) * M,
-                        run_dists.data() + static_cast<size_t>(pos) * M,
-                        new_nbrs.data(), new_dists.data(), M,
-                        scratch, id_sort_buf);
+                merge_buf(arrival_buf.data(), arrival_buf.data() + arrival_buf.size());
+                // S1: 再合内存里的块 (每块都是整条记录，flush 时不会把一条记录切开)
+                auto& blocks = mem_arrival[ai % 3][static_cast<size_t>(c)];
+                for (const auto& blk : blocks) merge_buf(blk.p.get(), blk.p.get() + blk.n);
+                if (!keep && !blocks.empty()) {
+                    size_t freed = 0;
+                    for (const auto& blk : blocks) freed += blk.cap;
+                    std::vector<MemBlock>().swap(blocks);
+                    arrival_mem_bytes->fetch_sub(freed, std::memory_order_relaxed);
                 }
                 n_records += n_file;
-                // 这一轮要留给最终 merge 的 arrival 文件不删
-                if (n_file > 0 && !(defer && ai == iter)) std::filesystem::remove(ip);
+                if (had_file && !keep) std::filesystem::remove(ip);
                 }   // ai
                 tm.n_records = static_cast<int64_t>(n_records);
                 if (!is_final) {
@@ -9060,6 +9109,8 @@ int run_pipeline_impl(
                 ChunkedKnnAccumulator::create(
                     knn_chunk_tmp_dir, N, static_cast<int>(neighbors_m),
                     config.cpu_limit_bytes / 4));
+            knn_acc->set_arrival_mem_budget(config.arrival_mem_mb << 20);
+            std::cout << "[ChunkedKNN] arrival records in host memory up to " << config.arrival_mem_mb << " MB\n";
         }
 
         // 这些值由最后一次 iteration 决定 (用于 Step 5/7)
@@ -10224,6 +10275,9 @@ int main(int argc, char** argv) {
             ("kmeans-train-fraction", po::value<float>(),
                 "Step 2 (dataset fits on GPU): train KMeans|| on this random fraction of the points "
                 "(centroid count stays N*centroid-ratio; default 1.0 = all points)")
+            ("arrival-mem-mb", po::value<size_t>(),
+                "Out-of-core Step 6: keep the per-round arrival records in host memory up to this budget in MB "
+                "(default 0 = all on disk); the rest is written to the chunk files as before")
             ("bucket-mem-mb", po::value<size_t>(),
                 "Rounds 2..t: keep the bucket records (Step 4 → Step 6) in host memory when they fit this budget in MB "
                 "(default 0 = cpu-limit/4); Step 6 then copies GPU-cache misses straight from it")

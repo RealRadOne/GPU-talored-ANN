@@ -16,6 +16,8 @@ Adaptive rules (user decisions 2026-10-22/23; they reproduce the hand-tuned SIFT
   --bucket-mem-mb = cache-mb + 1000      (floors = the values every dataset used before 2026-10-23, so the
                     SIFT configs run with exactly the same flags; only larger round records scale up)
   --gpu-bucket-cache-mb = GPU_MB / 2
+  --arrival-mem-mb = HOST_BUDGET_MB / 4  (scale S1: out-of-core Step 6 arrival records in RAM up to this, rest on disk;
+                    ARRIVAL_MEM_MB=0 = all on disk, also needed for binaries older than S1)
   all host-side sizes capped by HOST_BUDGET_MB / 4 each (machine: 251 GB RAM; optimize_chunked
   --host-budget-mb = HOST_BUDGET_MB is a ceiling, not a target)
 """
@@ -58,6 +60,7 @@ adaptive = {
     "CACHE_MB": str(cache_mb),
     "BUCKET_MEM_MB": str(min(cap, cache_mb + 1000)),
     "GPU_BUCKET_CACHE_MB": str(GPU_MB // 2),
+    "ARRIVAL_MEM_MB": str(cap),
     "CHUNKED_HOST_BUDGET_MB": str(HOST_BUDGET_MB),
     "A1_PASSES": "0",   # A1-R local join passes (resident path; #40, user-approved A1)
     "A7_UNWIN": "0",    # A7: batched GPU prune without the window restriction (#55, user-approved for 10M)

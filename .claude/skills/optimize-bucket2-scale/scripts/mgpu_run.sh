@@ -14,6 +14,7 @@ source $S/params.sh
 eval "$($PY -I $S/dataset_env.py $DS)"
 source $S/gpu_select.sh
 BUCKET2_EXTRA="$BUCKET2_EXTRA --kmeans-train-fraction $KMEANS_TRAIN_FRACTION --cache-mb $CACHE_MB --bucket-mem-mb $BUCKET_MEM_MB --gpu-bucket-cache-mb $GPU_BUCKET_CACHE_MB"
+(( ${ARRIVAL_MEM_MB:-0} > 0 )) && BUCKET2_EXTRA="$BUCKET2_EXTRA --arrival-mem-mb $ARRIVAL_MEM_MB"   # scale S1 (0 = all on disk / pre-S1 binaries)
 CHUNKED_EXTRA="$CHUNKED_EXTRA --host-budget-mb $CHUNKED_HOST_BUDGET_MB"
 export BUCKET2_A1_PASSES=$A1_PASSES BUCKET2_A7_UNWIN=$A7_UNWIN
 TAG="k${KNN_K}p${NPROBE}m${NEIGHBORS_M}t${ITERATIONS}"

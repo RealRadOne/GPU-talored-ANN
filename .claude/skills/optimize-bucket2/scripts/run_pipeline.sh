@@ -42,6 +42,7 @@ DSDIR=$DS_DIR
 : "${REPS:=$DEF_REPS}"
 [[ ${B13_DISTS:-0} == 1 ]] && BUCKET2_EXTRA="${BUCKET2_EXTRA/--skip-dists/}"   # B13: prune reads vector_dists.bin
 BUCKET2_EXTRA="$BUCKET2_EXTRA --kmeans-train-fraction $KMEANS_TRAIN_FRACTION --cache-mb $CACHE_MB --bucket-mem-mb $BUCKET_MEM_MB --gpu-bucket-cache-mb $GPU_BUCKET_CACHE_MB"
+(( ${ARRIVAL_MEM_MB:-0} > 0 )) && BUCKET2_EXTRA="$BUCKET2_EXTRA --arrival-mem-mb $ARRIVAL_MEM_MB"   # scale S1 (0 = all on disk / pre-S1 binaries)
 CHUNKED_EXTRA="$CHUNKED_EXTRA --host-budget-mb $CHUNKED_HOST_BUDGET_MB"
 # MGPU=G (G > 1): multi-GPU build on G free devices (bucket2 Step 4 / Step 6, prune, optimize_chunked
 # get --num-gpus G); select_gpu still guards GPU 0. Single-GPU runs (unset / 1) are unchanged.
