@@ -12,6 +12,11 @@ usage:
     --add-new    : with --update, record configs best.json does not have yet even if the verdict is REJECT
     --rebaseline : with --update, overwrite the best entries of these configs with the candidate when only
                    speed rules failed (used once after a measurement-rule change, e.g. SIFT100M 1 -> 3 runs)
+    --no-mem     : skip the memory guard (optimize-bucket2-scale, user 2026-11-16: host peak RSS ignored for now)
+  env JUDGE_BEST=<path>    : best file to compare with / update (default state/best.json; the scale loop uses
+                             optimize-bucket2-scale/state/best_scale.json)
+  env JUDGE_BENCH=k1,k2,.. : bench set required for ACCEPT (default: datasets.json "bench")
+  Multi-GPU runs (metrics.json num_gpus = G > 1, run_pipeline MGPU=G) get the config key <dataset>_<mode>_g<G>.
 
 Rules (agreed with the user; 2026-10-23: every config >= 3% = gain, > 3% slower = regression, SIFT100M now
 median of 3 runs like SIFT1M):
@@ -32,7 +37,7 @@ import json, os, sys
 
 SKILL = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 STATE = os.path.join(SKILL, "state")
-BEST = os.path.join(STATE, "best.json")
+BEST = os.environ.get("JUDGE_BEST") or os.path.join(STATE, "best.json")
 REG = {k: v for k, v in json.load(open(os.path.join(SKILL, "scripts", "datasets.json"))).items()
        if not k.startswith("_")}
 def load_ref(name):
@@ -42,6 +47,8 @@ REFS = {"tagore": load_ref("tagore"), "cagra": load_ref("cagra")}
 SPEED_GAIN, SPEED_TOL, MEM_TOL = 0.03, 0.03, 1.2
 REF_TOL = {"resident": 0.01, "large": 0.05}
 BENCH = [f"{ds}_{m}" for ds, v in REG.items() for m in v.get("bench", [])]
+if os.environ.get("JUDGE_BENCH"):
+    BENCH = [b for b in os.environ["JUDGE_BENCH"].split(",") if b]
 
 args = [a for a in sys.argv[1:] if not a.startswith("--")]
 flags = {a for a in sys.argv[1:] if a.startswith("--")}
@@ -50,7 +57,7 @@ if not args:
 cand, cand_dirs = {}, {}
 for d in args:
     m = json.load(open(os.path.join(d, "metrics.json")))
-    k = f"{m['dataset']}_{m['mode']}"
+    k = f"{m['dataset']}_{m['mode']}" + (f"_g{m['num_gpus']}" if m.get("num_gpus", 1) > 1 else "")
     if k in cand:
         sys.exit(f"config {k} given twice")
     cand[k], cand_dirs[k] = m, os.path.abspath(d)
@@ -163,7 +170,7 @@ for k in KEYS:
 
 # ---- memory (large path)
 for k in KEYS:
-    if cand[k]["path"] != "large" or k not in brun:
+    if "--no-mem" in flags or cand[k]["path"] != "large" or k not in brun:
         continue
     c, b = cand[k], brun[k]
     for st, v in c["peak_rss_gb"].items():

@@ -43,7 +43,7 @@ DSDIR=$DS_DIR
 [[ ${B13_DISTS:-0} == 1 ]] && BUCKET2_EXTRA="${BUCKET2_EXTRA/--skip-dists/}"   # B13: prune reads vector_dists.bin
 BUCKET2_EXTRA="$BUCKET2_EXTRA --kmeans-train-fraction $KMEANS_TRAIN_FRACTION --cache-mb $CACHE_MB --bucket-mem-mb $BUCKET_MEM_MB --gpu-bucket-cache-mb $GPU_BUCKET_CACHE_MB"
 CHUNKED_EXTRA="$CHUNKED_EXTRA --host-budget-mb $CHUNKED_HOST_BUDGET_MB"
-# MGPU=G (G > 1): multi-GPU build on visible devices 0..G-1 (bucket2 Step 4 / Step 6, prune, optimize_chunked
+# MGPU=G (G > 1): multi-GPU build on G free devices (bucket2 Step 4 / Step 6, prune, optimize_chunked
 # get --num-gpus G); select_gpu still guards GPU 0. Single-GPU runs (unset / 1) are unchanged.
 if (( ${MGPU:-1} > 1 )); then
   BUCKET2_EXTRA="$BUCKET2_EXTRA --num-gpus $MGPU"; PRUNE_EXTRA="$PRUNE_EXTRA --num-gpus $MGPU"; CHUNKED_EXTRA="$CHUNKED_EXTRA --num-gpus $MGPU"
@@ -98,12 +98,28 @@ rep_retry_or_fail() {  # rep_retry_or_fail STAGE
 
 for ((R = 0; R < REPS; R++)); do
   select_gpu
-  (( ${MGPU:-1} > 1 )) && export CUDA_VISIBLE_DEVICES=$(seq -s, 0 $((MGPU - 1)))   # MGPU: all G devices
+  MGPU_LIST=""
+  if (( ${MGPU:-1} > 1 )); then   # MGPU: G free devices (other users' jobs change Step 4 batching + timing)
+    MW=0
+    while :; do
+      free=(); for g in 0 1 2 3; do gpu_is_free "$g" && free+=("$g"); done
+      fs=" ${free[*]} "
+      if (( MGPU == 2 )); then   # same NUMA node first (GPU 0,1 = node 0; 2,3 = node 1), all pairs are NVLink
+        for pr in "0 1" "2 3"; do read -r ga gb <<< "$pr"; [[ $fs == *" $ga "* && $fs == *" $gb "* ]] && { MGPU_LIST="$ga,$gb"; break; }; done
+      fi
+      [[ -z $MGPU_LIST ]] && (( ${#free[@]} >= MGPU )) && MGPU_LIST=$(IFS=,; echo "${free[*]:0:MGPU}")
+      [[ -n $MGPU_LIST ]] && break
+      (( MW % 600 == 0 )) && echo "GPU_WAIT $(date +%F_%T): MGPU=$MGPU, free GPU(s): ${free[*]:-none}"
+      sleep 60; MW=$((MW + 60))
+    done
+    export CUDA_VISIBLE_DEVICES=$MGPU_LIST; GPU=${MGPU_LIST%%,*}   # end-of-rep "GPU taken" check watches our first device
+    echo "[gpu] MGPU=$MGPU on GPUs $MGPU_LIST"
+  fi
   RD=$OUT/rep$R; W=$RD/work; mkdir -p "$W"
-  echo "$GPU" > "$RD/gpu.txt"
+  echo "${MGPU_LIST:-$GPU}" > "$RD/gpu.txt"
   echo "[$DS/$MODE rep $R, GPU $GPU] -> $RD"
   # GPU memory sampler (MiB), for the peak-memory guard
-  nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -i "$GPU" -lms 200 > "$RD/gpu_mem.txt" 9>&- &
+  nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -i "${MGPU_LIST:-$GPU}" -lms 200 > "$RD/gpu_mem.txt" 9>&- &
   SMI=$!
   [[ ${SMOKE:-0} == 1 ]] || { sync; echo 3 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null 2>&1 || true; }
 

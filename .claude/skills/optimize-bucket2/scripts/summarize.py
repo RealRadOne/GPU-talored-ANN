@@ -28,7 +28,8 @@ for rd in sorted(glob.glob(os.path.join(out, "rep*"))):
             r["a1_stats"] = a1
     r["build_total_s"] = round(sum(r["stages"].values()), 3)
     f = os.path.join(rd, "gpu.txt")
-    r["gpu"] = int(open(f).read()) if os.path.exists(f) else 0
+    gl = [int(x) for x in open(f).read().strip().split(",") if x.strip()] if os.path.exists(f) else [0]
+    r["gpu"] = gl[0]; r["gpu_list"] = gl   # MGPU: all devices of the rep
     p = os.path.join(rd, "path.txt")
     r["path"] = open(p).read().strip() if os.path.exists(p) else "?"
     g = os.path.join(rd, "gpu_mem.txt")
@@ -47,6 +48,7 @@ stage_names = [s for s in STAGES if all(s in r["stages"] for r in reps)]
 res = {
     "dataset": ds, "mode": mode, "path": reps[-1]["path"], "reps": len(reps),
     "gpus": sorted({r["gpu"] for r in reps}),
+    "num_gpus": int(os.environ.get("MGPU", "1") or 1),   # run_pipeline MGPU=G (multi-GPU build)
     "build_total_s": med([r["build_total_s"] for r in reps]),
     "build_total_all_s": [r["build_total_s"] for r in reps],
     "stages_s": {s: med([r["stages"][s] for r in reps]) for s in stage_names},
