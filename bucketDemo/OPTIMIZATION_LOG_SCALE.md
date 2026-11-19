@@ -26,10 +26,7 @@ prune 44.7, optimize 35.8); 4 GPUs 347.79 s (Step 4 42.3, Step 6 121.8, Wait 50.
 
 Item names below are backlog labels, not iteration numbers (iterations are logged as `### S<N>` under Iterations).
 
-- **S1 — done** (arrival records in RAM). **S1b (next):** round 2 still spills ~16.7 GB to disk (budget 51.2 GB full with
-  round 1's 37.3 GB kept for the deferred final merge). S4 showed the G = 2 total is bound by bytes written — the spill is
-  what the final merge's write runs into. Raise the budget so both rounds fit (~71 GB; bucket2 RSS ~80 → ~97 GB, msTuring100M
-  ~103 → ~120 GB; size-gated, disk fallback stays), then re-try `scale4_balance.patch` on top.
+- **S1 — done** (arrival records in RAM). S1b (bigger budget, no round-2 spill) tried as S5: no gain (rejected).
 - **S2 — done** (per-GPU arrival lanes).
 - **S3 / S4 — load balance (Step 6 cost cut + optimize segment cut):** real per-stage gains, rejected because the disk-bound
   Wait absorbs them at G = 2 (see Tried & rejected). Re-try `bucketDemo/patches/scale4_balance.patch` after S1b, and at G = 4.
@@ -50,6 +47,11 @@ _(none)_
 
 ## Tried & rejected
 
+- **S5 (2026-11-19) — S1b: arrival budget 51.2 → 75 GB** (`dataset_env.py` ARRIVAL_MEM_MB = 3/8 HOST_BUDGET) so round 2 does not
+  spill (33.0 of 33.0 GB in RAM, 70.7 GB held). G = 2 311.63 s (−1.3 % vs best; reps 311.3 / 316.1 / 311.6), same-period ref with
+  51.2 GB: bucket2 230.95 vs 229.61 s → no gain; Step 6 99.2 s and Wait 27.6 s unchanged; peak RSS 80.4 → 92.8 GB. **Finding:** the
+  final merge (Wait) is ~7 s merge CPU + ~15 s `pwrite` of vector_knn (25.6 GB) throttled by the dirty-page limit — the round-2
+  spill is not what it waits for. det 2 EQUAL, guard ACCEPT, G = 4 skipped (wangcy07). Patch `bucketDemo/patches/scale5_arrival_budget_75g.patch`.
 - **S4 (2026-11-19) — multi-GPU load balance = S3 cost cut (κ = 0.3) + optimize_chunked segment cut.** The segment fix:
   dst segments were capped at ceil(E/G) edges and stopped one row short → a tiny extra segment went to GPU 0, which re-uploaded
   the whole forward graph for a few rows (G = 2 passes 3 → 2, fill 9.3 → 5.3 s; byte-identical). det 2 EQUAL, guard ACCEPT.
