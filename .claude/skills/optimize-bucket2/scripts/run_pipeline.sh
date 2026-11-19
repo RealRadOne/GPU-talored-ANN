@@ -103,10 +103,10 @@ for ((R = 0; R < REPS; R++)); do
   if (( ${MGPU:-1} > 1 )); then   # MGPU: G free devices (other users' jobs change Step 4 batching + timing)
     MW=0
     while :; do
-      free=(); for g in 0 1 2 3; do gpu_is_free "$g" && free+=("$g"); done
+      free=(); for g in $GPU_ORDER; do gpu_is_free "$g" && free+=("$g"); done   # preference order (gpu_select.sh: 2 3 0 1, agreement 2026-11-19)
       fs=" ${free[*]} "
-      if (( MGPU == 2 )); then   # same NUMA node first (GPU 0,1 = node 0; 2,3 = node 1), all pairs are NVLink
-        for pr in "0 1" "2 3"; do read -r ga gb <<< "$pr"; [[ $fs == *" $ga "* && $fs == *" $gb "* ]] && { MGPU_LIST="$ga,$gb"; break; }; done
+      if (( MGPU == 2 )); then   # same NUMA node first, our pair 2,3 before 0,1 (GPU 0,1 = node 0; 2,3 = node 1), all pairs are NVLink
+        for pr in "2 3" "0 1"; do read -r ga gb <<< "$pr"; [[ $fs == *" $ga "* && $fs == *" $gb "* ]] && { MGPU_LIST="$ga,$gb"; break; }; done
       fi
       [[ -z $MGPU_LIST ]] && (( ${#free[@]} >= MGPU )) && MGPU_LIST=$(IFS=,; echo "${free[*]:0:MGPU}")
       [[ -n $MGPU_LIST ]] && break

@@ -46,6 +46,10 @@ dominated). Step 4 scales (GPU search). Per-GPU setup (`gpu_buffer_alloc`, `futu
 
 ## GPU availability (user decisions 2026-11-01 / 2026-11-19)
 
+- **GPU agreement (2026-11-19):** wangcy07 uses GPUs 0,1; ours are 2,3, but 0,1 may be used while they are free.
+  `gpu_select.sh` `GPU_ORDER="2 3 0 1"`; `run_pipeline.sh` / `mgpu_run.sh` scan `$GPU_ORDER`, so single-GPU runs (guard, det
+  G = 1) take GPU 2 or 3 first and 2-GPU runs take the pair **2,3** first, then 0,1. G = 4 only when all four happen to be
+  free at the test phase; skipping it never blocks a verdict. The G = 4 best in `best_scale.json` stays as reference.
 - **2 GPUs are always measured. 4 GPUs are measured only if all four GPUs are free when the test phase
   starts; otherwise skip G = 4 for this iteration** (log "G=4 skipped: GPU x,y used by <user>") and judge on
   G = 2 alone. Never wait for the 4th GPU.
@@ -80,6 +84,17 @@ optimization has priority**; never change the algorithm's semantics — log such
 - **ACCEPT** iff the equivalence check passes, the single-GPU guard passes, every measured multi-GPU config
   passes quality / defects, at least one measured multi-GPU config is **≥ 3% faster** than its best, and none is
   **> 3% slower**. Memory guard off (`--no-mem`; user 2026-11-16: host peak RSS ignored for now — still record it).
+- **Compute gain, disk-bound (user 2026-11-19, in force from S7 on):** the user will re-test on a high-throughput disk, so a
+  change that really saves GPU / compute time but does not show in the total because `/` is slow (~0.29 GB/s) is also
+  ACCEPTED when all of:
+  (a) the saving is attributable and measured: the changed stage's compute metric (Step 6 per-GPU `bucket_loop` compute,
+      Step 4 GPU time, prune `compute(parallel)`, optimize GPU reverse+merge count / fill / select / h2d, ...) drops by
+      **≥ 5 s or ≥ 10 %** (median of 3), and the log names the disk wait that absorbed it (Wait / flush / sink growth);
+  (b) the total is **not > 3 % slower** than best (noise gate), preferably with a same-period HEAD reference;
+  (c) correctness, det_check, search quality and the single-GPU guard all pass as usual.
+  Judge with `--update --compute-gain` (writes only configs whose total beat their best; a slower total never replaces a
+  best, so +3 % cannot accumulate). Log it as **"accepted (compute gain, disk-bound)"** with a before / after table of the
+  compute metrics. Pure I/O moves / overlaps (e.g. S6 background write) are not compute savings.
 - A config with no best yet (e.g. G = 4 never measured, or the first iteration) is recorded with `--add-new`
   and does not block the verdict.
 - Report every iteration's **speedup vs 1 GPU** (`optimize-bucket2/state/best.json` `sift100M_auto`) per

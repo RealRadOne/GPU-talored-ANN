@@ -4,11 +4,15 @@ Goal: SIFT100M build faster with 2 GPUs (always) and 4 GPUs (when all four are f
 unchanged, single-GPU path not slower. Skill: `.claude/skills/optimize-bucket2-scale/SKILL.md`.
 Best: `.claude/skills/optimize-bucket2-scale/state/best_scale.json` (judge keys `sift100M_auto_g2`, `sift100M_auto_g4`).
 
+**GPU agreement (user, 2026-11-19):** wangcy07 uses GPUs 0,1, ours are 2,3 (0,1 usable while free). Selection order
+`2 3 0 1`; 2-GPU runs prefer the pair 2,3. G = 4 only when all four are free (never blocks a verdict); the G = 4 best is kept
+as reference.
+
 ## Current best
 
-**G = 2: 307.50 s** (S1, 2026-11-19, GPUs 0,1, reps 315.50 / 307.50 / 307.01) — bucket2 229.49 (Step 4 62.3,
-Step 6 99.4, Wait 25.1, Step 4.5 15.2), prune 42.9, optimize 37.4; recall@10 L 32 / 64 / 128 = 0.7254 / 0.8351 /
-0.9115, 0 defects; bucket2 peak RSS 80.4 GB. Run `runs/scale1/sift100M_auto_g2`. Baseline was 465.78 s (`runs/scale0_base`).
+**G = 2: 304.42 s** (S4 re-judged 2026-11-19, "accepted (compute gain, disk-bound)"; reps 304.4 / 299.4 / 365.0, GPUs 0,1;
+`runs/scale4/sift100M_auto_g2`) — Step 6 85.2, Wait 33.5, optimize 35.0; recall@10 0.7272 / 0.8334 / 0.9120. Previous best
+307.50 (S1). Compute metrics for the fast-disk re-check are in the S3 / S4 re-judge entry below.
 **G = 4: 259.46 s** (S2, 2026-11-19, GPUs 0–3, reps 258.90 / 259.46 / 259.76) — bucket2 171.94 (Step 4 42.4,
 Step 6 63.3, Wait 25.9), prune 50.0, optimize 37.6; recall@10 0.7257 / 0.8324 / 0.9105; peak RSS 83.3 GB.
 Run `runs/scale2/sift100M_auto_g4`. (S1 HEAD G = 4: 294.57 s, `runs/scale1m/sift100M_auto_g4`.)
@@ -26,10 +30,20 @@ prune 44.7, optimize 35.8); 4 GPUs 347.79 s (Step 4 42.3, Step 6 121.8, Wait 50.
 
 Item names below are backlog labels, not iteration numbers (iterations are logged as `### S<N>` under Iterations).
 
+**User priority (2026-11-19): after S7 (compact vector_knn), do these two next, in this order. Both implementation-level;
+outputs must stay byte-identical to today's.**
+
+- **P1 — prune multi-GPU: per-GPU parallel plan / load + per-GPU direct output.** Today at G = 4 the per-GPU plan
+  (0.7 / 1.4 / 2.9 / 5.6 s) and load (4.4 / 5.8 / 9.0 / 13.1 s) queue up one after another, and all rows go through one shared
+  sink (writer-thread time summed 67.8 s at G = 4 vs 30.6 s at G = 2). Make each GPU plan / load concurrently and `pwrite` its
+  own rows straight to their offsets in the output file (no shared sink).
+- **P2 — optimize_chunked source-row split** (was S7 below). Each GPU uploads only its own source rows once and sends the
+  edges to the GPU that owns the destination rows over NVLink (peer copies), instead of every GPU re-uploading the whole
+  forward graph on every pass (G = 4: passes 5, h2d 11.4 s vs G = 2: passes 3, 6.6 s). Source: cuVS `mg/snmg.cuh`.
+
 - **S1 — done** (arrival records in RAM). S1b (bigger budget, no round-2 spill) tried as S5: no gain (rejected).
 - **S2 — done** (per-GPU arrival lanes).
-- **S3 / S4 — load balance (Step 6 cost cut + optimize segment cut):** real per-stage gains, rejected because the disk-bound
-  Wait absorbs them at G = 2 (see Tried & rejected). Re-try `bucketDemo/patches/scale4_balance.patch` after S1b, and at G = 4.
+- **S3 / S4 — done:** accepted on re-judge under the compute-gain rule (2026-11-19).
 - **S8 — per-GPU setup.** `gpu_buffer_alloc` 0.2–0.9 s per GPU per round, `future_access` 0.16–0.68 s; Step 4
   per-GPU convert_upload doubling at G = 4 (shared H2D, NUMA). Pin host threads / staging to the GPU's NUMA node;
   allocate once for both rounds.
@@ -51,6 +65,13 @@ _(none)_
 
 ## Tried & rejected
 
+- **S7 (2026-11-19) — compact vector_knn.bin** (zigzag varint of nbr − gid, 256-row groups + offset table; prune / optimize /
+  knn_similarity read both formats; deterministic in-order offsets). Lossless: forward + final graph byte-identical with the
+  compact input, 50 004 sampled rows decode identical, knn_similarity identical, det 2 EQUAL, guard ACCEPT (+1.9 / +1.2 %). At
+  100M only 21.0 vs 25.6 GB (−18 %; sift10M −24 %). G = 2 (GPUs 2,3) **335.37 s (−9.1 %)**: final merge slightly faster (Wait
+  24.8 s) but prune `load` 8–13 → 18–46 s per GPU — prune re-reads candidate rows ~4.3 × N and every re-read now pays the
+  varint decode (prune 43 → 69 s). Not a compute saving. Patch `bucketDemo/patches/scale7_compact_vector_knn.patch`
+  (includes the new `knn_compact.hpp` and the knn_similarity decoder).
 - **S6 (2026-11-19) — data_reordered (12.8 GB) written in the background in blob mode** (`write_reordered_async`, join before round-2
   Step 4 and at exit) instead of synchronously in Step 4.5. Step 4.5 15.3 → 4.6 s, but round-1 Step 6 99 → 110.6 s (the background
   write competes for memory bandwidth / page cache while Step 6 reads the host blob) → G = 2 323.11 s (−5.1 % vs best), same-period
@@ -160,4 +181,29 @@ now lists every device of the reps (was the first one only).
 | prune | 55.8 | 42.6 (1.31x) | 50.0 (1.12x) |
 | optimize | 39.5 | 34.9 (1.13x) | 37.6 (1.05x) |
 | total | 429.6 | 309.4 (1.39x) | 259.5 (1.66x) |
+
+### S3 + S4 re-judged — accepted (compute gain, disk-bound) (2026-11-19, user rule of the same day)
+
+S3 (Step 6 cut by estimated cost, κ = 0.3) and S4 (= S3 + optimize_chunked segment cut at k·E/G) had real compute savings that
+the slow disk absorbed (originally rejected, see Tried & rejected). Re-judged from their existing runs (same code as today's HEAD
++ `scale4_balance.patch`, which is now committed): (a) attributable compute drop ≥ 5 s / ≥ 10 %; (b) total not > 3 % slower than
+best (S4 304.42 s, S3 302.20 s vs best 307.50 → faster; same-period HEAD refs 325.6 / 311.3 / A/B 311.0 s); (c) det 2 EQUAL,
+guard ACCEPT, quality unchanged. `judge.py --update --compute-gain` → G = 2 best 307.50 → 304.42 s. G = 4 never measured
+(GPUs busy). **Compute metrics for the fast-disk re-check** (SIFT100M G = 2, median of 3; loop = max over GPUs of the Step 6
+`bucket loop` per round; opt GPU = count + fill + select + merge+emit of the GPU reverse merge):
+
+| set | loop r1 | loop r2 | loop sum | Step 6 | Wait | opt GPU | fill | h2d | passes | total |
+|---|---|---|---|---|---|---|---|---|---|---|
+| HEAD (S2 judged, `runs/scale2`) | 50.2 | 44.2 | **94.4** | 99.3 | 25.8 | **21.9** | 8.5 | 7.4 | 3 | 309.4 |
+| HEAD A/B B1–3 (`runs/scale4/ab`; optimize here was already the S4 binary) | 50.3 | 43.8 | 94.0 | 98.5 | 26.3 | 18.0 | 5.6 | 4.0 | 2 | 311.0 |
+| S3 κ = 0.5 (`runs/scale3`, GPUs 2,3) | 45.2 | 39.3 | 84.7 | 89.4 | 26.0 | 24.2 | 9.4 | 8.2 | 3 | 308.2 |
+| S3 κ = 0.3 (`runs/scale3k`) | 42.6 | 37.3 | **80.0** | 85.1 | 25.8 | 22.3 | 8.9 | 7.7 | 3 | 302.2 |
+| S4 judged (`runs/scale4`) | 42.5 | 37.5 | **80.1** | 85.2 | 33.5 | **17.0** | 5.5 | 3.8 | 2 | 304.4 |
+| S4 A/B A1–3 (`runs/scale4/ab`) | 42.6 | 37.5 | 79.9 | 85.4 | 28.6 | 18.7 | 5.7 | 4.4 | 2 | 304.5 |
+
+- Step 6 (S3): loop sum 94.4 → 80.0 s (**−14.4 s, −15 %**); absorbed by the final merge (Wait 25.8 → 28.6–33.5 s: the earlier
+  end of Step 6 meets un-flushed dirty pages when the 25.6 GB vector_knn is written).
+- optimize (S4 segment cut): GPU reverse+merge 21.9 → 17.0 s (**−4.9 s, −22 %**; fill 8.5 → 5.5, h2d 7.4 → 3.8, passes 3 → 2);
+  absorbed by the 12.8 GB final-graph write (optimize_chunked total ~35 s in both).
+- Expected on a fast disk: up to ~19 s off the G = 2 total; more at G = 4 (per-GPU loops 18.6–30.3 s / round after S2).
 

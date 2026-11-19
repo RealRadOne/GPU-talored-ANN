@@ -1701,14 +1701,19 @@ struct GpuReverseMerge {
         const size_t per_edge = sizeof(KeyT) * (segsort ? 2 : 1);
         const size_t per_row = 12 + (segsort ? 4 : 0);
         const uint64_t max_seg_edges = segsort ? static_cast<uint64_t>(INT32_MAX) - 1 : ~0ull;   // cub 的 int 下标
-        const uint64_t edge_share = (G > 1) ? (n_edges + G - 1) / G : ~0ull;                      // 多卡: 每段 ≤ 1/G 的边
+        // 多卡: 段按累计边数切在 k·E/G (k = 1..G-1)，最后一段收尾。原来每段 ≤ ceil(E/G) 条边、在超出前一行停 →
+        // G 段总差几行，多出一个只有几行的尾段轮到卡 0，卡 0 为它再传一遍整张前向图、扫一遍全部边
+        // (SIFT100M: G=2 passes=3, G=4 passes=5)。显存预算 / cub 上限照旧可以多切段 (轮流分给各卡)。
         std::vector<std::pair<int64_t, int64_t>> segs;
         for (int64_t lo = 0; lo < N; ) {
+            const uint64_t seg_end_target = (G > 1 && static_cast<int>(segs.size()) < G - 1)
+                ? n_edges * static_cast<uint64_t>(segs.size() + 1) / static_cast<uint64_t>(G) : ~0ull;
             int64_t hi = lo; size_t need = 0; uint64_t e_acc = 0;
             while (hi < N) {
                 const uint64_t ce = off[static_cast<size_t>(hi) + 1] - off[static_cast<size_t>(hi)];
                 const size_t add = static_cast<size_t>(ce) * per_edge + per_row;
-                if (hi > lo && (need + add + (size_t(64) << 20) > budget || e_acc + ce > max_seg_edges || e_acc + ce > edge_share)) break;
+                if (hi > lo && (need + add + (size_t(64) << 20) > budget || e_acc + ce > max_seg_edges ||
+                                off[static_cast<size_t>(hi) + 1] > seg_end_target)) break;
                 need += add; e_acc += ce; ++hi;
             }
             segs.emplace_back(lo, hi);

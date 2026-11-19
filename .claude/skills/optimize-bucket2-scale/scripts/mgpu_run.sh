@@ -23,13 +23,13 @@ exec 9>>/home/lanlu/.bench_locks/bucket2_bench.lock
 flock 9
 echo "$$ $(date +%F_%T) mgpu_run $DS G=$G -> $OUT" > /home/lanlu/.bench_locks/bucket2_bench.lock.owner
 
-if [[ -z ${GPU_LIST:-} ]]; then   # G free GPUs; for G=2 a same-NUMA pair first (0,1 / 2,3)
+if [[ -z ${GPU_LIST:-} ]]; then   # G free GPUs in $GPU_ORDER; for G=2 a same-NUMA pair first (2,3 then 0,1)
   W=0
   while :; do
-    free=(); for g in 0 1 2 3; do gpu_is_free "$g" && free+=("$g"); done
+    free=(); for g in $GPU_ORDER; do gpu_is_free "$g" && free+=("$g"); done   # preference order (gpu_select.sh: 2 3 0 1, agreement 2026-11-19)
     fs=" ${free[*]} "
     if (( G == 2 )); then
-      for pr in "0 1" "2 3"; do read -r ga gb <<< "$pr"; [[ $fs == *" $ga "* && $fs == *" $gb "* ]] && { GPU_LIST="$ga,$gb"; break; }; done
+      for pr in "2 3" "0 1"; do read -r ga gb <<< "$pr"; [[ $fs == *" $ga "* && $fs == *" $gb "* ]] && { GPU_LIST="$ga,$gb"; break; }; done
     fi
     [[ -z ${GPU_LIST:-} ]] && (( ${#free[@]} >= G )) && GPU_LIST=$(IFS=,; echo "${free[*]:0:G}")
     [[ -n ${GPU_LIST:-} ]] && break

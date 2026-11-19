@@ -2,7 +2,7 @@
 """Accept / reject one candidate iteration against state/best.json (dataset-generic).
 
 usage:
-  judge.py RUN_DIR [RUN_DIR ...] [--update] [--md] [--quick] [--add-new] [--rebaseline]
+  judge.py RUN_DIR [RUN_DIR ...] [--update] [--md] [--quick] [--add-new] [--rebaseline] [--no-mem] [--compute-gain]
     RUN_DIR      : run_pipeline.sh output dirs (each holds metrics.json); the config key is
                    <dataset>_<mode> from metrics.json (e.g. sift1M_auto, sift100M_auto, msTuring10M_auto)
     --update     : on ACCEPT (or when best.json does not exist yet) write the candidate into state/best.json
@@ -13,6 +13,10 @@ usage:
     --rebaseline : with --update, overwrite the best entries of these configs with the candidate when only
                    speed rules failed (used once after a measurement-rule change, e.g. SIFT100M 1 -> 3 runs)
     --no-mem     : skip the memory guard (optimize-bucket2-scale, user 2026-11-16: host peak RSS ignored for now)
+    --compute-gain : optimize-bucket2-scale rule (user 2026-11-19, "accepted (compute gain, disk-bound)"): with --update,
+                   when correctness / quality pass and no config is > 3% slower than best (only the ">= 3% faster" rule
+                   failed), write ONLY the configs whose total is faster than their best -- a slower total never replaces
+                   a best (no +3% creep). The compute-time gain itself (rule a) is checked from the stage logs.
   env JUDGE_BEST=<path>    : best file to compare with / update (default state/best.json; the scale loop uses
                              optimize-bucket2-scale/state/best_scale.json)
   env JUDGE_BENCH=k1,k2,.. : bench set required for ACCEPT (default: datasets.json "bench")
@@ -201,6 +205,12 @@ if "--update" in flags:
         print("--update ignored with --quick", file=sys.stderr)
     elif verdict == "ACCEPT" or best is None:
         write(KEYS)
+    elif "--compute-gain" in flags and not fail and not any("slower than best" in f or "incomplete bench set" in f for f in speed_fail):
+        better = [k for k in KEYS if k not in brun or cand[k]["build_total_s"] < brun[k]["build_total_s"]]
+        if better:
+            write(better)
+        print("compute-gain: no regression > 3%; best totals kept for "
+              f"{[k for k in KEYS if k not in better] or 'none'}", file=sys.stderr)
     elif "--rebaseline" in flags and not fail:
         write(KEYS); print("rebaseline: only speed rules failed; entries replaced", file=sys.stderr)
     elif "--add-new" in flags and best:

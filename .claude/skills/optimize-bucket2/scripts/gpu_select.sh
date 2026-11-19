@@ -2,7 +2,8 @@
 # select_gpu keeps $GPU if it is free, else takes the first free GPU in $GPU_ORDER; if none is free it
 # waits, printing GPU_WAIT lines (the loop's Monitor turns them into a notification to the user).
 # Free = no compute process on it and < GPU_FREE_MIB used.
-: "${GPU_ORDER:=0 1 2 3}"
+# User agreement 2026-11-19: our GPUs are 2,3 (wangcy07 has 0,1); 0,1 may be used when free (user 2026-11-19), 2,3 first.
+: "${GPU_ORDER:=2 3 0 1}"
 : "${GPU_FREE_MIB:=1000}"
 GPU_WAIT_MARK=/home/lanlu/.bench_locks/GPU_WAIT
 
