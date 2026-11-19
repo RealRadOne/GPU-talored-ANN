@@ -12,7 +12,7 @@ as reference.
 
 **G = 2: 304.42 s** (S4 re-judged 2026-11-19, "accepted (compute gain, disk-bound)"; reps 304.4 / 299.4 / 365.0, GPUs 0,1;
 `runs/scale4/sift100M_auto_g2`) — Step 6 85.2, Wait 33.5, optimize 35.0; recall@10 0.7272 / 0.8334 / 0.9120. Previous best
-307.50 (S1). Compute metrics for the fast-disk re-check are in the S3 / S4 re-judge entry below.
+307.50 (S1). S9 (optimize src-split) accepted under the compute-gain rule without a new best (311.50 s, slow-disk period). Compute metrics for the fast-disk re-check are in the S3 / S4 re-judge entry below.
 **G = 4: 259.46 s** (S2, 2026-11-19, GPUs 0–3, reps 258.90 / 259.46 / 259.76) — bucket2 171.94 (Step 4 42.4,
 Step 6 63.3, Wait 25.9), prune 50.0, optimize 37.6; recall@10 0.7257 / 0.8324 / 0.9105; peak RSS 83.3 GB.
 Run `runs/scale2/sift100M_auto_g4`. (S1 HEAD G = 4: 294.57 s, `runs/scale1m/sift100M_auto_g4`.)
@@ -30,6 +30,10 @@ prune 44.7, optimize 35.8); 4 GPUs 347.79 s (Step 4 42.3, Step 6 121.8, Wait 50.
 
 Item names below are backlog labels, not iteration numbers (iterations are logged as `### S<N>` under Iterations).
 
+- **S10 — optimize count phase (4.2 s at G = 2):** each GPU D2Hs a full N×4 B count array and the host sums G arrays +
+  serial prefix over N; reduce on GPU (peer add into GPU 0, or per-GPU dst-range counts) + parallel prefix.
+- **S11 — re-judge S8 (prune async writers) at G = 4** when all four GPUs are free (patch kept).
+
 **User priority (2026-11-19): after S7 (compact vector_knn), do these two next, in this order. Both implementation-level;
 outputs must stay byte-identical to today's.**
 
@@ -37,7 +41,7 @@ outputs must stay byte-identical to today's.**
   (0.7 / 1.4 / 2.9 / 5.6 s) and load (4.4 / 5.8 / 9.0 / 13.1 s) queue up one after another, and all rows go through one shared
   sink (writer-thread time summed 67.8 s at G = 4 vs 30.6 s at G = 2). Make each GPU plan / load concurrently and `pwrite` its
   own rows straight to their offsets in the output file (no shared sink).
-- **P2 — optimize_chunked source-row split** (was S7 below). Each GPU uploads only its own source rows once and sends the
+- **P2 — done (S9, accepted compute gain).** ~~optimize_chunked source-row split~~ (was S7 below). Each GPU uploads only its own source rows once and sends the
   edges to the GPU that owns the destination rows over NVLink (peer copies), instead of every GPU re-uploading the whole
   forward graph on every pass (G = 4: passes 5, h2d 11.4 s vs G = 2: passes 3, 6.6 s). Source: cuVS `mg/snmg.cuh`.
 
@@ -214,3 +218,35 @@ guard ACCEPT, quality unchanged. `judge.py --update --compute-gain` → G = 2 be
   absorbed by the 12.8 GB final-graph write (optimize_chunked total ~35 s in both).
 - Expected on a fast disk: up to ~19 s off the G = 2 total; more at G = 4 (per-GPU loops 18.6–30.3 s / round after S2).
 
+### S9 — P2 optimize_chunked source-row split (NVLink peer fill) — accepted (compute gain, disk-bound) (2026-11-19)
+
+**Idea.** `GpuReverseMerge` fill: before, every GPU streamed the *whole* forward graph over PCIe for each dst segment it
+owned (GPU 2,3 share one PCIe switch). Now segments go in rounds (round k: GPU g owns segment k·G+g, all resident at once);
+each GPU streams only its own source rows [N·g/G, N·(g+1)/G) once per round and `kern_rev_fill_multi` writes every edge
+straight into the owning GPU's `keys` (NVLink peer store + peer `atomicAdd`; `off_rel` replicated read-only per GPU). Needs
+P2P + native peer atomics between all pairs, else (and for G = 1, or `OC_GPU_REV_SPLIT=0`) the old path. Budget charges
+8·(G−1) B/row for the replicas. Select / merge / emit unchanged. Source: cuVS `mg/snmg.cuh` sharded build (each rank works on
+its own shard). Class: implementation (same result; det byte-identical). New test switch `OC_GPU_PHASE2=0` forces the
+GpuReverseMerge path on small data (SIFT10M normally uses single-chunk GPU Phase 2 and would not exercise it).
+
+**Correctness.** det 2 EQUAL in plain mode, with `OC_GPU_PHASE2=0` (new path, passes=2 src-split) and with
+`OC_GPU_PHASE2=0 OC_GPU_REV_BUDGET_MB=300` (passes=6 → 3 rounds). Single-GPU guard ACCEPT. SIFT10M probe (G = 2):
+fill 1.20 → 0.44 s, h2d 0.95 → 0.24 s. G = 4 skipped (GPU 0 held by wangcy07).
+
+**SIFT100M G = 2 ×3 (GPUs 2,3).** Total 311.50 s (+2.3 % vs best 304.42 → within the 3 % gate; best unchanged), reps:
+optimize 39.6 / 38.7 / 32.1, prune 57.3 / 53.3 / 45.6 (prune code unchanged; same-period HEAD ref 42.1 → slow-disk reps).
+bucket2 219.9 (Step 4 61.6, Step 6 85.6, Wait 28.6). Recall@10 0.7254 / 0.8338 / 0.9116 (unchanged).
+
+| compute metric (optimize GPU reverse + merge) | same-period HEAD ref (`OC_GPU_REV_SPLIT=0`) | S9 median of 3 |
+|---|---|---|
+| fill | 5.52 s | 4.60 s (−17 %) |
+| h2d inside | 4.29 s | 2.54 s (−41 %) |
+| count + fill + select | 10.78 s | 9.50 s (−11.9 %) |
+| merge + emit (incl. disk-bound emit) | 6.30 s | 7.32 s |
+
+Absorbed by: optimize Phase 2 stream write of the final graph (Phase 2 37.8 / 37.0 / 30.3 s vs ref 31.0, tracks the slow-disk
+reps that also slowed the unchanged prune). Expected larger at G = 4 (each GPU used to stream the whole graph per pass).
+
+| speedup vs 1 GPU (429.56 s) | Step 4 | Step 6 | Wait | prune | optimize | total |
+|---|---|---|---|---|---|---|
+| G = 2 (S9) | 1.65× | 1.87× | 1.18× | 1.05× | 1.02× | 1.38× |
