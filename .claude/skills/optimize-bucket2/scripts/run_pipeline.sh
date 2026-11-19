@@ -43,6 +43,11 @@ DSDIR=$DS_DIR
 [[ ${B13_DISTS:-0} == 1 ]] && BUCKET2_EXTRA="${BUCKET2_EXTRA/--skip-dists/}"   # B13: prune reads vector_dists.bin
 BUCKET2_EXTRA="$BUCKET2_EXTRA --kmeans-train-fraction $KMEANS_TRAIN_FRACTION --cache-mb $CACHE_MB --bucket-mem-mb $BUCKET_MEM_MB --gpu-bucket-cache-mb $GPU_BUCKET_CACHE_MB"
 CHUNKED_EXTRA="$CHUNKED_EXTRA --host-budget-mb $CHUNKED_HOST_BUDGET_MB"
+# MGPU=G (G > 1): multi-GPU build on visible devices 0..G-1 (bucket2 Step 4 / Step 6, prune, optimize_chunked
+# get --num-gpus G); select_gpu still guards GPU 0. Single-GPU runs (unset / 1) are unchanged.
+if (( ${MGPU:-1} > 1 )); then
+  BUCKET2_EXTRA="$BUCKET2_EXTRA --num-gpus $MGPU"; PRUNE_EXTRA="$PRUNE_EXTRA --num-gpus $MGPU"; CHUNKED_EXTRA="$CHUNKED_EXTRA --num-gpus $MGPU"
+fi
 export BUCKET2_A1_PASSES=$A1_PASSES   # A1-R local join passes (resident path, #40)
 export BUCKET2_A7_UNWIN=$A7_UNWIN     # A7: unwindowed batched GPU prune (#55)
 echo "[$DS] $DTYPE N=$N D=$DIM reps=$REPS iters=$ITERATIONS ratio=$CENTROID_RATIO nprobe=$NPROBE search=$SEARCH ($ADAPT_NOTE)"
@@ -93,6 +98,7 @@ rep_retry_or_fail() {  # rep_retry_or_fail STAGE
 
 for ((R = 0; R < REPS; R++)); do
   select_gpu
+  (( ${MGPU:-1} > 1 )) && export CUDA_VISIBLE_DEVICES=$(seq -s, 0 $((MGPU - 1)))   # MGPU: all G devices
   RD=$OUT/rep$R; W=$RD/work; mkdir -p "$W"
   echo "$GPU" > "$RD/gpu.txt"
   echo "[$DS/$MODE rep $R, GPU $GPU] -> $RD"

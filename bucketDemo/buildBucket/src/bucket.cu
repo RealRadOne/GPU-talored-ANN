@@ -1942,7 +1942,10 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
         const int64_t be = std::min(bs + Nv, nc_end);
         const int64_t lo = non_centroid_indices[bs], hi = non_centroid_indices[be - 1];
         T* dst = d_raw_pf[slot];
-        io_next = std::async(std::launch::async, [&raw_batch, &input_path, copy_stream, dst, lo, hi, D] {
+        int io_dev = 0;
+        CUDA_CHECK(cudaGetDevice(&io_dev));   // 多 GPU Step 4: 后台线程要切到这张卡 (copy_stream 属于它)
+        io_next = std::async(std::launch::async, [&raw_batch, &input_path, copy_stream, dst, lo, hi, D, io_dev] {
+            CUDA_CHECK(cudaSetDevice(io_dev));
             int32_t n_tmp, d_tmp;
             load::read_bigann_raw_range<T>(input_path, lo, hi - lo + 1, raw_batch, n_tmp, d_tmp);
             CUDA_CHECK(cudaMemcpyAsync(dst, raw_batch.data(),
@@ -7713,6 +7716,9 @@ void build_vector_knn_with_tensorcore(
 
     auto producer = [&]() {
         try {
+            // 多 GPU Step 6: cudaSetDevice 是线程级的，producer 是新线程 (默认在 0 号卡)，
+            // 必须切到调用方这张卡，否则用的是别的卡上创建的 stream / event → invalid resource handle
+            CUDA_CHECK(cudaSetDevice(dev_id));
             std::vector<CopyJob> jobs;
             jobs.reserve(static_cast<size_t>(K) + 1);
             for (int32_t pos = 0; pos < n_pos; ++pos) {

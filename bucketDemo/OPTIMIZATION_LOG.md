@@ -2705,6 +2705,25 @@ Also: two accumulator structs got a `std::mutex` member for multi-GPU, which mad
 
 **Verdict:** ACCEPT by rule (sift1M_auto +4.0 %, msTuring10M +3.3 %; others within ±3 %: SIFT100M −1.8 %, sift1M_large −2.8 %). **End-to-end effectively neutral** — ~14 s of compute saved on SIFT100M is hidden by ±15 s disk variance; not claimed as a speed-up. Value: GPU reverse merge is the basis for 1B / multi-GPU optimize. best.json updated (note: SIFT100M best moves 422.08 → 429.56 s).
 
+### #97 — multi-GPU fixes + first multi-GPU measurements (no change to the single-GPU path)  (2026-11-16)
+**Fixes:** (1) `bucket_order::compute_future_access_lists` sized its per-bucket table by `order.size()`; with multi-GPU Step 6 each GPU gets only its slice of the processing order → out-of-bounds writes (SIFT100M segfault at Step 6 start, G = 2 / 4; silent heap corruption at 10M). Now sized by the bucket count (`adj.size()`) with a bounds check; full-order callers unchanged. (2) `cudaSetDevice` is per thread: the Step 6 producer thread and the Step 4 prefetch `std::async` thread now switch to their GPU first (was `invalid resource handle` on GPU ≥ 1). (3) `run_pipeline.sh`: `MGPU=G` → visible devices 0..G−1 and `--num-gpus G` for bucket2 / prune / optimize_chunked (unset = old behaviour).
+**Correctness:** with `BUCKET2_ASSIGN_DETERMINISTIC=1` (sequential Step 4d) SIFT10M G = 1 / 2 / 4 are byte-identical at every stage (inverse_perm, vector_knn, forward graph, final graph). Normal runs differ only through Step 4's randomness (user 2026-11-16: byte identity not required; search quality must hold).
+**SIFT100M (−r 1, GPU 0..G−1, `runs/mgpu/q`):**
+
+| | 1 GPU (best #96) | 2 GPUs | 4 GPUs |
+|---|---|---|---|
+| total | 429.56 | **317.70 (−26 %)** | 347.79 (−19 %) |
+| Step 4 (2 rounds) | 101.6 | 62.5 | 42.3 |
+| Step 6 (2 rounds) | 159.8 | 109.9 | 121.8 |
+| Wait | 33.8 | 25.2 | 50.7 |
+| prune | 55.8 | 44.7 | 45.8 |
+| optimize_chunked | 39.5 | 35.8 | 46.5 |
+| recall@10 L 32 / 64 / 128 | 0.7246 / 0.8306 / 0.9097 | 0.7258 / 0.8326 / 0.9100 | 0.7245 / 0.8333 / 0.9111 |
+
+10M (4 GPUs): SIFT10M 36.73 → 33.78 s, msTuring10M 81.19 → 81.88 s, recall within ±0.005 of best. Host peak RSS grows with G (msTuring10M 26.3 GB, SIFT100M 37.5 GB; user: ignore for now).
+**Bottlenecks:** Step 6 is capped at ~50 s / round by the shared arrival appender (`append_mtx`: one thread writes ~35 GB / round at ~0.85 GB/s into the page cache, the other GPUs' threads wait 33–50 s on the lock) — more GPUs only add contention, and Wait grows (+17 s at G = 4, more dirty pages to flush). optimize G > 1 re-uploads the whole forward graph per GPU per segment (H2D 3.8 / 7.9 / 12.1 s at G = 1 / 2 / 4). Step 4 scales (GPU search 40.6 → 10.4 s per round at G = 4).
+**Next:** per-GPU arrival accumulators (same bytes, removes the lock; disk still the final limit at 1B), then optimize split by source rows + NVLink exchange to dst owners.
+
 <!-- template for an accepted entry:
 ### #N — <one-line idea>  (<date>, commit <hash>)
 **Idea / rationale:** what changed and why; cuVS 26.12 reference (file::function) it follows.
