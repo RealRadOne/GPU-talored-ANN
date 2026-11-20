@@ -1,0 +1,103 @@
+diff --git a/.claude/skills/optimize-bucket2-scale/scripts/det_check.sh b/.claude/skills/optimize-bucket2-scale/scripts/det_check.sh
+index 53413bc..9c7b95a 100755
+--- a/.claude/skills/optimize-bucket2-scale/scripts/det_check.sh
++++ b/.claude/skills/optimize-bucket2-scale/scripts/det_check.sh
+@@ -9,13 +9,14 @@ set -uo pipefail
+ DS=$1; G=$2
+ T=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+ W=${3:-/home/lanlu/microBenchmark/bucketDemo/buildBucket/runs/det_check_$$}
+-export BUCKET2_ASSIGN_DETERMINISTIC=1 BUCKET2_STEP4_CHECKSUM=1
++# OC_KEEP_FORWARD=1: optimize_chunked keeps forward_graph_reordered.bin (S13 deletes it by default) so it can be compared
++export BUCKET2_ASSIGN_DETERMINISTIC=1 BUCKET2_STEP4_CHECKSUM=1 OC_KEEP_FORWARD=1
+ bash $T/mgpu_run.sh $DS 1 $W/g1 | tee >(grep --line-buffered GPU_WAIT >&2) | tail -1 || { echo "MISMATCH (G=1 build failed)"; exit 1; }
+ bash $T/mgpu_run.sh $DS $G $W/g$G | tee >(grep --line-buffered GPU_WAIT >&2) | tail -1 || { echo "MISMATCH (G=$G build failed)"; rm -rf $W; exit 1; }
+ a=$(ls -d $W/g1/work/k*/ | head -1); b=$(ls -d $W/g$G/work/k*/ | head -1)
+ ok=1
+ for f in inverse_perm.bin bucket_offsets.bin vector_knn.bin forward_graph_reordered.bin final_graph.bin; do
+-  if [[ ! -f $a/$f && ! -f $b/$f ]]; then continue; fi
++  if [[ ! -f $a/$f && ! -f $b/$f ]]; then [[ $f == forward_graph_reordered.bin ]] && { echo "$f MISSING"; ok=0; }; continue; fi
+   if cmp -s $a/$f $b/$f; then echo "$f same"; else echo "$f DIFF"; ok=0; fi
+ done
+ echo "step4 checksums G=1: $(grep -o 'checksum [0-9a-f]*' $W/g1/bucket2.log | awk '{print $2}' | tr '\n' ' ') G=$G: $(grep -o 'checksum [0-9a-f]*' $W/g$G/bucket2.log | awk '{print $2}' | tr '\n' ' ')"
+diff --git a/bucketDemo/buildBucket/src/optimize_chunked.cu b/bucketDemo/buildBucket/src/optimize_chunked.cu
+index 679e70c..81922e0 100644
+--- a/bucketDemo/buildBucket/src/optimize_chunked.cu
++++ b/bucketDemo/buildBucket/src/optimize_chunked.cu
+@@ -2117,6 +2117,17 @@ struct InProcessTranslate {
+     }
+ };
+ 
++// S13 (user-approved 2026-11-19): forward_graph(_reordered).bin 是 prune → optimize 的中间文件，optimize 读完
++// 就删掉 —— 还没刷盘的脏页 (/ 写盘只有 ~0.29 GB/s) 随之丢弃，不再跟最终图的写出抢带宽。最终输出不变。
++// --keep-forward 或 OC_KEEP_FORWARD=1 保留 (det_check 等需要比较前向图时用)。重复调用无害。
++static bool g_keep_forward = false;
++static void drop_forward_graph(const std::string& p) {
++    static bool done = false;
++    if (g_keep_forward || done) return;
++    done = true;
++    if (::unlink(p.c_str()) == 0) std::cout << "  [S13] removed intermediate " << p << " (already read)\n";
++    else if (errno != ENOENT) std::cout << "  [S13] could not remove " << p << ": " << std::strerror(errno) << "\n";
++}
+ static void run_method_E(
+     const std::string& fwd_path,
+     const std::string& out_path,
+@@ -2326,6 +2337,7 @@ static void run_method_E(
+         h_fwd_all.reset(new uint32_t[static_cast<size_t>(N) * K_out]);
+         parallel_pread_file(fwd_path, static_cast<off_t>(sizeof(int64_t) + sizeof(int32_t)),
+                             static_cast<size_t>(N) * K_out * sizeof(uint32_t), h_fwd_all.get());
++        drop_forward_graph(fwd_path);   // S13: 整张图已在内存，后面不再读这个文件
+         for (auto& t : warm) t.join();
+         const double t_phase1 = std::chrono::duration<double>(Clock::now() - tA).count();
+         std::cout << "  [Timing] Phase 1 (read forward graph for the GPU reverse + merge) = " << std::fixed
+@@ -2550,10 +2562,13 @@ static void run_method_E(
+     // 那一段当 output 的初始值），rank 排序合并，直接流式写出。--------
+     auto tB = Clock::now();
+     {
+-        std::ifstream fwd_in2(fwd_path, std::ios::binary);
+-        if (!fwd_in2.is_open())
+-            throw std::runtime_error("Method E: cannot reopen " + fwd_path);
+-        fwd_in2.seekg(sizeof(int64_t) + sizeof(int32_t), std::ios::beg);
++        std::ifstream fwd_in2;   // gpu_rev: 前向图已在内存 (文件可能已被 S13 删掉)，不再打开
++        if (!gpu_rev) {
++            fwd_in2.open(fwd_path, std::ios::binary);
++            if (!fwd_in2.is_open())
++                throw std::runtime_error("Method E: cannot reopen " + fwd_path);
++            fwd_in2.seekg(sizeof(int64_t) + sizeof(int32_t), std::ios::beg);
++        }
+ 
+         std::unique_ptr<InProcessTranslate> xl;
+         if (!final_path.empty()) {
+@@ -2710,6 +2725,8 @@ int main(int argc, char** argv)
+                 "E (per-chunk disk-backed scatter buffer, rank-priority preserving, "
+                 "single pass, streams fwd graph + output from/to disk -- doesn't "
+                 "require the full graph resident in host memory like A/B/C/D do)")
++            ("keep-forward", po::bool_switch()->default_value(false),
++                "keep the forward graph file (default: delete it once read, S13; also OC_KEEP_FORWARD=1)")
+             ("num-gpus", po::value<int>()->default_value(1),
+                 "Method E GPU reverse + merge: use visible CUDA devices 0..G-1")
+             ("gpu-budget-mb", po::value<size_t>()->default_value(8000),
+@@ -2747,6 +2764,8 @@ int main(int argc, char** argv)
+             int ndev = 0;
+             if (cudaGetDeviceCount(&ndev) != cudaSuccess) ndev = 0;
+             g_num_gpus = std::max(1, vm["num-gpus"].as<int>());
++            g_keep_forward = vm["keep-forward"].as<bool>() ||
++                (std::getenv("OC_KEEP_FORWARD") && std::getenv("OC_KEEP_FORWARD")[0] == '1');
+             if (g_num_gpus > 1) g_stage_threads = std::max(4, omp_get_max_threads() / (4 * g_num_gpus));
+             if (g_num_gpus > std::max(ndev, 1))
+                 throw std::runtime_error("--num-gpus " + std::to_string(g_num_gpus) + " > visible CUDA devices");
+@@ -2815,6 +2834,7 @@ int main(int argc, char** argv)
+             auto t2 = Clock::now();
+             run_method_E(fwd_path, out_path, N, K_out, plan, gpu_budget_b, edge_buffer_b, tmp_dir, host_budget_b,
+                          inv_perm_path, final_path);
++            drop_forward_graph(fwd_path);   // S13: 流式路径 Phase 2 读完之后
+             std::cout << "  Done [" << std::chrono::duration<double>(Clock::now() - t2).count()
+                       << "s]\n";
+ 
+@@ -2847,6 +2867,7 @@ int main(int argc, char** argv)
+         std::vector<uint32_t> fwd_graph;
+         int64_t N = 0; int32_t K_out = 0;
+         read_forward_graph(fwd_path, fwd_graph, N, K_out);
++        drop_forward_graph(fwd_path);   // S13: 方法 A-D 整图读进内存之后
+         const int32_t K_rev_cap = (rev_cap_arg > 0) ? rev_cap_arg : K_out;
+         std::cout << "  N=" << N << " K_out=" << K_out
+                   << " K_rev_cap=" << K_rev_cap

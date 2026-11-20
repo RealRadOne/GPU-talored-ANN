@@ -75,15 +75,16 @@ outputs must stay byte-identical to today's.**
 
 ## Awaiting approval
 
-- **S13 (2026-11-19) — unlink forward_graph_reordered.bin once optimize_chunked has read it** (prune → optimize intermediate,
-  not used afterwards by run_pipeline / eval). Its still-dirty pages (up to ~19 GB background threshold) would then be dropped
-  instead of written at 0.29 GB/s while optimize streams the final graph. Same results; removes an artifact the user may want for
-  debugging → needs approval (could be a `--drop-forward` flag passed by run_pipeline). vector_knn.bin must stay (eval uses it).
-
-_(none)_
-
+- **S13 — approved 2026-11-19, tried, rejected (see Tried & rejected).**
 ## Tried & rejected
 
+- **S13 (2026-11-19, user-approved) — optimize_chunked unlinks forward_graph_reordered.bin once read** (`--keep-forward` /
+  `OC_KEEP_FORWARD=1` to keep; det_check exported it). Final graph byte-identical (keep vs drop, both GPU-rev and GPU-phase-2
+  paths), det 2 EQUAL, guard ACCEPT. SIFT100M G = 2 ×3: 295.62 s (+1.6 % vs best 290.97); same-period ref (keep) optimize
+  28.83 s vs S13 32.45 s: the synchronous ext4 unlink of the 12.8 GB file costs ~2.9 s (Phase 1 1.39 → 4.2 s), and Phase 2
+  (final-graph stream) is unchanged (27.7 vs 27.0 s) — no timed stage waits for the forward graph's flush, the final graph
+  itself goes to the page cache. An async unlink would at best be neutral → rejected. Patch
+  `bucketDemo/patches/scale13_unlink_forward.patch` (incl. det_check change); still useful for disk space at 1B scale.
 - **S8 (2026-11-19) — P1 prune multi-GPU: per-GPU async writers + parallel plan / load** (each GPU plans / loads concurrently and
   writes its own rows through its own writer thread with `pwrite` to their offsets; byte-identical, det 2 EQUAL, guard ACCEPT
   sift10M / sift1M_large). SIFT100M G = 2 ×3: total 304.06 s (+0.1 % vs best 304.42); prune 40.9 / 40.7 / 41.0 s (best 44.64,
