@@ -173,6 +173,12 @@ for k in KEYS:
         gate_ref(k, m, ds, cr, ref_name, tab)
 
 # ---- memory (large path)
+# JUDGE_MEM_REF=<json>: per-config memory reference ({key: {peak_rss_gb: {...}, gpu_peak_mib: N}}) overriding best.json's for the
+# memory guard only (optimize-bucket2-scale single-GPU guard, user 2026-11-20: reference = the scale loop's current level)
+_mem_ref = json.load(open(os.environ["JUDGE_MEM_REF"])) if os.environ.get("JUDGE_MEM_REF") else {}
+for k in KEYS:
+    if k in _mem_ref and k in brun:
+        brun[k] = dict(brun[k], peak_rss_gb=_mem_ref[k]["peak_rss_gb"], gpu_peak_mib=_mem_ref[k].get("gpu_peak_mib") or brun[k].get("gpu_peak_mib"))
 for k in KEYS:
     if "--no-mem" in flags or cand[k]["path"] != "large" or k not in brun:
         continue

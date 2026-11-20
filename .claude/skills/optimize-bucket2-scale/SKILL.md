@@ -73,7 +73,7 @@ dominated). Step 4 scales (GPU search). Per-GPU setup (`gpu_buffer_alloc`, `futu
 | `sift100M_auto_g2` = `MGPU=2 run_pipeline.sh -d sift100M -m auto` | every iteration | 3 (median) | speed vs `best_scale.json`; quality: own best − 0.05 and TAGORE − 0.05 (datasets.json `ref`), 0 graph defects |
 | `sift100M_auto_g4` = `MGPU=4 ...` | every iteration **if all 4 GPUs are free** | 3 | same |
 | multi-GPU equivalence (optional diagnostic, user 2026-11-20 — not a gate) | when useful | 1 | `det_check.sh sift10M G` (deterministic mode); differences are fine as long as search quality holds |
-| single-GPU guard: `run_pipeline.sh -d sift10M -m auto` + `-d sift1M -m large` | every iteration | 3 / 5 | `judge.py --quick` against `optimize-bucket2/state/best.json` (default `JUDGE_BEST`): no config > 3% slower, quality + defects as there |
+| single-GPU guard: `run_pipeline.sh -d sift10M -m auto` + `-d sift1M -m large` | every iteration | 3 / 5 | `judge.py --quick` against `optimize-bucket2/state/best.json` (default `JUDGE_BEST`): no config > 3% slower, quality + defects as there; **memory guard against `state/guard_mem_ref.json`** (`JUDGE_MEM_REF`, user 2026-11-20: the scale loop's current HEAD level, ≤ 1.2× — the sister loop's best.json is not changed) |
 | `msTuring100M_auto_g2` | milestones (user asks, before a summary, after a change to the float32 path) | 1 | float32 large path still correct + quality (own best − 0.05, CAGRA ACE − 0.05) |
 
 **User standard (2026-11-19):** single GPU unaffected or faster, multi-GPU unaffected or faster; **multi-GPU
@@ -167,7 +167,8 @@ R=/home/lanlu/microBenchmark/bucketDemo/buildBucket/runs/scale<N>
 # fast path added? one build with search eval on the fallback too (small budget), e.g. sift10M
 bash $S/run_pipeline.sh -d sift10M -m auto  -o $R/sift10M_auto     # single-GPU guard
 bash $S/run_pipeline.sh -d sift1M  -m large -o $R/sift1M_large
-python3 $S/judge.py $R/sift10M_auto $R/sift1M_large --quick   # vs optimize-bucket2 best.json (memory guard on)
+JUDGE_MEM_REF=/home/lanlu/microBenchmark/.claude/skills/optimize-bucket2-scale/state/guard_mem_ref.json \
+python3 $S/judge.py $R/sift10M_auto $R/sift1M_large --quick   # speed / quality vs optimize-bucket2 best.json; memory vs the scale loop's own reference
 MGPU=2 bash $S/run_pipeline.sh -d sift100M -m auto -o $R/sift100M_auto_g2
 MGPU=4 bash $S/run_pipeline.sh -d sift100M -m auto -o $R/sift100M_auto_g4   # only if all 4 free at this point
 ```

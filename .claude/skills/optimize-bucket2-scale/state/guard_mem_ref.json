@@ -1,0 +1,19 @@
+{
+ "_note": "single-GPU guard memory reference of the scale loop (user 2026-11-20, option 1): current HEAD level (S20 guard runs runs/scale20); later changes may not exceed 1.2x. Used by judge.py via JUDGE_MEM_REF; optimize-bucket2/state/best.json is not touched.",
+ "sift10M_auto": {
+  "peak_rss_gb": {
+   "bucket2": 12.948,
+   "prune": 3.837,
+   "optimize_chunked": 2.036
+  },
+  "gpu_peak_mib": 8996
+ },
+ "sift1M_large": {
+  "peak_rss_gb": {
+   "bucket2": 1.954,
+   "prune": 0.604,
+   "optimize_chunked": 0.495
+  },
+  "gpu_peak_mib": 1286
+ }
+}

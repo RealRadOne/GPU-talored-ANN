@@ -10,7 +10,9 @@ as reference.
 
 ## Current best
 
-**G = 2: 268.24 s** (S19 = S17 + S18, 2026-11-20, GPUs 2,3, `runs/scale19/sift100M_auto_g2`) — bucket2 197.0 (Step 4 53.7,
+**G = 2: 251.87 s** (S20, 2026-11-20, GPUs 2,3, `runs/scale20/sift100M_auto_g2`) — bucket2 196.1, prune 39.7, optimize 17.7;
+recall@10 0.7263 / 0.8329 / 0.9108; peak RSS 92.0 GB. Speedup vs 1 GPU 1.71×.
+Previous **G = 2: 268.24 s** (S19 = S17 + S18, 2026-11-20, GPUs 2,3, `runs/scale19/sift100M_auto_g2`) — bucket2 197.0 (Step 4 53.7,
 Step 4.5 4.7, Step 6 83.6, Wait 26.0), prune 42.1, optimize 28.9; recall@10 0.7272 / 0.8343 / 0.9114. Speedup vs 1 GPU 1.60×.
 Previous **G = 2: 285.33 s** (S16 run, 2026-11-19, GPUs 2,3, `runs/scale16/sift100M_auto_g2`; S16 itself is inactive at G = 2 — faster
 period) — bucket2 215.1, prune 41.6, optimize 28.7; recall@10 0.7241 / 0.8322 / 0.9108. Previous **290.97 s** (S10, GPUs 2,3, `runs/scale10/sift100M_auto_g2`) — bucket2 214.1 (Step 4 61.4, Step 6 84.9,
@@ -18,7 +20,9 @@ Wait 26.4), prune 46.3, optimize 30.0; recall@10 0.7267 / 0.8340 / 0.9109 (same-
 Previous: **304.42 s** (S4 re-judged 2026-11-19, "accepted (compute gain, disk-bound)"; reps 304.4 / 299.4 / 365.0, GPUs 0,1;
 `runs/scale4/sift100M_auto_g2`) — Step 6 85.2, Wait 33.5, optimize 35.0; recall@10 0.7272 / 0.8334 / 0.9120. Previous best
 307.50 (S1). S9 (optimize src-split) accepted under the compute-gain rule without a new best (311.50 s, slow-disk period). Compute metrics for the fast-disk re-check are in the S3 / S4 re-judge entry below.
-**G = 4: 222.82 s** (S19, 2026-11-20, GPUs 0–3, `runs/scale19g4/sift100M_auto_g4`) — bucket2 145.1 (Step 4 34.0, Step 4.5 6.3,
+**G = 4: 213.84 s** (S20, 2026-11-20, GPUs 0–3, `runs/scale20/sift100M_auto_g4`) — bucket2 145.1, prune 49.9, optimize 16.3;
+recall@10 0.7258 / 0.8333 / 0.9095; peak RSS 95.1 GB. Speedup vs 1 GPU 2.01×.
+Previous **G = 4: 222.82 s** (S19, 2026-11-20, GPUs 0–3, `runs/scale19g4/sift100M_auto_g4`) — bucket2 145.1 (Step 4 34.0, Step 4.5 6.3,
 Step 6 51.7, Wait 26.3), prune 49.0, optimize 27.2; recall@10 0.7251 / 0.8332 / 0.9100. Speedup vs 1 GPU 1.93×.
 Previous **G = 4: 237.60 s** (S16, 2026-11-19, GPUs 2,3,0,1, `runs/scale16/sift100M_auto_g4`) — bucket2 161.0, prune 49.4, optimize 26.6;
 recall@10 0.7261 / 0.8338 / 0.9104. Previous **G = 4: 238.74 s** (S14 measurement of HEAD incl. S9–S11, 2026-11-19, GPUs 0–3, `runs/scale14/sift100M_auto_g4`) — bucket2
@@ -46,6 +50,10 @@ Item names below are backlog labels, not iteration numbers (iterations are logge
   serial prefix over N; reduce on GPU (peer add into GPU 0, or per-GPU dst-range counts) + parallel prefix.
 - **S14 — analysed (S12 entry): shared host link, not fixable at G = 2.** ~~GPU 0 H2D 2× slower than GPU 1 in optimize count / fill~~ (same bytes; NUMA placement of `h_fwd_all` pages read by
   `parallel_pread_file`, or PCIe topology). Check `numactl`/`move_pages` of the first half; interleave or bind the pread threads.
+- **S21 (backlog, user 2026-11-20) — bring the in-memory fast paths under one host budget:** arrival records in RAM (S1,
+  `--arrival-mem-mb`), Step 4.5 `r1_blob` retention into round 2 (S18/S19), bucket cache, optimize fin etc. counted against a single
+  user-given budget (HOST_BUDGET_MB → --host-budget-mb / --bucket-mem-mb / --arrival-mem-mb / --cache-mb), disk fallback otherwise.
+  Later (after items 2–4 and A).
 - **S12 — checked 2026-11-19:** prune already caps per-GPU load threads (8); Step 6 scatter uses explicit threads; Step 4
   read is prefetched (float path). No oversubscription found besides optimize staging (S10). Was: per-GPU OpenMP oversubscription elsewhere: prune_windowed per-GPU load / sink and bucket2 per-GPU host loops
   run `omp parallel` from G threads at once (as optimize staging did before S10); cap team sizes per GPU thread.
@@ -520,3 +528,10 @@ G = 2 92.0, G = 4 95.1 GB (guard passes).
 from S1 etc.; the guard ran with `--no-mem` until today). S20 only touches optimize (sift10M optimize RSS 1.60 → 2.04 GB, mapped
 file pages; within its gate). **Awaiting the user's decision** on the guard's memory reference (rebaseline to the scale-loop level /
 bring bucket2 memory under one host budget first / multi-GPU-only memory guard). Code committed; best_scale.json NOT updated yet.
+
+**S20 decision (user 2026-11-20, option 1):** the single-GPU guard's memory reference is now the scale loop's own current HEAD
+level, `.claude/skills/optimize-bucket2-scale/state/guard_mem_ref.json` (from the S20 guard runs: sift10M_auto bucket2 12.95 /
+prune 3.84 / optimize 2.04 GB; sift1M_large 1.95 / 0.60 / 0.50 GB), applied by judge.py via the new `JUDGE_MEM_REF` (memory guard
+only; optimize-bucket2's best.json untouched). Later changes may not exceed 1.2×. **S20 guard re-judged: ACCEPT** (also ACCEPT
+against the pre-S20 level from runs/scale19: sift10M optimize 2.04 ≤ 1.2 × 1.60 + 0.2). **S20 accepted**; best_scale.json updated:
+G = 2 251.87 s, G = 4 213.84 s. "Arrival records etc. under one host budget" → backlog S21.
