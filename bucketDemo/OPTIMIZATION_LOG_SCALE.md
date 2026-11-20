@@ -86,6 +86,15 @@ outputs must stay byte-identical to today's.**
 - **S13 — approved 2026-11-19, tried, rejected (see Tried & rejected).**
 ## Tried & rejected
 
+- **S18 (2026-11-20, first idea under the relaxed single-GPU-stage rule) — Step 4.5: data_reordered written in the background
+  with bounded dirty pages** (64 MB pieces, `sync_file_range` write + wait 4 pieces back → ≤ ~256 MB dirty; `BUCKET2_REORDER_BG`),
+  round 1 Step 6 no longer joins (blob mode), round 2 Step 4 + bucket write take `r1_blob` as host_raw (no file read; blob
+  kept until then). Test switch `BUCKET2_HOST_RAW_BUDGET_MB` forces this path on SIFT10M: data_reordered / vector_knn / forward /
+  final graph byte-identical to the synchronous write; det 2 EQUAL (plain + forced path), guard ACCEPT. SIFT100M G = 2 ×3:
+  **280.01 s (−1.9 % vs 285.33)**; Step 4.5 15.5 → 4.5 s, Step 6 unchanged 84.5 s (the S6 penalty is gone), Step 4 58.0 s,
+  bucket2 204.0 vs ~215 s, but prune 47.0 s (vs 41.6 — disk period or page-cache effect, unresolved: the same-period HEAD ref
+  was not run because `/` dropped to 197 GB < 200 GB). Below the 3 % gate, I/O overlap → rejected for now; **re-judge with a
+  same-period ref when disk space allows** (candidate together with S17). Patch `bucketDemo/patches/scale18_bg_reorder_write.patch`.
 - **S17 (2026-11-20) — Step 4 prefetch path: batches of Nv / 4** (`BUCKET2_STEP4_PF_DIV`; v1 shrank only the first batch to
   Nv / 8 → no gain, the wait moved to the 2nd full batch: G = 4 237.48 s, read still 3.5 s). v2: every prefetch batch Nv / 4 so
   each read + H2D hides behind the previous search. det 4 / det 2 EQUAL, guard ACCEPT. Per-GPU Step 4 read 3.5 → 1.0 s (G = 4),
