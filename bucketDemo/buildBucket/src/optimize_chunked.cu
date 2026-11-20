@@ -50,6 +50,8 @@
 
 #include <cuda_runtime.h>
 #include <cub/device/device_segmented_sort.cuh>
+#include <cub/device/device_scan.cuh>
+#include <thrust/iterator/transform_iterator.h>
 #include <thread>
 #include <mutex>
 #include <atomic>
@@ -1498,6 +1500,13 @@ __global__ void kern_e_merge(const uint32_t* __restrict__ fwd, const uint32_t* _
 // 显存: 每段 4 B/边 + 12 B/行 + 批缓冲。host: N·K_out·4 (前向图) + 4 B/边 + 8 B/行。
 // OC_GPU_REV=0 退回 CPU TopKReverseStore (A/B、逐字节对比用)。
 // =====================================================================
+// S11: 计数归约 (卡 0 上: dst += src，src 可以是别卡的显存，经 NVLink peer 读)
+__global__ void kern_add_u32(uint32_t* __restrict__ dst, const uint32_t* __restrict__ src, uint64_t n)
+{
+    const uint64_t i = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] += src[i];
+}
+struct U32ToU64 { __host__ __device__ uint64_t operator()(uint32_t x) const { return x; } };
 __global__ void kern_rev_count(const uint32_t* __restrict__ fwd, uint64_t n_elems, uint64_t N,
                                uint32_t* __restrict__ cnt, unsigned long long* __restrict__ n_bad)
 {
@@ -1674,9 +1683,36 @@ struct GpuReverseMerge {
         };
 
         // ---- (1) 入度 → 行偏移 (源行按卡切，各卡的部分计数在 host 上相加) ----
+        // 所有卡对之间 P2P + native atomic (S9 源行切分 fill、S11 计数 peer 归约都要)
+        bool p2p_all = G > 1;
+        for (int a = 0; p2p_all && a < G; ++a)
+            for (int b2 = 0; b2 < G; ++b2) {
+                if (a == b2) continue;
+                int can = 0, atom = 0;
+                CUDA_CHECK(cudaDeviceCanAccessPeer(&can, dev_of(a), dev_of(b2)));
+                CUDA_CHECK(cudaDeviceGetP2PAttribute(&atom, cudaDevP2PAttrNativeAtomicSupported, dev_of(a), dev_of(b2)));
+                if (!can || !atom) p2p_all = false;
+            }
         auto q = Clock::now();
-        std::vector<uint64_t> off(static_cast<size_t>(N) + 1);
+        // S11: 计数在 GPU 上归约 + 前缀和 (多卡: 别卡的部分计数经 NVLink 直接加到卡 0；cub 扫描出 uint64 行偏移)，
+        // host 只收一次 (N+1)·8 B 的偏移。原来每张卡 D2H N·4 B 计数、host 上相加 + 串行前缀和，
+        // 外加 800 MB 的 off 串行清零 (SIFT100M G=2: d2h 0.35–0.48 s/卡 + alloc ~0.8 s + prefix 0.13 s)。
+        // 结果相同 (整数)。OC_GPU_REV_GPUSCAN=0 走原来的 host 路径。
+        const bool gpu_scan = N <= static_cast<int64_t>(INT32_MAX) && (G == 1 || p2p_all) &&
+            !(std::getenv("OC_GPU_REV_GPUSCAN") && std::getenv("OC_GPU_REV_GPUSCAN")[0] == '0');
+        std::unique_ptr<uint64_t[]> off_buf(new uint64_t[static_cast<size_t>(N) + 1]);   // 不清零: 下面整段写满
+        uint64_t* const off = off_buf.get();
         {
+            std::vector<uint32_t*> d_cnts(static_cast<size_t>(G), nullptr);   // gpu_scan: 各卡的部分计数留在显存
+            if (gpu_scan && G > 1)
+                run_on_gpus([&](int g) {   // 卡 0 读别卡的计数 (peer)，warm-up 通常已打开
+                    if (g != 0) return;
+                    for (int h = 1; h < G; ++h) {
+                        const cudaError_t e = cudaDeviceEnablePeerAccess(dev_of(h), 0);
+                        if (e == cudaErrorPeerAccessAlreadyEnabled) (void)cudaGetLastError();
+                        else CUDA_CHECK(e);
+                    }
+                });
             std::vector<std::vector<uint32_t>> part(static_cast<size_t>(G));
             std::vector<double> th2d(static_cast<size_t>(G), 0.0);
             std::vector<double> c_setup(static_cast<size_t>(G), 0.0), c_loop(static_cast<size_t>(G), 0.0), c_d2h(static_cast<size_t>(G), 0.0);
@@ -1703,15 +1739,54 @@ struct GpuReverseMerge {
                 unsigned long long h_bad = 0;
                 CUDA_CHECK(cudaMemcpy(&h_bad, d_bad, sizeof(h_bad), cudaMemcpyDeviceToHost));
                 if (h_bad) throw std::runtime_error("GpuReverseMerge: " + std::to_string(h_bad) + " forward entries >= N");
-                auto& c = part[static_cast<size_t>(g)];
-                c.resize(static_cast<size_t>(N));
-                stg.d2h(c.data(), d_cnt, c.size() * sizeof(uint32_t));
-                CUDA_CHECK(cudaFree(d_fwd)); CUDA_CHECK(cudaFree(d_cnt)); CUDA_CHECK(cudaFree(d_bad));
+                CUDA_CHECK(cudaFree(d_fwd)); CUDA_CHECK(cudaFree(d_bad));
+                if (gpu_scan) {
+                    d_cnts[static_cast<size_t>(g)] = d_cnt;
+                } else {
+                    auto& c = part[static_cast<size_t>(g)];
+                    c.resize(static_cast<size_t>(N));
+                    stg.d2h(c.data(), d_cnt, c.size() * sizeof(uint32_t));
+                    CUDA_CHECK(cudaFree(d_cnt));
+                }
                 c_d2h[static_cast<size_t>(g)] = secs(qg);
             });
             const double c_gpu = secs(q_spawn);
             auto qh = Clock::now();
             for (double x : th2d) t_h2d = std::max(t_h2d, x);
+            if (gpu_scan) {
+                // 在卡 0 (当前线程的设备 dev0) 上: 加上别卡的计数 → uint64 前缀和 → 一次 D2H
+                uint32_t* d_c0 = d_cnts[0];
+                for (int h = 1; h < G; ++h) {
+                    kern_add_u32<<<static_cast<unsigned>((N + 255) / 256), 256>>>(d_c0, d_cnts[static_cast<size_t>(h)], static_cast<uint64_t>(N));
+                    CUDA_CHECK(cudaGetLastError());
+                }
+                CUDA_CHECK(cudaDeviceSynchronize());
+                for (int h = 1; h < G; ++h) {
+                    CUDA_CHECK(cudaSetDevice(dev_of(h)));
+                    CUDA_CHECK(cudaFree(d_cnts[static_cast<size_t>(h)]));
+                }
+                CUDA_CHECK(cudaSetDevice(dev0));
+                uint64_t* d_off = nullptr;
+                CUDA_CHECK(cudaMalloc(&d_off, (static_cast<size_t>(N) + 1) * sizeof(uint64_t)));
+                CUDA_CHECK(cudaMemset(d_off, 0, sizeof(uint64_t)));
+                auto in_it = thrust::make_transform_iterator(static_cast<const uint32_t*>(d_c0), U32ToU64{});
+                size_t tmp_b = 0;
+                CUDA_CHECK(cub::DeviceScan::InclusiveSum(nullptr, tmp_b, in_it, d_off + 1, static_cast<int>(N)));
+                void* d_tmp = nullptr;
+                CUDA_CHECK(cudaMalloc(&d_tmp, std::max<size_t>(tmp_b, 1)));
+                CUDA_CHECK(cub::DeviceScan::InclusiveSum(d_tmp, tmp_b, in_it, d_off + 1, static_cast<int>(N)));
+                CUDA_CHECK(cudaDeviceSynchronize());
+                CUDA_CHECK(cudaFree(d_tmp)); CUDA_CHECK(cudaFree(d_c0));
+                {
+                    PinnedStaging stg;
+                    stg.d2h(off, d_off, (static_cast<size_t>(N) + 1) * sizeof(uint64_t));
+                }
+                CUDA_CHECK(cudaFree(d_off));
+                std::cout << std::fixed << std::setprecision(2) << "  [Timing] GPU reverse count detail: gpu=" << c_gpu
+                          << "s [per GPU setup/loop:";
+                for (int g = 0; g < G; ++g) std::cout << " " << c_setup[static_cast<size_t>(g)] << "/" << c_loop[static_cast<size_t>(g)] << "(h2d " << th2d[static_cast<size_t>(g)] << ")";
+                std::cout << "] gpu reduce+scan+d2h=" << secs(qh) << "s\n";
+            } else {
             if (G > 1) {
                 #pragma omp parallel for schedule(static)
                 for (int64_t j = 0; j < N; ++j) {
@@ -1729,6 +1804,7 @@ struct GpuReverseMerge {
                       << "s [per GPU setup/loop/d2h:";
             for (int g = 0; g < G; ++g) std::cout << " " << c_setup[static_cast<size_t>(g)] << "/" << c_loop[static_cast<size_t>(g)] << "(h2d " << th2d[static_cast<size_t>(g)] << ")/" << c_d2h[static_cast<size_t>(g)];
             std::cout << "] host sum=" << c_sum << "s prefix=" << c_pre << "s\n";
+            }   // !gpu_scan
         }
         n_edges = off[static_cast<size_t>(N)];
         if (n_edges != n_elems) throw std::runtime_error("GpuReverseMerge: edge count mismatch");
@@ -1749,16 +1825,8 @@ struct GpuReverseMerge {
             budget = std::min(budget, static_cast<size_t>(std::atoll(e)) << 20);
         const size_t per_edge = sizeof(KeyT) * (segsort ? 2 : 1);
         // S9: 多卡且所有卡对之间有 P2P + native atomic → 源行切分 fill (OC_GPU_REV_SPLIT=0 关掉)
-        bool split = G > 1;
+        bool split = G > 1 && p2p_all;
         if (const char* e = std::getenv("OC_GPU_REV_SPLIT")) if (e[0] == '0') split = false;
-        for (int a = 0; split && a < G; ++a)
-            for (int b2 = 0; b2 < G; ++b2) {
-                if (a == b2) continue;
-                int can = 0, atom = 0;
-                CUDA_CHECK(cudaDeviceCanAccessPeer(&can, dev_of(a), dev_of(b2)));
-                CUDA_CHECK(cudaDeviceGetP2PAttribute(&atom, cudaDevP2PAttrNativeAtomicSupported, dev_of(a), dev_of(b2)));
-                if (!can || !atom) split = false;
-            }
         // split: 一轮里别卡段的 off_rel 在每张卡上各有一份副本 → 每行约多 8·(G-1) B
         const size_t per_row = 12 + (segsort ? 4 : 0) + (split ? 8 * static_cast<size_t>(G - 1) : 0);
         const uint64_t max_seg_edges = segsort ? static_cast<uint64_t>(INT32_MAX) - 1 : ~0ull;   // cub 的 int 下标

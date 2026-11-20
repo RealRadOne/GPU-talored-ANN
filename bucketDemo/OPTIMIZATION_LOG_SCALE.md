@@ -34,7 +34,10 @@ Item names below are backlog labels, not iteration numbers (iterations are logge
 
 - **S10 — done (partly: warm-up + staging threads; GPU-side count reduction not done).** optimize count phase (4.2 s at G = 2): each GPU D2Hs a full N×4 B count array and the host sums G arrays +
   serial prefix over N; reduce on GPU (peer add into GPU 0, or per-GPU dst-range counts) + parallel prefix.
-- **S12 — per-GPU OpenMP oversubscription elsewhere:** prune_windowed per-GPU load / sink and bucket2 per-GPU host loops
+- **S14 — GPU 0 H2D 2× slower than GPU 1 in optimize count / fill** (same bytes; NUMA placement of `h_fwd_all` pages read by
+  `parallel_pread_file`, or PCIe topology). Check `numactl`/`move_pages` of the first half; interleave or bind the pread threads.
+- **S12 — checked 2026-11-19:** prune already caps per-GPU load threads (8); Step 6 scatter uses explicit threads; Step 4
+  read is prefetched (float path). No oversubscription found besides optimize staging (S10). Was: per-GPU OpenMP oversubscription elsewhere: prune_windowed per-GPU load / sink and bucket2 per-GPU host loops
   run `omp parallel` from G threads at once (as optimize staging did before S10); cap team sizes per GPU thread.
 - **S11 — re-judge S8 (prune async writers) at G = 4** when all four GPUs are free (patch kept).
 
@@ -68,6 +71,11 @@ outputs must stay byte-identical to today's.**
   12.8 GB final write (disk-bound) → at most a few seconds. Source: cuVS `mg/snmg.cuh` sharded build.
 
 ## Awaiting approval
+
+- **S13 (2026-11-19) — unlink forward_graph_reordered.bin once optimize_chunked has read it** (prune → optimize intermediate,
+  not used afterwards by run_pipeline / eval). Its still-dirty pages (up to ~19 GB background threshold) would then be dropped
+  instead of written at 0.29 GB/s while optimize streams the final graph. Same results; removes an artifact the user may want for
+  debugging → needs approval (could be a `--drop-forward` flag passed by run_pipeline). vector_knn.bin must stay (eval uses it).
 
 _(none)_
 
@@ -289,3 +297,29 @@ vs best is the faster disk period; the attributable gain is optimize −2.0 s (�
 
 Follow-up: the same per-GPU-thread OpenMP oversubscription may exist in prune_windowed's per-GPU loaders and bucket2's
 per-GPU Step 4 / Step 6 host loops (backlog S12).
+
+### S11 — optimize: GPU-side count reduction + uint64 scan — accepted (compute gain, disk-bound) (2026-11-19)
+
+**Idea.** The rest of the GpuReverseMerge count phase after S10 was host work: G × N·4 B count D2H, host sum of G arrays,
+serial prefix over N and a serially zeroed 800 MB `off` vector. Now GPU g ≠ 0 keeps its partial counts in device memory, GPU 0
+adds them over NVLink (`kern_add_u32`, peer reads), `cub::DeviceScan::InclusiveSum` (uint32 → uint64 via transform iterator)
+produces the row offsets, and one staged D2H fills an uninitialised `off` buffer (parallel first touch). Also used for G = 1.
+Fallback (no P2P, N > INT32_MAX, `OC_GPU_REV_GPUSCAN=0`) = old host path. Class: implementation (integers, identical).
+Source: cuVS `mg/snmg.cuh` (reduce on one rank over NVLink instead of host).
+
+**Correctness.** det 2 EQUAL plain / `OC_GPU_PHASE2=0` / rounds; SIFT10M G = 2 final graph byte-identical with
+`OC_GPU_REV_GPUSCAN` 1 vs 0; guard ACCEPT. G = 4 skipped (GPU 0,1 held by wangcy07).
+
+**SIFT100M G = 2 ×3.** 293.01 s (+0.7 % vs best 290.97 → within gate, best unchanged); same-period ref
+(`OC_GPU_REV_GPUSCAN=0`) 289.61 s (bucket2 212.9, prune 44.5, optimize 32.15). Recall@10 0.7253 / 0.8330 / 0.9109.
+
+| optimize count phase | same-period ref | S11 median of 3 |
+|---|---|---|
+| count | 3.35 s | 2.51 s (−25 %) |
+| host part (D2H + sum + prefix + off alloc) → GPU reduce+scan+D2H | 0.39 + 0.05 + 0.65 + ~0.8 s | 0.26 s |
+
+Absorbed by: optimize merge + emit (disk-bound final-graph stream, 6.0 / 8.5 / 7.4 s vs ref 6.3). Total gain is small
+(~0.8 s); the rule accepts it as a real compute saving for the fast-disk re-test.
+
+Observation for S14: count H2D of GPU 0 (device 2, first half of the rows) is consistently ~2× slower than GPU 1
+(1.85–2.05 s vs 0.84–0.98 s, also in S10 / ref) for the same bytes.
