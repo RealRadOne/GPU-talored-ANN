@@ -10,12 +10,14 @@ as reference.
 
 ## Current best
 
-**G = 2: 290.97 s** (S10, 2026-11-19, GPUs 2,3, `runs/scale10/sift100M_auto_g2`) — bucket2 214.1 (Step 4 61.4, Step 6 84.9,
+**G = 2: 285.33 s** (S16 run, 2026-11-19, GPUs 2,3, `runs/scale16/sift100M_auto_g2`; S16 itself is inactive at G = 2 — faster
+period) — bucket2 215.1, prune 41.6, optimize 28.7; recall@10 0.7241 / 0.8322 / 0.9108. Previous **290.97 s** (S10, GPUs 2,3, `runs/scale10/sift100M_auto_g2`) — bucket2 214.1 (Step 4 61.4, Step 6 84.9,
 Wait 26.4), prune 46.3, optimize 30.0; recall@10 0.7267 / 0.8340 / 0.9109 (same-period HEAD ref 293.27 s — faster disk period).
 Previous: **304.42 s** (S4 re-judged 2026-11-19, "accepted (compute gain, disk-bound)"; reps 304.4 / 299.4 / 365.0, GPUs 0,1;
 `runs/scale4/sift100M_auto_g2`) — Step 6 85.2, Wait 33.5, optimize 35.0; recall@10 0.7272 / 0.8334 / 0.9120. Previous best
 307.50 (S1). S9 (optimize src-split) accepted under the compute-gain rule without a new best (311.50 s, slow-disk period). Compute metrics for the fast-disk re-check are in the S3 / S4 re-judge entry below.
-**G = 4: 238.74 s** (S14 measurement of HEAD incl. S9–S11, 2026-11-19, GPUs 0–3, `runs/scale14/sift100M_auto_g4`) — bucket2
+**G = 4: 237.60 s** (S16, 2026-11-19, GPUs 2,3,0,1, `runs/scale16/sift100M_auto_g4`) — bucket2 161.0, prune 49.4, optimize 26.6;
+recall@10 0.7261 / 0.8338 / 0.9104. Previous **G = 4: 238.74 s** (S14 measurement of HEAD incl. S9–S11, 2026-11-19, GPUs 0–3, `runs/scale14/sift100M_auto_g4`) — bucket2
 162.8 (Step 4 43.0, Step 6 52.1, Wait 25.9), prune 47.3, optimize 28.6; recall@10 0.7245 / 0.8326 / 0.9111.
 Previous **G = 4: 259.46 s** (S2, 2026-11-19, GPUs 0–3, reps 258.90 / 259.46 / 259.76) — bucket2 171.94 (Step 4 42.4,
 Step 6 63.3, Wait 25.9), prune 50.0, optimize 37.6; recall@10 0.7257 / 0.8324 / 0.9105; peak RSS 83.3 GB.
@@ -43,7 +45,7 @@ Item names below are backlog labels, not iteration numbers (iterations are logge
 - **S12 — checked 2026-11-19:** prune already caps per-GPU load threads (8); Step 6 scatter uses explicit threads; Step 4
   read is prefetched (float path). No oversubscription found besides optimize staging (S10). Was: per-GPU OpenMP oversubscription elsewhere: prune_windowed per-GPU load / sink and bucket2 per-GPU host loops
   run `omp parallel` from G threads at once (as optimize staging did before S10); cap team sizes per GPU thread.
-- **S15 — keep each GPU's source rows resident between count and fill (G ≥ 4, size-gated):** halves optimize H2D bytes.
+- **S15 (backlog name) — done as S16 (accepted).** ~~keep each GPU's source rows resident between count and fill~~
 - **S11 — done as S15: S8 re-judged at G = 4, rejected.**
 
 **User priority (2026-11-19): after S7 (compact vector_knn), do these two next, in this order. Both implementation-level;
@@ -357,3 +359,26 @@ GPU reverse count 2.5 / fill 3.0 / select 0.43 / merge+emit 6.2 s, passes=4 src-
 |---|---|---|---|---|---|---|
 | G = 2 (best, S10) | 1.66× | 1.88× | 1.28× | 1.21× | 1.32× | 1.48× |
 | G = 4 (S14) | 2.36× | 3.07× | 1.31× | 1.18× | 1.38× | 1.80× |
+
+### S16 — optimize: source rows resident between count and fill (split, size-gated) — accepted (compute gain, disk-bound) (2026-11-19)
+
+**Idea.** With the S9 source-row split each GPU uploads its rows [N·g/G, N·(g+1)/G) twice (count, then fill). If they fit
+(≤ 30 % of free device memory on every GPU; SIFT100M: G = 4 3.2 GB yes, G = 2 6.4 GB no → old path), count uploads them
+batch by batch into one resident buffer and fill / later rounds launch `kern_rev_fill_multi` straight on it — half the H2D
+bytes of the reverse phase. `OC_GPU_REV_RESIDENT=0` disables. Class: implementation (same edges, det identical). Source: cuVS
+`cagra_build.cuh::build_knn_graph` (dataset kept on device across passes when it fits).
+
+**Correctness.** SIFT10M G = 2 (resident there): final graph byte-identical with `OC_GPU_REV_RESIDENT` 1 vs 0; det 2 EQUAL
+(`OC_GPU_PHASE2=0`, rounds, plain); det 4 EQUAL (`OC_GPU_PHASE2=0`); guard ACCEPT.
+
+**SIFT100M (all four GPUs free).** G = 4 ×3: **237.60 s** (−0.5 % vs best 238.74); same-period ref G = 4 (`OC_GPU_REV_RESIDENT=0`)
+239.97 s (bucket2 162.7, prune 48.5, optimize 28.74). G = 2 ×3 (not resident, unchanged path): 285.33 s (−1.9 % vs 290.97, faster
+period). Recall unchanged (G = 4 0.7261 / 0.8338 / 0.9104, G = 2 0.7241 / 0.8322 / 0.9108). `--update --compute-gain` → both bests.
+
+| optimize GPU reverse, G = 4 | same-period ref | S16 median of 3 |
+|---|---|---|
+| fill | 3.68 s | 1.93 s (−48 %) |
+| count + fill + select | 6.75 s | 4.54 s (−33 %) |
+| optimize stage | 28.74 s | 26.58 s |
+
+Absorbed by: optimize merge + emit / final-graph stream (disk-bound, 5.5–6.0 s). G = 4 speedup vs 1 GPU: total 1.81×, optimize 1.49×.
