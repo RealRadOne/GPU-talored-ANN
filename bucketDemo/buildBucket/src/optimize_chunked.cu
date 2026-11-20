@@ -54,6 +54,8 @@
 #include <thrust/iterator/transform_iterator.h>
 #include <thread>
 #include <mutex>
+#include <future>
+#include <sys/mman.h>
 #include <atomic>
 #include <exception>
 #include <thrust/device_ptr.h>
@@ -2100,33 +2102,74 @@ struct GpuReverseMerge {
 struct InProcessTranslate {
     int64_t N = 0; int32_t K = 0;
     std::vector<uint32_t> inv;                 // new id → old id
-    std::unique_ptr<uint32_t[]> fin;           // 原始顺序的最终图 (N, K)
+    std::unique_ptr<uint32_t[]> fin;           // 原始顺序的最终图 (N, K) (缓冲模式)
+    // S20 mmap 模式: fin 直接是最终输出文件 (MAP_SHARED) 头 12 B 之后的部分，按旧 id 散写就是写文件，
+    // 省掉最后再把 12.8 GB 整块 write 一遍 (同一文件的 buffered write 不随线程数扩展: /dev/shm 1.5–1.8 GB/s,
+    // / 的页缓存 1.0–1.2 GB/s，SIFT100M 7.5–10 s)。脏页由内核回写。是否走进程内翻译仍由 host budget / 4 决定。
+    uint32_t* F = nullptr;                     // 两种模式下 add_rows 都写这里
+    int map_fd = -1; void* map_base = nullptr; size_t map_len = 0;
     std::vector<uint8_t> hit;                  // 每个原始行被写过 (置换检查)
     std::atomic<int64_t> n_bad{0};             // 越界 id 计数 (bounds check)；多 GPU 时 add_rows 并发
     double secs = 0;
     std::mutex secs_mtx;
+    double t_inv = 0, t_alloc = 0, t_add_sum = 0, t_hit = 0, t_write = 0;   // 细分计时 (add_rows: 各次调用之和)
+    int64_t n_add_calls = 0;
     static size_t bytes_needed(int64_t n, int32_t k) {
         return static_cast<size_t>(n) * k * sizeof(uint32_t) + static_cast<size_t>(n) * (sizeof(uint32_t) + 1);
     }
-    InProcessTranslate(const std::string& inv_path, int64_t n, int32_t k) : N(n), K(k) {
+    // map_path 非空: mmap 模式 (直接写最终文件)；空: 缓冲模式 (最后整块写出)
+    InProcessTranslate(const std::string& inv_path, int64_t n, int32_t k, const std::string& map_path = "") : N(n), K(k) {
         auto t0 = std::chrono::steady_clock::now();
         inv = translate_ids::read_inverse_perm(inv_path, N);
-        fin.reset(new uint32_t[static_cast<size_t>(N) * K]);
+        auto t1 = std::chrono::steady_clock::now();
+        t_inv = std::chrono::duration<double>(t1 - t0).count();
+        if (!map_path.empty()) {
+            constexpr size_t kHdr = sizeof(int64_t) + sizeof(int32_t);
+            map_len = kHdr + static_cast<size_t>(N) * K * sizeof(uint32_t);
+            map_fd = ::open(map_path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
+            if (map_fd < 0) throw std::runtime_error("InProcessTranslate: cannot create " + map_path);
+            if (::ftruncate(map_fd, static_cast<off_t>(map_len)) != 0) throw std::runtime_error("InProcessTranslate: ftruncate failed " + map_path);
+            map_base = ::mmap(nullptr, map_len, PROT_READ | PROT_WRITE, MAP_SHARED, map_fd, 0);
+            if (map_base == MAP_FAILED) { map_base = nullptr; throw std::runtime_error("InProcessTranslate: mmap failed " + map_path); }
+            char* b = static_cast<char*>(map_base);
+            std::memcpy(b, &N, sizeof(int64_t));
+            std::memcpy(b + sizeof(int64_t), &K, sizeof(int32_t));
+            F = reinterpret_cast<uint32_t*>(b + kHdr);   // 12 B 偏移: 4 B 对齐
+        } else {
+            fin.reset(new uint32_t[static_cast<size_t>(N) * K]);
+            F = fin.get();
+        }
         hit.assign(static_cast<size_t>(N), 0);
+        t_alloc = std::chrono::duration<double>(std::chrono::steady_clock::now() - t1).count();
         secs += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    }
+    ~InProcessTranslate() { if (map_base) ::munmap(map_base, map_len); if (map_fd >= 0) ::close(map_fd); }
+    // S20: fin 预先触页 (后台线程，跟读前向图 / GPU count+fill 重叠)，按旧 id 随机散写时不再在 GPU 线程的
+    // emit 里吃首次缺页。fin 本来就整块要写满，峰值内存不变 (仍受 host budget / 4 约束)。
+    double t_prefault = 0;
+    void prefault() {
+        auto t0 = std::chrono::steady_clock::now();
+        const size_t n_el = static_cast<size_t>(N) * K;
+        const int64_t piece = int64_t(1) << 22;   // 16 MB
+        #pragma omp parallel for schedule(static) num_threads(std::max(1, std::min(16, omp_get_max_threads())))
+        for (int64_t o = 0; o < static_cast<int64_t>(n_el); o += piece)
+            std::memset(F + o, 0, static_cast<size_t>(std::min<int64_t>(piece, static_cast<int64_t>(n_el) - o)) * sizeof(uint32_t));
+        t_prefault = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     }
     // rows = 新 id 空间的第 [r0, r0+n) 行
     void add_rows(const uint32_t* rows, int64_t r0, int64_t n) {
         auto t0 = std::chrono::steady_clock::now();
         if (r0 < 0 || r0 + n > N) throw std::runtime_error("InProcessTranslate: row range out of bounds");
         int64_t bad = 0;
-        #pragma omp parallel for reduction(+:bad) schedule(static)
+        // S20: 多 GPU 时 add_rows 从 G 个 GPU 线程同时调用，每次各开一个默认大小的 OpenMP team 会互相抢核 (同 S10)
+        const int nth = g_num_gpus > 1 ? std::max(4, omp_get_max_threads() / g_num_gpus) : omp_get_max_threads();
+        #pragma omp parallel for reduction(+:bad) schedule(static) num_threads(nth)
         for (int64_t i = 0; i < n; ++i) {
             const uint32_t old_row = inv[static_cast<size_t>(r0 + i)];
             if (old_row >= static_cast<uint64_t>(N)) { ++bad; continue; }   // bounds check
             hit[old_row] = 1;
             const uint32_t* src = rows + static_cast<size_t>(i) * K;
-            uint32_t* dst = fin.get() + static_cast<size_t>(old_row) * K;
+            uint32_t* dst = F + static_cast<size_t>(old_row) * K;
             for (int32_t k = 0; k < K; ++k) {
                 uint32_t v = src[k];
                 if (v >= static_cast<uint64_t>(N)) { ++bad; v = 0; }        // bounds check
@@ -2135,7 +2178,8 @@ struct InProcessTranslate {
         }
         n_bad += bad;
         std::lock_guard<std::mutex> lk(secs_mtx);
-        secs += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        const double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        secs += dt; t_add_sum += dt; ++n_add_calls;
     }
     void write(const std::string& path) {
         auto t0 = std::chrono::steady_clock::now();
@@ -2147,10 +2191,23 @@ struct InProcessTranslate {
         if (n_hit != N)
             throw std::runtime_error("Method E: inverse_perm is not a permutation (" + std::to_string(n_hit) +
                                      " of " + std::to_string(N) + " rows hit)");
-        graph_io::StreamingGraphWriter w(path, N, K);
-        w.write_rows(fin.get(), 0, N);
-        if (w.rows_written() != N) throw std::runtime_error("Method E: short write of " + path);
+        auto t1 = std::chrono::steady_clock::now();
+        t_hit = std::chrono::duration<double>(t1 - t0).count();
+        if (map_base) {   // mmap 模式: 内容已经在文件里，解除映射即可 (path 就是映射的那个文件)
+            if (::munmap(map_base, map_len) != 0) throw std::runtime_error("Method E: munmap failed for " + path);
+            map_base = nullptr;
+            if (::close(map_fd) != 0) throw std::runtime_error("Method E: close failed for " + path);
+            map_fd = -1;
+        } else {
+            graph_io::StreamingGraphWriter w(path, N, K);
+            w.write_rows(fin.get(), 0, N);
+            if (w.rows_written() != N) throw std::runtime_error("Method E: short write of " + path);
+        }
+        t_write = std::chrono::duration<double>(std::chrono::steady_clock::now() - t1).count();
         secs += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        std::cout << std::fixed << std::setprecision(2) << "  [Timing] in-process translate detail: read_inv=" << t_inv
+                  << "s alloc=" << t_alloc << "s prefault(bg)=" << t_prefault << "s add_rows(sum over " << n_add_calls << " calls)=" << t_add_sum
+                  << "s hit_check=" << t_hit << "s write=" << t_write << "s\n";
     }
 };
 
@@ -2334,6 +2391,18 @@ static void run_method_E(
     std::cout << "  [Timing] acc.create()+start()=" << std::fixed << std::setprecision(2)
               << t_acc_create << "s\n";
 
+    // S20: 进程内 id 翻译 (#79) 的 inverse_perm 读入 + fin 分配 / 预触页放到后台，从 Phase 1 开始就跟读前向图、
+    // GPU count / fill 重叠；第一次 emit 时才等它 (xl_get)。是否走进程内翻译照旧由 host budget / 4 决定。
+    const bool xl_on = !final_path.empty() && InProcessTranslate::bytes_needed(N, K_out) <= host_budget_bytes / 4;
+    const bool xl_async = !(std::getenv("OC_XL_ASYNC") && std::getenv("OC_XL_ASYNC")[0] == '0');
+    const bool xl_mmap = !(std::getenv("OC_XL_MMAP") && std::getenv("OC_XL_MMAP")[0] == '0');   // S20 mmap 模式 (默认开)
+    std::future<std::unique_ptr<InProcessTranslate>> xl_fut;
+    if (xl_on && xl_async)
+        xl_fut = std::async(std::launch::async, [&inv_perm_path, &final_path, N, K_out, xl_mmap] {
+            auto p = std::make_unique<InProcessTranslate>(inv_perm_path, N, K_out, xl_mmap ? final_path : std::string());
+            p->prefault();
+            return p;
+        });
     // -------- Phase 1: 单遍扫描 forward_graph.bin，散射进 per-chunk buffer --------
     auto tA = Clock::now();
     GpuReverseMerge grev;
@@ -2593,9 +2662,17 @@ static void run_method_E(
         fwd_in2.seekg(sizeof(int64_t) + sizeof(int32_t), std::ios::beg);
 
         std::unique_ptr<InProcessTranslate> xl;
+        std::once_flag xl_once;
+        auto xl_get = [&]() -> InProcessTranslate* {   // 后台准备好的翻译器 (第一次调用时等它)
+            if (!xl_on) return nullptr;
+            std::call_once(xl_once, [&] {
+                xl = xl_async ? xl_fut.get()
+                              : std::make_unique<InProcessTranslate>(inv_perm_path, N, K_out, xl_mmap ? final_path : std::string());
+            });
+            return xl.get();
+        };
         if (!final_path.empty()) {
-            if (InProcessTranslate::bytes_needed(N, K_out) <= host_budget_bytes / 4)
-                xl = std::make_unique<InProcessTranslate>(inv_perm_path, N, K_out);
+            if (xl_on) { /* S20: 已在 Phase 1 开始时后台构造 */ }
             else
                 std::cout << "  [Method E] in-process id translation needs "
                           << InProcessTranslate::bytes_needed(N, K_out) / 1e9
@@ -2603,10 +2680,10 @@ static void run_method_E(
         }
         // 翻译时不写中间图 (out_path)，行交给 xl
         std::unique_ptr<graph_io::StreamingGraphWriter> writer_p;
-        if (!xl) writer_p = std::make_unique<graph_io::StreamingGraphWriter>(out_path, N, K_out);
+        if (!xl_on) writer_p = std::make_unique<graph_io::StreamingGraphWriter>(out_path, N, K_out);
         std::atomic<int64_t> rows_out{0};
         auto emit_rows = [&](const uint32_t* rows, int64_t r0, int64_t n) {
-            if (xl) xl->add_rows(rows, r0, n);
+            if (xl_on) xl_get()->add_rows(rows, r0, n);
             else if (gpu_rev) writer_p->write_rows_at(rows, r0, n);   // GPU 反向合并: 行不一定按序 (多 GPU)
             else writer_p->write_rows(rows, r0, n);
             rows_out += n;
@@ -2709,7 +2786,8 @@ static void run_method_E(
         if (rows_out.load() != N)
             throw std::runtime_error("Method E: wrote " + std::to_string(rows_out.load()) +
                                      " rows, expected " + std::to_string(N));
-        if (xl) {
+        if (xl_on) {
+            xl_get();
             { std::vector<uint32_t>().swap(row_block); }
             xl->write(final_path);
             std::cout << "  [Method E] ids translated in-process -> " << final_path
@@ -2800,7 +2878,9 @@ int main(int argc, char** argv)
         const size_t gpu_budget_b   = gpu_budget_mb << 20;
         const size_t edge_buffer_mb = vm["edge-buffer-mb"].as<size_t>();
         const size_t edge_buffer_b  = edge_buffer_mb << 20;
-        const size_t host_budget_b  = vm["host-budget-mb"].as<size_t>() << 20;
+        size_t host_budget_b  = vm["host-budget-mb"].as<size_t>() << 20;
+        // 测试用: OC_HOST_BUDGET_MB 覆盖 --host-budget-mb (小上限强制走磁盘 / translate_ids 回退路径做带搜索的检查)
+        if (const char* e = std::getenv("OC_HOST_BUDGET_MB")) host_budget_b = static_cast<size_t>(std::atoll(e)) << 20;
         std::string tmp_dir_arg     = vm["tmp-dir"].as<std::string>();
         const std::string bo_path   = vm["bucket-offsets"].as<std::string>();
         int32_t rev_cap_arg         = vm["rev-degree-cap"].as<int32_t>();

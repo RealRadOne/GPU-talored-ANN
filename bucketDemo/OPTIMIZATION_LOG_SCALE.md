@@ -489,3 +489,34 @@ but under rule (a) this retention must be counted against the host budget (to do
 |---|---|---|---|---|---|---|
 | G = 2 (S19) | 1.89× | 1.91× | 1.30× | 1.32× | 1.37× | 1.60× |
 | G = 4 (S19) | 2.99× | 3.09× | 1.29× | 1.14× | 1.45× | 1.93× |
+
+### S20 — item 1: optimize in-process id translation + final write — multi-GPU ACCEPT, guard blocked by a pre-existing memory issue (2026-11-20)
+
+**Breakdown first** (new `[Timing] in-process translate detail` line; SIFT100M G = 2 on /dev/shm): read_inv 2.11 s, alloc 0.07 s,
+add_rows (sum of 192 calls, page faults + id translation) 5.15 s, hit check 0.01 s, **write 7.5 s** (12.8 GB). Microbenchmark:
+buffered writes to one file do not scale with threads (per-inode lock): /dev/shm 1.5–1.8 GB/s, `/` page cache 1.0–1.2 GB/s for
+1–80 threads.
+
+**Change.** (1) `fin` is a `MAP_SHARED` mapping of `final_graph.bin` (header written into the mapping, rows start at byte 12): the
+scatter by old id *is* the file write; `write()` becomes munmap + close (no 12.8 GB copy). Same buffered (no fsync) semantics as
+before; dirty pages are written back by the kernel. `OC_XL_MMAP=0` = old buffer + write. (2) the translator (inverse_perm read,
+mapping, prefault) is built on a background thread from the start of Phase 1, overlapping the forward-graph read and GPU count /
+fill; the first emit waits for it (`OC_XL_ASYNC=0` = old). (3) add_rows OpenMP team capped to max(4, omp_max / G) (G GPU threads
+call it concurrently, cf. S10). In-process translation is still gated by the same host budget (`bytes_needed ≤ host budget / 4`),
+otherwise the unchanged translate_ids fallback (1B-safe). Test switch `OC_HOST_BUDGET_MB` overrides `--host-budget-mb`.
+
+**Quality.** Fallback forced on SIFT10M (`OC_HOST_BUDGET_MB=4000` → graph_new_ids.bin + translate_ids) with search eval: recall@10
+0.8322 / 0.9209 / 0.9691 / 0.9899 / 0.9973 vs fast path 0.8337 / 0.9220 / 0.9697 / 0.9898 / 0.9972, QPS equal, 0 bad ids.
+SIFT10M: fast-path final graph byte-identical to the old code (diagnostic only).
+
+**SIFT100M (judge with memory guard ON): G = 2 ×3 251.87 s (−6.1 % vs 268.24), G = 4 ×3 213.84 s (−4.0 % vs 222.82) → ACCEPT.**
+Same-period refs (same binary, `OC_XL_ASYNC=0 OC_XL_MMAP=0`): G = 2 265.25 s (optimize 27.29), G = 4 218.27 s (optimize 24.03).
+optimize G = 2 27.3 → 17.7 s, G = 4 24.0 → 16.3 s; translate + write G = 4 ~21.7 → 6.4–7.7 s (prefault runs 8.6–9.3 s in the
+background, off the critical path). Recall unchanged (G = 2 0.7263 / 0.8329 / 0.9108, G = 4 0.7258 / 0.8333 / 0.9095). Peak RSS
+G = 2 92.0, G = 4 95.1 GB (guard passes).
+
+**Single-GPU guard: REJECT on memory only — pre-existing, not caused by S20:** sift10M bucket2 peak RSS 12.95 GB > 1.2 × 9.65 GB
+(optimize-bucket2 best.json). The same 12.94–12.97 GB appears in every scale-loop guard run since scale8 (arrival records in RAM
+from S1 etc.; the guard ran with `--no-mem` until today). S20 only touches optimize (sift10M optimize RSS 1.60 → 2.04 GB, mapped
+file pages; within its gate). **Awaiting the user's decision** on the guard's memory reference (rebaseline to the scale-loop level /
+bring bucket2 memory under one host budget first / multi-GPU-only memory guard). Code committed; best_scale.json NOT updated yet.
