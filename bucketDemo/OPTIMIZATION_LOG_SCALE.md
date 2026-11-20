@@ -86,6 +86,9 @@ outputs must stay byte-identical to today's.**
 - **S13 — approved 2026-11-19, tried, rejected (see Tried & rejected).**
 ## Tried & rejected
 
+- **S19 (2026-11-20) — S17 + S18 combined: pending, not judged.** det 2 EQUAL (plain + forced S18 path), guard ACCEPT; the SIFT100M
+  part did not start: `/` 198 GB < 200 GB before the same-period ref (chain order: ref first, then G = 2 ×3). Patch
+  `bucketDemo/patches/scale19_s17_s18_combined.patch`; resume (`runs/scale19/chain.sh` minus the done parts) when disk ≥ 200 GB.
 - **S18 (2026-11-20, first idea under the relaxed single-GPU-stage rule) — Step 4.5: data_reordered written in the background
   with bounded dirty pages** (64 MB pieces, `sync_file_range` write + wait 4 pieces back → ≤ ~256 MB dirty; `BUCKET2_REORDER_BG`),
   round 1 Step 6 no longer joins (blob mode), round 2 Step 4 + bucket write take `r1_blob` as host_raw (no file read; blob
