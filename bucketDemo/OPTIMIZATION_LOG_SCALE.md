@@ -44,7 +44,7 @@ Item names below are backlog labels, not iteration numbers (iterations are logge
   read is prefetched (float path). No oversubscription found besides optimize staging (S10). Was: per-GPU OpenMP oversubscription elsewhere: prune_windowed per-GPU load / sink and bucket2 per-GPU host loops
   run `omp parallel` from G threads at once (as optimize staging did before S10); cap team sizes per GPU thread.
 - **S15 — keep each GPU's source rows resident between count and fill (G ≥ 4, size-gated):** halves optimize H2D bytes.
-- **S11 — re-judge S8 (prune async writers) at G = 4** when all four GPUs are free (patch kept).
+- **S11 — done as S15: S8 re-judged at G = 4, rejected.**
 
 **User priority (2026-11-19): after S7 (compact vector_knn), do these two next, in this order. Both implementation-level;
 outputs must stay byte-identical to today's.**
@@ -87,6 +87,10 @@ outputs must stay byte-identical to today's.**
   (final-graph stream) is unchanged (27.7 vs 27.0 s) — no timed stage waits for the forward graph's flush, the final graph
   itself goes to the page cache. An async unlink would at best be neutral → rejected. Patch
   `bucketDemo/patches/scale13_unlink_forward.patch` (incl. det_check change); still useful for disk space at 1B scale.
+- **S15 (2026-11-19) — S8 re-judged at G = 4** (scale8 patch on HEAD 05f2bd1, all four GPUs free): det 4 EQUAL; SIFT100M
+  G = 4 ×3 239.03 s vs best 238.74 (same-period HEAD, `runs/scale14`) → no gain; prune 46.4 / 46.5 / 53.2 s vs HEAD 47.3 / 47.9 /
+  45.6 — prune stays bound by the 12.8 GB forward-graph write at G = 4 too. Pure I/O overlap → not a compute gain. **S8 finally
+  rejected** (chain stopped before the G = 2 part; nothing to gain there either, see S8 below).
 - **S8 (2026-11-19) — P1 prune multi-GPU: per-GPU async writers + parallel plan / load** (each GPU plans / loads concurrently and
   writes its own rows through its own writer thread with `pwrite` to their offsets; byte-identical, det 2 EQUAL, guard ACCEPT
   sift10M / sift1M_large). SIFT100M G = 2 ×3: total 304.06 s (+0.1 % vs best 304.42); prune 40.9 / 40.7 / 41.0 s (best 44.64,
