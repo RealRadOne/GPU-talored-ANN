@@ -15,7 +15,9 @@ Wait 26.4), prune 46.3, optimize 30.0; recall@10 0.7267 / 0.8340 / 0.9109 (same-
 Previous: **304.42 s** (S4 re-judged 2026-11-19, "accepted (compute gain, disk-bound)"; reps 304.4 / 299.4 / 365.0, GPUs 0,1;
 `runs/scale4/sift100M_auto_g2`) — Step 6 85.2, Wait 33.5, optimize 35.0; recall@10 0.7272 / 0.8334 / 0.9120. Previous best
 307.50 (S1). S9 (optimize src-split) accepted under the compute-gain rule without a new best (311.50 s, slow-disk period). Compute metrics for the fast-disk re-check are in the S3 / S4 re-judge entry below.
-**G = 4: 259.46 s** (S2, 2026-11-19, GPUs 0–3, reps 258.90 / 259.46 / 259.76) — bucket2 171.94 (Step 4 42.4,
+**G = 4: 238.74 s** (S14 measurement of HEAD incl. S9–S11, 2026-11-19, GPUs 0–3, `runs/scale14/sift100M_auto_g4`) — bucket2
+162.8 (Step 4 43.0, Step 6 52.1, Wait 25.9), prune 47.3, optimize 28.6; recall@10 0.7245 / 0.8326 / 0.9111.
+Previous **G = 4: 259.46 s** (S2, 2026-11-19, GPUs 0–3, reps 258.90 / 259.46 / 259.76) — bucket2 171.94 (Step 4 42.4,
 Step 6 63.3, Wait 25.9), prune 50.0, optimize 37.6; recall@10 0.7257 / 0.8324 / 0.9105; peak RSS 83.3 GB.
 Run `runs/scale2/sift100M_auto_g4`. (S1 HEAD G = 4: 294.57 s, `runs/scale1m/sift100M_auto_g4`.)
 **msTuring100M G = 2 (milestone, after S11, ×1): 561.61 s** (2026-11-19, `runs/scale12/msTuring100M_auto_g2`) — bucket2 434.8,
@@ -339,3 +341,15 @@ microbenchmark: concurrent direct DMA to 2 + 3 aggregates 8.9 GB/s (single GPU 1
 the larger share varies run to run; count's 2 × 6.4 GB finish in ~2.0 s = 6.4 GB/s aggregate. Only fewer bytes (keep the
 source rows resident between count and fill, fits at G = 4 only) or pinned direct DMA (`cudaHostRegister` costs 1.6 s + 0.7 s
 unregister for 12.8 GB, net ≈ +0) would help. Not pursued at G = 2.
+
+### S14 — G = 4 measurement of HEAD (S9–S11) while all four GPUs were free — new G = 4 best (2026-11-19)
+
+No code change. det 4 EQUAL (plain and `OC_GPU_PHASE2=0`, i.e. the S9 src-split GpuReverseMerge path with 4 segments / 1
+round). SIFT100M G = 4 ×3: **238.74 s vs 259.46 (S2) → −8.0 %, judge ACCEPT, written to best_scale.json.** Stages: bucket2
+162.8 (Step 4 43.0, Step 6 52.1 vs 63.3 at S2 — S3/S4 load balance, Wait 25.9), prune 47.3 (50.0), optimize 28.6 (37.6;
+GPU reverse count 2.5 / fill 3.0 / select 0.43 / merge+emit 6.2 s, passes=4 src-split). Recall@10 0.7245 / 0.8326 / 0.9111.
+
+| speedup vs 1 GPU (429.56 s) | Step 4 | Step 6 | Wait | prune | optimize | total |
+|---|---|---|---|---|---|---|
+| G = 2 (best, S10) | 1.66× | 1.88× | 1.28× | 1.21× | 1.32× | 1.48× |
+| G = 4 (S14) | 2.36× | 3.07× | 1.31× | 1.18× | 1.38× | 1.80× |
