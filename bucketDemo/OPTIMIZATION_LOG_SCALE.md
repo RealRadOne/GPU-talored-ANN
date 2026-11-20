@@ -18,7 +18,9 @@ Previous: **304.42 s** (S4 re-judged 2026-11-19, "accepted (compute gain, disk-b
 **G = 4: 259.46 s** (S2, 2026-11-19, GPUs 0–3, reps 258.90 / 259.46 / 259.76) — bucket2 171.94 (Step 4 42.4,
 Step 6 63.3, Wait 25.9), prune 50.0, optimize 37.6; recall@10 0.7257 / 0.8324 / 0.9105; peak RSS 83.3 GB.
 Run `runs/scale2/sift100M_auto_g4`. (S1 HEAD G = 4: 294.57 s, `runs/scale1m/sift100M_auto_g4`.)
-**msTuring100M G = 2 (milestone, S1 HEAD, ×1): 607.54 s** (1 GPU best 741.0) — bucket2 453.8 (Step 4 151.3, Step 6
+**msTuring100M G = 2 (milestone, after S11, ×1): 561.61 s** (2026-11-19, `runs/scale12/msTuring100M_auto_g2`) — bucket2 434.8,
+prune 95.2, optimize 31.6 (was 44.4); recall@10 L 32 / 64 / 128 = 0.6135 / 0.7174 / 0.8023; peak RSS 103.6 GB.
+Previous milestone **(S1 HEAD, ×1): 607.54 s** (1 GPU best 741.0) — bucket2 453.8 (Step 4 151.3, Step 6
 127.3, Wait 29.2), prune 109.3, optimize 44.4; recall@10 L 32 / 64 / 128 = 0.6108 / 0.7186 / 0.8024 (1 GPU 0.6117 /
 0.7151 / 0.8020); peak RSS 102.7 GB. Run `runs/scale1m/msTuring100M_auto_g2`.
 
@@ -34,11 +36,12 @@ Item names below are backlog labels, not iteration numbers (iterations are logge
 
 - **S10 — done (partly: warm-up + staging threads; GPU-side count reduction not done).** optimize count phase (4.2 s at G = 2): each GPU D2Hs a full N×4 B count array and the host sums G arrays +
   serial prefix over N; reduce on GPU (peer add into GPU 0, or per-GPU dst-range counts) + parallel prefix.
-- **S14 — GPU 0 H2D 2× slower than GPU 1 in optimize count / fill** (same bytes; NUMA placement of `h_fwd_all` pages read by
+- **S14 — analysed (S12 entry): shared host link, not fixable at G = 2.** ~~GPU 0 H2D 2× slower than GPU 1 in optimize count / fill~~ (same bytes; NUMA placement of `h_fwd_all` pages read by
   `parallel_pread_file`, or PCIe topology). Check `numactl`/`move_pages` of the first half; interleave or bind the pread threads.
 - **S12 — checked 2026-11-19:** prune already caps per-GPU load threads (8); Step 6 scatter uses explicit threads; Step 4
   read is prefetched (float path). No oversubscription found besides optimize staging (S10). Was: per-GPU OpenMP oversubscription elsewhere: prune_windowed per-GPU load / sink and bucket2 per-GPU host loops
   run `omp parallel` from G threads at once (as optimize staging did before S10); cap team sizes per GPU thread.
+- **S15 — keep each GPU's source rows resident between count and fill (G ≥ 4, size-gated):** halves optimize H2D bytes.
 - **S11 — re-judge S8 (prune async writers) at G = 4** when all four GPUs are free (patch kept).
 
 **User priority (2026-11-19): after S7 (compact vector_knn), do these two next, in this order. Both implementation-level;
@@ -323,3 +326,15 @@ Absorbed by: optimize merge + emit (disk-bound final-graph stream, 6.0 / 8.5 / 7
 
 Observation for S14: count H2D of GPU 0 (device 2, first half of the rows) is consistently ~2× slower than GPU 1
 (1.85–2.05 s vs 0.84–0.98 s, also in S10 / ref) for the same bytes.
+
+### S12 — milestone msTuring100M G = 2 ×1 after S9–S11 + S14 analysis (2026-11-19)
+
+No code change. S9–S11 changed `optimize_chunked` (also the float32 path) → milestone run: **561.61 s vs 607.54 (S1 HEAD),
+−7.6 %**, optimize 44.4 → 31.6 s; recall@10 0.6135 / 0.7174 / 0.8023 vs 0.6108 / 0.7186 / 0.8024 (unchanged, ≥ own best −0.05
+and CAGRA ACE −0.05); judge ACCEPT, written to best_scale.json. Speedup vs 1 GPU (741.0 s): 1.32×.
+
+S14 (GPU 0 H2D 2× slower than GPU 1 in count / fill): not a code / NUMA effect but the shared host link of GPUs 2,3 —
+microbenchmark: concurrent direct DMA to 2 + 3 aggregates 8.9 GB/s (single GPU 11.4), staged 6.4 GB/s, and which GPU gets
+the larger share varies run to run; count's 2 × 6.4 GB finish in ~2.0 s = 6.4 GB/s aggregate. Only fewer bytes (keep the
+source rows resident between count and fill, fits at G = 4 only) or pinned direct DMA (`cudaHostRegister` costs 1.6 s + 0.7 s
+unregister for 12.8 GB, net ≈ +0) would help. Not pursued at G = 2.
