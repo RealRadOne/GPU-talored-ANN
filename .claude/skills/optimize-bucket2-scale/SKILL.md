@@ -72,7 +72,7 @@ dominated). Step 4 scales (GPU search). Per-GPU setup (`gpu_buffer_alloc`, `futu
 |---|---|---|---|
 | `sift100M_auto_g2` = `MGPU=2 run_pipeline.sh -d sift100M -m auto` | every iteration | 3 (median) | speed vs `best_scale.json`; quality: own best − 0.05 and TAGORE − 0.05 (datasets.json `ref`), 0 graph defects |
 | `sift100M_auto_g4` = `MGPU=4 ...` | every iteration **if all 4 GPUs are free** | 3 | same |
-| multi-GPU equivalence: `det_check.sh sift10M 2` (and `4` when G = 4 runs) | every iteration, before timing | 1 each | deterministic mode (`BUCKET2_ASSIGN_DETERMINISTIC=1`): `inverse_perm`, `vector_knn`, forward graph, final graph byte-identical to G = 1 |
+| multi-GPU equivalence (optional diagnostic, user 2026-11-20 — not a gate) | when useful | 1 | `det_check.sh sift10M G` (deterministic mode); differences are fine as long as search quality holds |
 | single-GPU guard: `run_pipeline.sh -d sift10M -m auto` + `-d sift1M -m large` | every iteration | 3 / 5 | `judge.py --quick` against `optimize-bucket2/state/best.json` (default `JUDGE_BEST`): no config > 3% slower, quality + defects as there |
 | `msTuring100M_auto_g2` | milestones (user asks, before a summary, after a change to the float32 path) | 1 | float32 large path still correct + quality (own best − 0.05, CAGRA ACE − 0.05) |
 
@@ -83,7 +83,16 @@ optimization has priority**; never change the algorithm's semantics — log such
 **Rules:**
 - **ACCEPT** iff the equivalence check passes, the single-GPU guard passes, every measured multi-GPU config
   passes quality / defects, at least one measured multi-GPU config is **≥ 3% faster** than its best, and none is
-  **> 3% slower**. Memory guard off (`--no-mem`; user 2026-11-16: host peak RSS ignored for now — still record it).
+  **> 3% slower**. Memory guard ON (user 2026-11-20: judge default, peak RSS ≤ 1.2 × best + 0.2 GB; no `--no-mem`).
+- **Memory fast paths (user 2026-11-20):** never gate an in-memory fast path on "the data fits" / "the machine has free RAM".
+  All fast paths count against one user-given host memory budget (reuse / unify the existing host-budget parameters:
+  `HOST_BUDGET_MB` in dataset_env.py → `--host-budget-mb` / `--bucket-mem-mb` / `--arrival-mem-mb` / `--cache-mb`); only within
+  that budget use the fast path, otherwise the existing disk / out-of-core fallback. Default peak memory must not rise noticeably.
+  Everything must scale to 1B / degree 512 (no design that needs the whole data in RAM).
+- **Correctness (user 2026-11-20):** byte identity between paths or between G GPUs and 1 GPU is no longer required; the gate is
+  search performance — recall@10 at every L within judge.py's quality gates and QPS not lower. Every iteration that adds a fast
+  path runs at least one build *with search eval* on the fast path and one on the fallback (force it with a small budget, on
+  sift10M or SIFT100M once). `det_check.sh` is an optional diagnostic.
 - **Compute gain, disk-bound (user 2026-11-19, in force from S7 on):** the user will re-test on a high-throughput disk, so a
   change that really saves GPU / compute time but does not show in the total because `/` is slow (~0.29 GB/s) is also
   ACCEPTED when all of:
@@ -91,7 +100,7 @@ optimization has priority**; never change the algorithm's semantics — log such
       Step 4 GPU time, prune `compute(parallel)`, optimize GPU reverse+merge count / fill / select / h2d, ...) drops by
       **≥ 5 s or ≥ 10 %** (median of 3), and the log names the disk wait that absorbed it (Wait / flush / sink growth);
   (b) the total is **not > 3 % slower** than best (noise gate), preferably with a same-period HEAD reference;
-  (c) correctness, det_check, search quality and the single-GPU guard all pass as usual.
+  (c) search quality (recall / QPS gates) and the single-GPU guard pass as usual (det_check optional).
   Judge with `--update --compute-gain` (writes only configs whose total beat their best; a slower total never replaces a
   best, so +3 % cannot accumulate). Log it as **"accepted (compute gain, disk-bound)"** with a before / after table of the
   compute metrics. Pure I/O moves / overlaps (e.g. S6 background write) are not compute savings.
@@ -112,7 +121,7 @@ bounds checks; change policy) applies. In addition (user decisions 2026-11-15):
    its device first (#97 bug).
 2. **Only Step 4, Step 6, prune and optimize go multi-GPU.** Steps 1, 2, 3, 4.5, 5 stay single-GPU (never split across GPUs),
    but (user 2026-11-20) they may be parallelised on the CPU (multi-threaded) or moved to background threads that overlap with
-   GPU stages. Output must stay identical (det_check EQUAL), search quality unchanged, single-GPU path not slower. Lesson S6: a
+   GPU stages. Search quality unchanged (judge gates, QPS not lower; user 2026-11-20), single-GPU path not slower. Lesson S6: a
    background write of data_reordered competed with Step 6 for memory bandwidth / page cache — prefer overlapping with Step 4,
    multi-threading, or throttled writes.
 3. **1B / degree-512 target:** no design that needs the whole graph or all arrival records in host RAM
@@ -146,7 +155,7 @@ bounds checks; change policy) applies. In addition (user decisions 2026-11-15):
 ### 2. Implement
 - Edit sources; match style (Chinese/English comments); credit sources (`// 参考 cuVS mg/snmg.cuh::...`).
 - Build `build/` with ninja (nice). Compile error → fix; infeasible → revert, log rejected.
-- Smoke first: `bash $T/det_check.sh sift10M 2` (≈ 3 min; also catches crashes / races). Deterministic
+- Smoke first: a sift10M build (and optionally `bash $T/det_check.sh sift10M 2` as a diagnostic, ≈ 3 min). Deterministic
   mismatch = bug → fix before timing. (Mismatch while another user is on the GPUs is not a verdict — rerun when free.)
 
 ### 3. Test (detached chain; GPUs per **GPU availability**; disk check first)
@@ -154,10 +163,11 @@ bounds checks; change policy) applies. In addition (user decisions 2026-11-15):
 S=/home/lanlu/microBenchmark/.claude/skills/optimize-bucket2/scripts
 T=/home/lanlu/microBenchmark/.claude/skills/optimize-bucket2-scale/scripts
 R=/home/lanlu/microBenchmark/bucketDemo/buildBucket/runs/scale<N>
-bash $T/det_check.sh sift10M 2 > $R/det2.txt          # + "4" if all four GPUs are free
+# optional: bash $T/det_check.sh sift10M 2 > $R/det2.txt   (diagnostic only)
+# fast path added? one build with search eval on the fallback too (small budget), e.g. sift10M
 bash $S/run_pipeline.sh -d sift10M -m auto  -o $R/sift10M_auto     # single-GPU guard
 bash $S/run_pipeline.sh -d sift1M  -m large -o $R/sift1M_large
-python3 $S/judge.py $R/sift10M_auto $R/sift1M_large --quick --no-mem   # vs optimize-bucket2 best.json (RSS not gated)
+python3 $S/judge.py $R/sift10M_auto $R/sift1M_large --quick   # vs optimize-bucket2 best.json (memory guard on)
 MGPU=2 bash $S/run_pipeline.sh -d sift100M -m auto -o $R/sift100M_auto_g2
 MGPU=4 bash $S/run_pipeline.sh -d sift100M -m auto -o $R/sift100M_auto_g4   # only if all 4 free at this point
 ```
@@ -174,9 +184,9 @@ MGPU=4 bash $S/run_pipeline.sh -d sift100M -m auto -o $R/sift100M_auto_g4   # on
 ```bash
 JUDGE_BEST=/home/lanlu/microBenchmark/.claude/skills/optimize-bucket2-scale/state/best_scale.json \
 JUDGE_BENCH=sift100M_auto_g2[,sift100M_auto_g4] \
-python3 $S/judge.py $R/sift100M_auto_g2 [$R/sift100M_auto_g4] --no-mem --md
+python3 $S/judge.py $R/sift100M_auto_g2 [$R/sift100M_auto_g4] --md
 ```
-plus `det*.txt` (must say `EQUAL`) and the single-GPU `--quick` verdict. Rules in **Goal and bench set**.
+plus the single-GPU `--quick` verdict (det*.txt optional). Rules in **Goal and bench set**.
 
 ### 5a. ACCEPT
 1. Same judge command with `--update` (add `--add-new` if G = 4 has no best yet).

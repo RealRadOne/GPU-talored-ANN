@@ -18,7 +18,9 @@ Wait 26.4), prune 46.3, optimize 30.0; recall@10 0.7267 / 0.8340 / 0.9109 (same-
 Previous: **304.42 s** (S4 re-judged 2026-11-19, "accepted (compute gain, disk-bound)"; reps 304.4 / 299.4 / 365.0, GPUs 0,1;
 `runs/scale4/sift100M_auto_g2`) — Step 6 85.2, Wait 33.5, optimize 35.0; recall@10 0.7272 / 0.8334 / 0.9120. Previous best
 307.50 (S1). S9 (optimize src-split) accepted under the compute-gain rule without a new best (311.50 s, slow-disk period). Compute metrics for the fast-disk re-check are in the S3 / S4 re-judge entry below.
-**G = 4: 237.60 s** (S16, 2026-11-19, GPUs 2,3,0,1, `runs/scale16/sift100M_auto_g4`) — bucket2 161.0, prune 49.4, optimize 26.6;
+**G = 4: 222.82 s** (S19, 2026-11-20, GPUs 0–3, `runs/scale19g4/sift100M_auto_g4`) — bucket2 145.1 (Step 4 34.0, Step 4.5 6.3,
+Step 6 51.7, Wait 26.3), prune 49.0, optimize 27.2; recall@10 0.7251 / 0.8332 / 0.9100. Speedup vs 1 GPU 1.93×.
+Previous **G = 4: 237.60 s** (S16, 2026-11-19, GPUs 2,3,0,1, `runs/scale16/sift100M_auto_g4`) — bucket2 161.0, prune 49.4, optimize 26.6;
 recall@10 0.7261 / 0.8338 / 0.9104. Previous **G = 4: 238.74 s** (S14 measurement of HEAD incl. S9–S11, 2026-11-19, GPUs 0–3, `runs/scale14/sift100M_auto_g4`) — bucket2
 162.8 (Step 4 43.0, Step 6 52.1, Wait 25.9), prune 47.3, optimize 28.6; recall@10 0.7245 / 0.8326 / 0.9111.
 Previous **G = 4: 259.46 s** (S2, 2026-11-19, GPUs 0–3, reps 258.90 / 259.46 / 259.76) — bucket2 171.94 (Step 4 42.4,
@@ -80,6 +82,15 @@ outputs must stay byte-identical to today's.**
   12.8 GB final write (disk-bound) → at most a few seconds. Source: cuVS `mg/snmg.cuh` sharded build.
 
 ## Awaiting approval
+
+- **User decisions 2026-11-20 (later):** (a) memory: in-memory fast paths only within one user-given host budget (reuse / unify
+  HOST_BUDGET_MB → --host-budget-mb / --bucket-mem-mb / --arrival-mem-mb / --cache-mb), never "if it fits / RAM is free";
+  otherwise the existing disk / out-of-core fallback; default peak memory must not rise noticeably; judge memory guard ON again.
+  (b) correctness: byte identity (paths, G vs 1) no longer required; gate = search quality (recall@10 per L within judge gates, QPS
+  not lower); fast path and fallback each get ≥ 1 build with search eval; det_check is optional. Everything must scale to
+  1B / degree 512. Order after S19: 1 optimize id translation + final write → 2 prune parallel plan / load (S8 part without the
+  async writer, compute rule) → 3 Step 4 (serial init, round-2 upload OpenMP threads, read waits) → 4 Step 6 load balance at
+  G = 4 → A incremental final merge (keep the disk spill path). B not now.
 
 - **User decision 2026-11-20:** Steps 1, 2, 3, 4.5, 5 stay on one GPU but may now be CPU-parallelised or moved to background
   threads overlapping GPU stages (identical output, det EQUAL, quality unchanged, 1-GPU not slower). SKILL.md invariant 2
@@ -465,3 +476,16 @@ binary): 291.32 s (bucket2 217.2, prune 45.5, optimize 28.7).
 | speedup vs 1 GPU (429.56 s) | Step 4 | Step 6 | Wait | prune | optimize | total |
 |---|---|---|---|---|---|---|
 | G = 2 (S19) | 1.89× | 1.91× | 1.30× | 1.32× | 1.37× | 1.60× |
+
+**S19 at G = 4 (2026-11-20, all four GPUs free):** det 4 EQUAL (plain + forced S18 path). SIFT100M G = 4 ×3: **222.82 s (reps
+222.8 / 220.2 / 223.8), −6.2 % vs best 237.60 → judge ACCEPT (memory guard on: peak RSS 95.6 GB ≤ 1.2 × 82.2), new G = 4 best.**
+Step 4 43.0 → 34.0 s, Step 4.5 15.6 → 6.3 s, Step 6 51.7 s, prune 49.0, optimize 27.2. Same-period ref (pre-S19 HEAD 74060c5,
+×1): 222.98 s = bucket2 163.7 + prune **32.6** + optimize 26.7 — bucket2 −18.6 s for S19, but the ref's prune is an outlier
+(every other G = 4 prune 46–49 s: S14 47.3, S15 46.5, S16 49.4, S17 48.6) → caveat noted; a second ref would settle it.
+Peak RSS note: S19 keeps the 12.8 GB `r1_blob` into round 2 (G = 2 91.7 vs 80.4 GB, G = 4 95.6 vs 82.2 GB) — within the guard,
+but under rule (a) this retention must be counted against the host budget (to do with item 1/3).
+
+| speedup vs 1 GPU (429.56 s) | Step 4 | Step 6 | Wait | prune | optimize | total |
+|---|---|---|---|---|---|---|
+| G = 2 (S19) | 1.89× | 1.91× | 1.30× | 1.32× | 1.37× | 1.60× |
+| G = 4 (S19) | 2.99× | 3.09× | 1.29× | 1.14× | 1.45× | 1.93× |
