@@ -82,6 +82,13 @@ outputs must stay byte-identical to today's.**
 - **S13 — approved 2026-11-19, tried, rejected (see Tried & rejected).**
 ## Tried & rejected
 
+- **S17 (2026-11-20) — Step 4 prefetch path: batches of Nv / 4** (`BUCKET2_STEP4_PF_DIV`; v1 shrank only the first batch to
+  Nv / 8 → no gain, the wait moved to the 2nd full batch: G = 4 237.48 s, read still 3.5 s). v2: every prefetch batch Nv / 4 so
+  each read + H2D hides behind the previous search. det 4 / det 2 EQUAL, guard ACCEPT. Per-GPU Step 4 read 3.5 → 1.0 s (G = 4),
+  2.8 → 0.8 s (G = 2); Step 4 G = 4 42.0 → 36.8 s (same-period ref), G = 2 61.4 → 54.8 s. Totals: **G = 2 277.74 s (−2.7 % vs
+  285.33), G = 4 236.76 s (−0.4 %; ref 237.21)** — G = 4 saving absorbed by Step 4.5 / Step 6 (+2 s each, disk). Below the 3 %
+  gate and an I/O overlap (not a compute saving) → rejected. Strongest near-miss so far; worth a re-judge on the fast disk.
+  Patch `bucketDemo/patches/scale17_step4_small_prefetch_batches.patch`.
 - **S13 (2026-11-19, user-approved) — optimize_chunked unlinks forward_graph_reordered.bin once read** (`--keep-forward` /
   `OC_KEEP_FORWARD=1` to keep; det_check exported it). Final graph byte-identical (keep vs drop, both GPU-rev and GPU-phase-2
   paths), det 2 EQUAL, guard ACCEPT. SIFT100M G = 2 ×3: 295.62 s (+1.6 % vs best 290.97); same-period ref (keep) optimize
