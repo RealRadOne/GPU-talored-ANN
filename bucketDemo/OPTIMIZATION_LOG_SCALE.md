@@ -10,7 +10,9 @@ as reference.
 
 ## Current best
 
-**G = 2: 285.33 s** (S16 run, 2026-11-19, GPUs 2,3, `runs/scale16/sift100M_auto_g2`; S16 itself is inactive at G = 2 — faster
+**G = 2: 268.24 s** (S19 = S17 + S18, 2026-11-20, GPUs 2,3, `runs/scale19/sift100M_auto_g2`) — bucket2 197.0 (Step 4 53.7,
+Step 4.5 4.7, Step 6 83.6, Wait 26.0), prune 42.1, optimize 28.9; recall@10 0.7272 / 0.8343 / 0.9114. Speedup vs 1 GPU 1.60×.
+Previous **G = 2: 285.33 s** (S16 run, 2026-11-19, GPUs 2,3, `runs/scale16/sift100M_auto_g2`; S16 itself is inactive at G = 2 — faster
 period) — bucket2 215.1, prune 41.6, optimize 28.7; recall@10 0.7241 / 0.8322 / 0.9108. Previous **290.97 s** (S10, GPUs 2,3, `runs/scale10/sift100M_auto_g2`) — bucket2 214.1 (Step 4 61.4, Step 6 84.9,
 Wait 26.4), prune 46.3, optimize 30.0; recall@10 0.7267 / 0.8340 / 0.9109 (same-period HEAD ref 293.27 s — faster disk period).
 Previous: **304.42 s** (S4 re-judged 2026-11-19, "accepted (compute gain, disk-bound)"; reps 304.4 / 299.4 / 365.0, GPUs 0,1;
@@ -86,7 +88,7 @@ outputs must stay byte-identical to today's.**
 - **S13 — approved 2026-11-19, tried, rejected (see Tried & rejected).**
 ## Tried & rejected
 
-- **S19 (2026-11-20) — S17 + S18 combined: pending, not judged.** det 2 EQUAL (plain + forced S18 path), guard ACCEPT; the SIFT100M
+- **S19 — accepted (see Iterations), was pending:** det 2 EQUAL (plain + forced S18 path), guard ACCEPT; the SIFT100M
   part did not start: `/` 198 GB < 200 GB before the same-period ref (chain order: ref first, then G = 2 ×3). Patch
   `bucketDemo/patches/scale19_s17_s18_combined.patch`; resume (`runs/scale19/chain.sh` minus the done parts) when disk ≥ 200 GB.
 - **S18 (2026-11-20, first idea under the relaxed single-GPU-stage rule) — Step 4.5: data_reordered written in the background
@@ -434,3 +436,32 @@ Value of the compute changes without the disk (G = 2, shm, A/B):
 Remaining bottlenecks on shm at G = 2 (265 s): Step 6 85.6 s (GPU-bound, 1.87×), Step 4 60.8 s (per-GPU search ~20 s × 2
 rounds + ~3 s serial step0/init per round + read waits, cf. S17), the single-GPU / serial parts Steps 1–3 + 4.5 + 5 + Wait
 ≈ 50 s (now allowed to be CPU-parallel / overlapped, user 2026-11-20 → S18…), prune 33–38 s, optimize 25 s.
+
+### S19 — S17 + S18 combined: Step 4 prefetch batches Nv / 4 + Step 4.5 background reorder write (bounded dirty) + round-2 blob — accepted (2026-11-20)
+
+**Idea.** The two near-misses touch different phases: S17 hides the per-batch dataset read behind the previous search in
+round-1 Step 4 (prefetch batches Nv / 4); S18 (first idea under the user's 2026-11-20 relaxation: single-GPU steps may overlap
+GPU stages) writes data_reordered in a background thread with ≤ ~256 MB dirty pages (`sync_file_range`), round-1 Step 6 does not
+wait for it, and round-2 Step 4 + bucket write read the in-memory `r1_blob` instead of the file. Same results (S17: top-2 per
+point is batch-independent; S18: data_reordered byte-identical). Sources: TAGORE `large_index.cu` GPU–CPU–disk pipeline; cuVS
+`cagra_ace.cuh::ace_check_use_disk_mode` (memory mode when it fits). Switches: `BUCKET2_STEP4_PF_DIV`, `BUCKET2_REORDER_BG`;
+test switch `BUCKET2_HOST_RAW_BUDGET_MB`.
+
+**Correctness.** det 2 EQUAL plain and with the S18 path forced on SIFT10M (`BUCKET2_HOST_RAW_BUDGET_MB=2000`); SIFT10M
+data_reordered / vector_knn / forward / final graph byte-identical with the background write on vs off; guard ACCEPT.
+G = 4 skipped (GPU 0 held by wangcy07). The SIFT100M part ran on a second attempt (first stopped at `/` 198 GB < 200 GB).
+
+**SIFT100M G = 2 ×3 (GPUs 2,3): 268.24 s, −6.0 % vs best 285.33 → judge ACCEPT, new best.** Same-period HEAD ref (HEAD
+binary): 291.32 s (bucket2 217.2, prune 45.5, optimize 28.7).
+
+| stage | same-period HEAD ref | S19 median |
+|---|---|---|
+| Step 4 (2 rounds) | 60.6 s | 53.7 s |
+| Step 4.5 | 16.7 s | 4.7 s |
+| Step 6 | 85.8 s | 83.6 s (no S6 penalty) |
+| bucket2 | 217.2 s | 197.0 s |
+| prune / optimize | 45.5 / 28.7 s | 42.1 / 28.9 s |
+
+| speedup vs 1 GPU (429.56 s) | Step 4 | Step 6 | Wait | prune | optimize | total |
+|---|---|---|---|---|---|---|
+| G = 2 (S19) | 1.89× | 1.91× | 1.30× | 1.32× | 1.37× | 1.60× |
