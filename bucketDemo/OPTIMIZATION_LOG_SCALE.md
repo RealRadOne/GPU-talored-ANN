@@ -79,6 +79,10 @@ outputs must stay byte-identical to today's.**
 
 ## Awaiting approval
 
+- **User decision 2026-11-20:** Steps 1, 2, 3, 4.5, 5 stay on one GPU but may now be CPU-parallelised or moved to background
+  threads overlapping GPU stages (identical output, det EQUAL, quality unchanged, 1-GPU not slower). SKILL.md invariant 2
+  updated. First target: Step 4.5 (mind S6: background data_reordered write vs Step 6).
+
 - **S13 — approved 2026-11-19, tried, rejected (see Tried & rejected).**
 ## Tried & rejected
 
@@ -389,3 +393,32 @@ period). Recall unchanged (G = 4 0.7261 / 0.8338 / 0.9104, G = 2 0.7241 / 0.8322
 | optimize stage | 28.74 s | 26.58 s |
 
 Absorbed by: optimize merge + emit / final-graph stream (disk-bound, 5.5–6.0 s). G = 4 speedup vs 1 GPU: total 1.81×, optimize 1.49×.
+
+### M1 — no-disk-limit measurement on /dev/shm (user request 2026-11-20; measurement only, best unchanged)
+
+HEAD 74060c5 binaries built separately (git worktree + niced build in the scratchpad; `mgpu_run.sh` now takes `BIN=` like
+`B2BIN=`), OUTDIR (work/, tmp, all intermediates, final graph) on `/dev/shm/bucket2_shm/<run>`, timing only, each run's shm dir
+removed right after it (safety: MemAvailable ≥ 170 GB and /dev/shm ≥ 100 GB before each run; min MemAvailable seen 111 GB, shm
+peak 55–61 GB). G = 4 skipped in both chains (GPU 0,1 held by other users). Logs: `runs/shm/`.
+
+| SIFT100M | total | Step 4 | Step 4.5 | Step 6 | Wait | Steps 1–3 + 5 | prune | optimize | disk best |
+|---|---|---|---|---|---|---|---|---|---|
+| G = 1 shm | **406.0** | 99.2 | 12.0 | 159.9 | 19.5 | 18.7 | 53.0 | 37.8 | 429.56 (#96) |
+| G = 2 shm #1 | **263.4** | 60.8 | 12.2 | 85.6 | 21.4 | 18.7 | 33.5 | 24.6 | 285.33 |
+| G = 2 shm #2 | **266.9** | 60.8 | 11.7 | 85.6 | 19.4 | 18.3 | 38.3 | 25.8 | |
+| G = 2 disk (S16 rep1, ref) | 285.3 | 59.5 | 16.0 | 84.1 | 25.2 | 18.8 | 41.6 | 28.7 | |
+
+Speedup 1 → 2 GPUs on shm: 406.0 / 265.2 = **1.53×** (disk 1.51×); Step 4 1.63×, Step 6 1.87×, prune 1.47×, optimize 1.50×,
+Wait / Steps 1–3, 4.5, 5 ≈ 1×. shm vs disk at G = 2: −7 % (Wait −5 s, Step 4.5 −4 s, prune −5 s, optimize −3.5 s); **Step 6 and
+Step 4 are not disk-bound** (unchanged on shm).
+
+Value of the compute changes without the disk (G = 2, shm, A/B):
+- S9 + S11 off (`OC_GPU_REV_SPLIT=0 OC_GPU_REV_GPUSCAN=0`): optimize 28.72 s vs 24.6 / 25.8 s → **−3.5 s (−12 %)**; count
+  3.48 → 2.26 s, fill 4.92 → 3.50 s. (S10 is not switchable here.)
+- S17 (patch build): Step 4 60.8 → **54.6 s (−6.2 s)**; per-GPU read 2.75 → 0.67 s even on shm (the original dataset is still
+  read from `/`); bucket2 total 202.1 vs 205.3 / 202.8 s — the gain is partly absorbed by the other steps' noise.
+- S16: G = 4 only → not measured (G = 4 skipped).
+
+Remaining bottlenecks on shm at G = 2 (265 s): Step 6 85.6 s (GPU-bound, 1.87×), Step 4 60.8 s (per-GPU search ~20 s × 2
+rounds + ~3 s serial step0/init per round + read waits, cf. S17), the single-GPU / serial parts Steps 1–3 + 4.5 + 5 + Wait
+≈ 50 s (now allowed to be CPU-parallel / overlapped, user 2026-11-20 → S18…), prune 33–38 s, optimize 25 s.

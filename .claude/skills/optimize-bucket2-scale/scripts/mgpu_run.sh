@@ -7,7 +7,7 @@
 set -uo pipefail
 DS=$1; G=$2; OUT=$3
 S=/home/lanlu/microBenchmark/.claude/skills/optimize-bucket2/scripts
-BIN=/home/lanlu/microBenchmark/bucketDemo/buildBucket/build
+BIN=${BIN:-/home/lanlu/microBenchmark/bucketDemo/buildBucket/build}   # BIN=<dir>: prune / optimize binaries (HEAD copies for side runs)
 B2BIN=${B2BIN:-$BIN}
 PY=/home/lanlu/miniconda3/envs/cuvs-bench/bin/python
 source $S/params.sh

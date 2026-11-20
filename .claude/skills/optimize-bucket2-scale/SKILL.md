@@ -110,7 +110,11 @@ bounds checks; change policy) applies. In addition (user decisions 2026-11-15):
 1. **One host CPU manages 1…N GPUs**; `--num-gpus G` stays generic (no hard-coded 2 / 4), one thread per GPU
    with its own streams / resources. `cudaSetDevice` is per thread — every new thread that touches CUDA sets
    its device first (#97 bug).
-2. **Only Step 4, Step 6, prune and optimize go multi-GPU.** Steps 1, 2, 3, 4.5, 5 stay single-GPU.
+2. **Only Step 4, Step 6, prune and optimize go multi-GPU.** Steps 1, 2, 3, 4.5, 5 stay single-GPU (never split across GPUs),
+   but (user 2026-11-20) they may be parallelised on the CPU (multi-threaded) or moved to background threads that overlap with
+   GPU stages. Output must stay identical (det_check EQUAL), search quality unchanged, single-GPU path not slower. Lesson S6: a
+   background write of data_reordered competed with Step 6 for memory bandwidth / page cache — prefer overlapping with Step 4,
+   multi-threading, or throttled writes.
 3. **1B / degree-512 target:** no design that needs the whole graph or all arrival records in host RAM
    (size-gated fast paths are fine with an out-of-core fallback that keeps working); GPU memory per device
    bounded; device count and sizes from runtime queries.
