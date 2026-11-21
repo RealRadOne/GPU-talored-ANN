@@ -150,14 +150,16 @@ public:
 
     // 多 GPU (prune 每张卡一段行): 行写到已知偏移，不要求顺序；可多线程同时调用 (各段互不重叠)。
     // rows_written() 计入这些行，调用方照样检查 == N。
-    void write_rows_at(const uint32_t* rows, int64_t row_lo, int64_t n_rows) {
+    // count=false (spot: 块可能被拒收后由别人重做，写的是同样的字节): 不计数，提交成功后调用方 add_rows_written
+    void add_rows_written(int64_t n) { rows_unordered_ += n; }
+    void write_rows_at(const uint32_t* rows, int64_t row_lo, int64_t n_rows, bool count = true) {
         if (row_lo < 0 || row_lo + n_rows > N_)
             throw std::runtime_error("StreamingGraphWriter: write_rows_at out of range");
         const int64_t bytes = n_rows * K_out_ * static_cast<int64_t>(sizeof(uint32_t));
         const off_t base = static_cast<off_t>(kHeader) + static_cast<off_t>(row_lo) * K_out_ * static_cast<off_t>(sizeof(uint32_t));
         if (!pwrite_all(reinterpret_cast<const char*>(rows), static_cast<size_t>(bytes), base))
             throw std::runtime_error("StreamingGraphWriter: write failed");
-        rows_unordered_ += n_rows;
+        if (count) rows_unordered_ += n_rows;
     }
 
     ~StreamingGraphWriter() {

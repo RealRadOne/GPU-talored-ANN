@@ -582,6 +582,75 @@ int main(int argc, char** argv)
             }
             auto chunked = [&](auto* tag) {
                 using T = std::remove_pointer_t<decltype(tag)>;
+                if (spot::Client::get().enabled()) {
+                    // ---- spot (SPOT_DESIGN §4.3): 单元 = bucket 位置；初始切分 = 按行数切 (下面的 cut)，每段预留给该设备的
+                    // spot worker (dedicated: 设备 0 = on-demand)。每个租约调一次 run_chunked([L.begin, end))：每块前
+                    // may_start，块的行写出后 commit。行按偏移 pwrite；被拒收的块写的字节跟重做的相同 (每点只看自己的窗口)，
+                    // 所以照写不误，只在提交成功时计行数 (rows_written == N 的检查不变)。同卡 worker 用设备锁串行。
+                    bool shared = false;
+                    const auto ws = spot::make_workers(G, &shared);
+                    std::vector<int64_t> cuts{0};
+                    std::vector<int> owners;
+                    for (int g = 1, p = 0; g <= G; ++g) {
+                        const uint64_t target = static_cast<uint64_t>(N) * g / G;
+                        while (g < G && p < n_buckets && offsets_new[static_cast<size_t>(p)] < target) ++p;
+                        cuts.push_back(g < G ? p : n_buckets);
+                        int o = -1;
+                        for (size_t w = 0; w < ws.size(); ++w)
+                            if (ws[w].device == g - 1 && (o < 0 || (ws[static_cast<size_t>(o)].ondemand && !ws[w].ondemand))) o = static_cast<int>(w);
+                        owners.push_back(o);
+                    }
+                    for (size_t i = 1; i < cuts.size(); ++i) cuts[i] = std::max(cuts[i], cuts[i - 1]);
+                    std::vector<double> ucost(static_cast<size_t>(n_buckets));
+                    for (int32_t p = 0; p < n_buckets; ++p)
+                        ucost[static_cast<size_t>(p)] = static_cast<double>(offsets_new[static_cast<size_t>(p) + 1] - offsets_new[static_cast<size_t>(p)]) + 1.0;
+                    spot::SegmentScheduler S("prune", n_buckets, ws, cuts, owners, spot::options_from_env(shared), ucost);
+                    std::vector<prune_windowed_gpu::ChunkStats> st(ws.size());
+                    std::vector<std::exception_ptr> exc(ws.size());
+                    std::vector<std::mutex> dev_m(static_cast<size_t>(G));
+                    std::vector<std::thread> th;
+                    std::mutex sink_mtx;
+                    for (size_t w = 0; w < ws.size(); ++w) {
+                        th.emplace_back([&, w] {
+                            const int g = ws[w].device;
+                            try {
+                                if (g < 0 || g >= G) throw std::runtime_error("spot prune: bad worker device");
+                                prune_windowed_gpu::set_device(g);
+                                S.run_worker(static_cast<int>(w), [] {}, [&](const spot::Lease& L) {
+                                    std::lock_guard<std::mutex> dl(dev_m[static_cast<size_t>(g)]);
+                                    const int64_t e = S.end_of(L);
+                                    if (L.begin < 0 || e > n_buckets || L.begin >= e) return;   // bounds check
+                                    prune_windowed_gpu::ChunkHooks hk;
+                                    hk.claim = [&](int p0, int p1) { return S.may_start(L, p0, p1); };
+                                    hk.done = [&](int p0, int p1) {
+                                        if (p0 < 0 || p1 > n_buckets || p0 >= p1) throw std::runtime_error("spot prune: bad chunk");
+                                        if (S.commit(L, p1))
+                                            writer.add_rows_written(static_cast<int64_t>(offsets_new[static_cast<size_t>(p1)]) -
+                                                                    static_cast<int64_t>(offsets_new[static_cast<size_t>(p0)]));
+                                    };
+                                    prune_windowed_gpu::run_chunked<T>(N, M_in, D_all, offsets_new.data(), n_buckets, win, win_len, Wmax,
+                                        output_degree, budget / G,
+                                        [&](int64_t lo, int64_t n, int32_t* c, T* v) { load_rows(lo, n, c, v); },
+                                        [&](const uint32_t* rows, int64_t row0, int64_t n) {
+                                            auto tw0 = Clock::now();
+                                            writer.write_rows_at(rows, row0, n, false);
+                                            std::lock_guard<std::mutex> lk(sink_mtx);
+                                            t_sink += std::chrono::duration<double>(Clock::now() - tw0).count();
+                                        },
+                                        &st[w], static_cast<int>(L.begin), static_cast<int>(e), &hk);
+                                }, [] {});
+                            } catch (...) { exc[w] = std::current_exception(); }
+                        });
+                    }
+                    for (auto& t : th) t.join();
+                    prune_windowed_gpu::set_device(0);
+                    for (auto& e : exc) if (e) std::rethrow_exception(e);
+                    for (auto& x : st) { cst.chunks += x.chunks; cst.loaded_rows += x.loaded_rows; }
+                    S.print_stats(std::cout);
+                    std::string why;
+                    if (!S.verify_complete(&why)) throw std::runtime_error("spot prune: incomplete: " + why);
+                    return;
+                }
                 if (G == 1) {
                     prune_windowed_gpu::run_chunked<T>(N, M_in, D_all, offsets_new.data(), n_buckets, win, win_len, Wmax,
                                                        output_degree, budget,

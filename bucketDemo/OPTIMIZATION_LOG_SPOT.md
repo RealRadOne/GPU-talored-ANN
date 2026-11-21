@@ -9,7 +9,7 @@ Design: `bucketDemo/SPOT_DESIGN.md` (user decisions 2026-11-20/21). Skill: `.cla
 | P0 | infrastructure: `src/spot_sched.hpp` (Client + SegmentScheduler), unit test (`src/tests/test_spot_sched.cpp`, TSan clean), cross-process e2e (`src/tests/test_spot_e2e.cpp`), `spot_sim.py` (gen / run / show), run_pipeline `SPOT=1` hooks, summarize / judge `_spot<TAG>` keys, `spot_build.sh`, `spot_det.sh`, traces `t1_g{1,2,4}`, `d1_g{1,2,4}`; `Client::init()` at the top of bucket2 / prune_windowed `main()` | **done 2026-11-21** (set up interactively, see commit) |
 | P1 | Step 4 on the scheduler (SPOT_DESIGN §4.1) + `spot_det.sh sift10M {1,2,4} d1_g*` EQUAL | **done 2026-11-21** (SP1; det with denser `d2_g*`) |
 | P2 | Step 6 on the scheduler (§4.2) + det EQUAL | **done 2026-11-21** (SP2) |
-| P3 | prune on the scheduler (§4.3) + det EQUAL | todo |
+| P3 | prune on the scheduler (§4.3) + det EQUAL | **done 2026-11-21** (SP3) |
 | P4 | baseline: SIFT100M G=1/2/4 × {plain (spot off), SPOT none, SPOT t1} → `state/best_spot.json`, **Current best** | todo |
 | O* | optimization iterations (Ideas backlog) | — |
 
@@ -31,6 +31,7 @@ Design: `bucketDemo/SPOT_DESIGN.md` (user decisions 2026-11-20/21). Skill: `.cla
 - **O7 prune per-lease plan** — re-plan only the remaining range; keep the bucket pool across leases of the same epoch.
 - **O9 rejected-units accounting** — `commit` counts a rejected commit as `new_cursor - s.cursor`; after a reap + re-grant that is the distance from the *new* owner's cursor (SP1: G=1 rejected_units=9.98M for one ~2.5M batch). Pass the unit start `u0` to `commit` so lost work = `new_cursor - u0`. Needed before P4 / loss-cut judgements.
 - **O10 tail ping-pong** — SP2 logs: at the stage end both workers steal 3–29 positions from each other repeatedly, each Step 6 lease paying a full setup. Minimum steal size by cost (e.g. ≥ 2 × the per-lease setup time × the victim's unit rate) or no stealing below a threshold.
+- **O11 prune re-plan per lease** — SP3 quality run: spot prune loaded 2.98 × N rows vs 1.93 × N plain (each lease plans its own chunks and refills the bucket pool from scratch; chunks that cross a shrunken `end` are not claimed at all → the lease ends early and the rest is re-acquired). Truncate the last chunk at `end_of(L)` instead of stopping, keep the pool across leases of one epoch (with O7).
 - **O8 reap latency** — acquire() is the only place that reaps; reap from the Client monitor thread on Down so idle workers wake immediately.
 
 ## Awaiting approval
@@ -80,4 +81,22 @@ Design: `bucketDemo/SPOT_DESIGN.md` (user decisions 2026-11-20/21). Skill: `.cla
 **Quality (normal mode, `SPOT=1 d2_g2 MGPU=2 sift10M auto`, 1 rep, logs kept):** recall@10 itopk 32/64/128 = 0.8314 / 0.9218 / 0.9688 (best 0.8315 / 0.9208 / 0.9703), knn recall@10 0.7235; 0 defects. The log shows step-4 reap + on-demand steal, step-6 preemptions mid-lease (`committed [6583,12126)`), rejected commits 5/18, steals of the tail by both workers.
 
 **Note.** Under the dense d2 traces spot bucket2 is much slower than plain (G=4 +84 %, G=1 +44 %): instance down time + the per-lease Step 6 setup (16 setups in one G=4 round) + tail ping-pong (steals of 3–29 positions). O6 (per-epoch setup) and O4 (minimum steal size) address that after P4.
+
+### SP3 — P3: prune on the SegmentScheduler (2026-11-21) — **done**
+
+**What.**
+- `prune_windowed_gpu::ChunkHooks {claim(p0, p1), done(p0, p1)}` + trailing `hooks` arg of `run_chunked`, in both planning modes (pool mode: `claim` before chunk c, `finish(last_started)` after a stop, `done` at the end of `finish(c)` = after the chunk's rows went to the sink, in chunk order; legacy mode: `claim` after the chunk's union is planned, `done` after its D2H + sink).
+- `prune_windowed.cpp` chunked branch: spot ON → always the scheduler path (G=1 too): initial cuts = the existing row-count cuts reserved per device's spot worker (dedicated: device 0 = on-demand), unit cost = rows per bucket + 1, `run_worker` with `proc(L)` = one `run_chunked([L.begin, end_of(L)))` per lease under a per-device mutex; `claim = may_start`, `done = commit(L, p1)`. Rows are pwritten at their offsets (`write_rows_at(..., count=false)`); a rejected chunk's bytes equal the redo's (each point only sees its own window), so they are written anyway and only **accepted** commits add their rows to `rows_written` (`StreamingGraphWriter::add_rows_written`) → the `rows_written == N` check stays exact.
+- Only the chunked prune path is spot-integrated; the batched (window data fits the host budget, e.g. SIFT10M at the default 16 GB) path stays on the on-demand device. Correctness runs therefore use `PRUNE_CACHE_MB=4000` (honoured by params.sh) to force the chunked path at SIFT10M; SIFT100M uses it anyway.
+
+**Correctness (deterministic, `PRUNE_CACHE_MB=4000 spot_det.sh sift10M G <trace>`)** — all 5 artifacts byte-identical:
+
+| G | trace | result | prune [spot] | prune plain → spot (s) |
+|---|---|---|---|---|
+| 2 | d2_g2 | **EQUAL** | segments 4, steals 2, drains 1, preempts 3, setups 5 | 4.70 → 11.58 |
+| 1 | d2_g1 | EQUAL but prune not hit (step 4/6: 16 preempts) | — | 4.86 → 5.11 |
+| 1 | d1_g1 (3rd try; d1, d2 tries also EQUAL with 0 prune preempts) | **EQUAL** | segments 5, steals 1, drains 2, reaped 2, preempts 5, rejected 877, setups 6 | — → 38.4 wall |
+| 4 | d2_g4 | **EQUAL** | segments 8, steals 3, drains 3, reaped 3, preempts 8, setups 10 | 7.95 → 16.72 |
+
+**Quality (normal mode, G=2, `PRUNE_CACHE_MB=4000`, 1 rep):** spot d2: recall@10 itopk 32/64/128 = 0.8078 / 0.9075 / 0.9618 (prune preempts 2); same-setting plain reference = 0.8101 / 0.9080 / 0.9615 → spot within normal-mode noise; 0 defects. Both are below the default-path best (0.8315 / 0.9208): that gap is the chunked prune path itself vs the batched one at SIFT10M (pre-existing on main, not spot-related; noted for the main loops).
 

@@ -24,6 +24,12 @@ void run(const int32_t* cand, const T* vec, int64_t N, int M, int D,
          // 依次递增、覆盖 [0, N)；回调返回后暂存区会被复用
          const std::function<void(const uint32_t* rows, int64_t row0, int64_t n)>& sink);
 struct ChunkStats { int64_t chunks = 0, loaded_rows = 0; };
+// spot (SPOT_DESIGN §4.3): claim(p0, p1) 在块 [p0, p1) 开始前 (false → 不再开新块，已开的块写完后返回)；
+// done(p0, p1) 在块的行全部交给 sink 之后 (按块顺序)。
+struct ChunkHooks {
+    std::function<bool(int p0, int p1)> claim;
+    std::function<void(int p0, int p1)> done;
+};
 // B13: optional reader for the centers' own candidate distances (vector_dists.bin rows, M floats per
 // row, same order as the candidate rows). When set, run_chunked ranks each center's candidates by
 // these distances (out-of-window candidates get their Step 6 distance instead of +inf).
@@ -40,5 +46,6 @@ void run_chunked(int64_t N, int M, int D, const uint32_t* offsets, int n_buckets
                  const std::function<void(const uint32_t* rows, int64_t row0, int64_t n)>& sink,
                  ChunkStats* stats = nullptr,
                  // 多 GPU: 只处理位置 [pos_lo, pos_hi) (行 [offsets[pos_lo], offsets[pos_hi]))；调用方已 cudaSetDevice
-                 int pos_lo = 0, int pos_hi = -1);
+                 int pos_lo = 0, int pos_hi = -1,
+                 const ChunkHooks* hooks = nullptr);
 }

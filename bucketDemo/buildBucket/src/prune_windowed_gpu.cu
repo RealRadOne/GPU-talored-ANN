@@ -567,7 +567,7 @@ void run_chunked(int64_t N, int M, int D, const uint32_t* h_offsets, int n_bucke
                  int out_deg, size_t budget_bytes,
                  const std::function<void(int64_t lo, int64_t n, int32_t* cand, T* vec)>& load_rows,
                  const std::function<void(const uint32_t*, int64_t, int64_t)>& sink,
-                 ChunkStats* stats, int pos_lo, int pos_hi)
+                 ChunkStats* stats, int pos_lo, int pos_hi, const ChunkHooks* hooks)
 {
     if (pos_hi < 0) pos_hi = n_buckets;
     if (pos_lo < 0 || pos_lo > pos_hi || pos_hi > n_buckets) throw std::runtime_error("prune_windowed_gpu: bad position range");
@@ -732,9 +732,13 @@ void run_chunked(int64_t N, int M, int D, const uint32_t* h_offsets, int n_bucke
                 const int64_t row0 = pend[b].row0;
                 stg_out.d2h_rows(d_outB[b], pend[b].n_rows, out_deg, [&](const uint32_t* r, int64_t r0, int64_t n) { sink(r, row0 + r0, n); });
                 t_d2h += omp_get_wtime() - t0;
+                if (hooks && hooks->done) hooks->done(plans[static_cast<size_t>(c)].p0, plans[static_cast<size_t>(c)].p1);
             };
+            int32_t last_started = -1;
             for (int32_t c = 0; c < static_cast<int32_t>(plans.size()); ++c) {
                 const Plan& pl = plans[static_cast<size_t>(c)];
+                if (hooks && hooks->claim && !hooks->claim(pl.p0, pl.p1)) break;   // spot: 停止开新块
+                last_started = c;
                 const int b = c & 1;
                 double t0 = omp_get_wtime();
                 for (int q : prevU) cbase[static_cast<size_t>(q)] = -1;
@@ -834,7 +838,7 @@ void run_chunked(int64_t N, int M, int D, const uint32_t* h_offsets, int n_bucke
                 if (stats) { stats->chunks++; stats->loaded_rows += hd; }
                 prevU = pl.U;
             }
-            if (!plans.empty()) finish(static_cast<int32_t>(plans.size()) - 1);
+            if (last_started >= 0) finish(last_started);
             std::cout << "  B12: GPU bucket pool " << pool_slots << " slots x " << kSlotRows << " rows\n";
             std::cout << "  [Chunked timing] plan=" << t_plan << "s load=" << t_load << "s center_dists=" << t_cdist
                       << "s gpu_wait=" << t_wait << "s d2h+sink=" << t_d2h << "s (pipelined)\n";
@@ -863,6 +867,7 @@ void run_chunked(int64_t N, int M, int D, const uint32_t* h_offsets, int n_bucke
                 rows += add;
                 ++p1;
             }
+            if (hooks && hooks->claim && !hooks->claim(p0, p1)) break;   // spot: 停止开新块
             // ---- 布局: 上一块已在显存里的桶排前面 (按旧行号，旧布局里连续的仍连续 → run 少)，
             //      其余桶按 id 排在后面 (相邻 id 合并成连续段并行读 + 一次 H2D)。kernel 只经 cbase 找行，
             //      布局顺序不影响结果。
@@ -938,6 +943,7 @@ void run_chunked(int64_t N, int M, int D, const uint32_t* h_offsets, int n_bucke
                                                       "(check --output-degree <= M_in and padding)");
             stg.d2h_rows(d_out, n_rows, out_deg, [&](const uint32_t* r, int64_t r0, int64_t n) { sink(r, row0 + r0, n); });
             if (stats) { stats->chunks++; stats->loaded_rows += fresh_rows; }
+            if (hooks && hooks->done) hooks->done(p0, p1);
             p0 = p1;
         }
         report_unverified(N, out_deg);
@@ -957,7 +963,7 @@ void run_chunked(int64_t N, int M, int D, const uint32_t* h_offsets, int n_bucke
     template void run_chunked<T>(int64_t, int, int, const uint32_t*, int, const std::vector<int32_t>&,  \
                                  const std::vector<int32_t>&, int, int, size_t,                          \
                                  const std::function<void(int64_t, int64_t, int32_t*, T*)>&,             \
-                                 const std::function<void(const uint32_t*, int64_t, int64_t)>&, ChunkStats*, int, int);
+                                 const std::function<void(const uint32_t*, int64_t, int64_t)>&, ChunkStats*, int, int, const ChunkHooks*);
 PWG_INSTANTIATE(uint8_t)
 PWG_INSTANTIATE(int8_t)
 PWG_INSTANTIATE(float)
