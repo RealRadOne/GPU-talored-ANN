@@ -52,10 +52,18 @@ Item names below are backlog labels, not iteration numbers (iterations are logge
   serial prefix over N; reduce on GPU (peer add into GPU 0, or per-GPU dst-range counts) + parallel prefix.
 - **S14 — analysed (S12 entry): shared host link, not fixable at G = 2.** ~~GPU 0 H2D 2× slower than GPU 1 in optimize count / fill~~ (same bytes; NUMA placement of `h_fwd_all` pages read by
   `parallel_pread_file`, or PCIe topology). Check `numactl`/`move_pages` of the first half; interleave or bind the pread threads.
-- **S21 (backlog, user 2026-11-20) — bring the in-memory fast paths under one host budget:** arrival records in RAM (S1,
-  `--arrival-mem-mb`), Step 4.5 `r1_blob` retention into round 2 (S18/S19), bucket cache, optimize fin etc. counted against a single
-  user-given budget (HOST_BUDGET_MB → --host-budget-mb / --bucket-mem-mb / --arrival-mem-mb / --cache-mb), disk fallback otherwise.
-  Later (after items 2–4 and A).
+- **S21 (next, user 2026-11-20) — bring the in-memory fast paths under one host budget.** Inventory (2026-11-21): bucket2 already gates
+  each fast path on its own cap (dataset_env.py: CACHE_MB, BUCKET_MEM_MB, ARRIVAL_MEM_MB each ≤ HOST_BUDGET_MB / 4 = 50 GB at the 200 GB
+  default; `host_raw_budget` = bucket_mem_mb gates ooc `raw_host` (N·D·2) and Step 4.5 `keep_blob` / `r1_blob`), but the caps are
+  independent and r1_blob + BucketVectorAccumulator memory mode + kept round-1 arrivals + round-2 arrivals + Step 6 host cache can be
+  alive together. **Plan:** (1) bucket2 `--host-budget-mb` (run_pipeline passes HOST_BUDGET_MB; 0 = legacy per-cap behaviour);
+  (2) one process-wide accountant `g_host_budget` {atomic used, cap, peak; try_reserve(bytes, what) / release(bytes)}; (3) consumers
+  reserve before taking the fast path, else the existing fallback: arrival block admission (`ChunkedKnnAccumulator` flush, CAS at
+  ~line 6175; release where `arrival_mem_bytes` is decremented), BucketVectorAccumulator `start_iteration` memory mode (`pos ≤
+  mem_budget`; release on file mode / destruction), `r1_blob` (shared_ptr deleter releases), ooc `raw_host`, Step 6 host bucket cache
+  (cache_mb) — per-component caps stay as upper bounds; (4) log reserve / deny decisions + peak at the end. Gate: no slowdown at
+  200 GB (peak RSS 92–95 GB, nothing denied), one search-evaluated SIFT10M / SIFT100M build with a small budget that forces the
+  fallbacks, guard memory vs guard_mem_ref. Optional later: combine the S23 patch (Step 4 h2d + init overlap + persistent pinned staging).
 - **S12 — checked 2026-11-19:** prune already caps per-GPU load threads (8); Step 6 scatter uses explicit threads; Step 4
   read is prefetched (float path). No oversubscription found besides optimize staging (S10). Was: per-GPU OpenMP oversubscription elsewhere: prune_windowed per-GPU load / sink and bucket2 per-GPU host loops
   run `omp parallel` from G threads at once (as optimize staging did before S10); cap team sizes per GPU thread.
