@@ -22,6 +22,7 @@
 #include <map>
 #include <fcntl.h>
 #include <unistd.h>
+#include <sys/mman.h>
 #include <exception>
 #include <condition_variable>
 #include <mutex>
@@ -6340,10 +6341,11 @@ struct ChunkedKnnAccumulator {
         // running 文件里是第 base_iter 轮 merge 后的状态 (没有 = 全 sentinel)
         const int base_iter = (kept_iter >= 0) ? kept_iter - 1 : iter - 1;
         int fd_knn = -1, fd_dist = -1;
+        char* map_knn = nullptr; char* map_dist = nullptr; size_t map_bytes = 0;   // S26
         const off_t hdr = static_cast<off_t>(sizeof(int64_t) + sizeof(int32_t));
         if (is_final) {
             auto open_out = [&](const std::string& path) {
-                int fd = ::open(path.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0644);
+                int fd = ::open(path.c_str(), O_CREAT | O_RDWR | O_TRUNC, 0644);   // S26: O_RDWR (MAP_SHARED 写要可读)
                 if (fd < 0) throw std::runtime_error("ChunkedKnnAccumulator: cannot open " + path);
                 char h[sizeof(int64_t) + sizeof(int32_t)];
                 int32_t M32 = static_cast<int32_t>(M);
@@ -6358,7 +6360,33 @@ struct ChunkedKnnAccumulator {
             };
             fd_knn = open_out(final_knn_path);
             if (!final_dist_path.empty()) fd_dist = open_out(final_dist_path);   // 空 = 不写 vector_dists
+            // S26 (scale loop): 最终 vector_knn (SIFT100M 25.6 GB) 原来是各 chunk 线程 pwrite 到同一个文件：经 page cache 的
+            // buffered 写对单个文件不随线程数扩展 (per-inode 锁，S20 实测 `/` 1.0–1.2 GB/s) → Wait ≈ 25.6 GB / ~1.05 GB/s ≈ 24 s。
+            // 现在 MAP_SHARED 映射输出文件，chunk 结果直接 memcpy 进映射 (= 写文件，同样不 fsync、由内核回写)，写完的
+            // 整页马上 madvise(MADV_DONTNEED)：共享文件映射只撤掉页表项，脏数据留在 page cache，RSS 不随文件变大。
+            // 只是写法不同，文件字节相同；虚拟地址空间 = 文件大小 (1B: 256 GB 虚拟，不占内存)。BUCKET2_FINAL_MMAP=0 = 原来的 pwrite。
+            // 参考 S20 optimize final_graph.bin 的 mmap 写。
+            const char* fm = std::getenv("BUCKET2_FINAL_MMAP");
+            if (!(fm && fm[0] == '0')) {
+                const size_t fbytes = static_cast<size_t>(hdr) + static_cast<size_t>(N) * M * 4;
+                auto map_out = [&](int fd) -> char* {
+                    void* m = ::mmap(nullptr, fbytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+                    return (m == MAP_FAILED) ? nullptr : static_cast<char*>(m);
+                };
+                map_knn = map_out(fd_knn);
+                if (map_knn && fd_dist >= 0) {
+                    map_dist = map_out(fd_dist);
+                    if (!map_dist) { ::munmap(map_knn, fbytes); map_knn = nullptr; }
+                }
+                map_bytes = map_knn ? fbytes : 0;   // 映射失败 → 回到 pwrite
+            }
         }
+        auto write_mapped = [](char* base, const void* src, size_t n, size_t off) {
+            std::memcpy(base + off, src, n);
+            const size_t pg = static_cast<size_t>(::sysconf(_SC_PAGESIZE));
+            const size_t lo = (off + pg - 1) / pg * pg, hi = (off + n) / pg * pg;   // 只放掉完全在本段内的页
+            if (hi > lo) ::madvise(base + lo, hi - lo, MADV_DONTNEED);
+        };
         auto pwrite_all = [](int fd, const void* buf, size_t n, off_t off) {
             const char* p = static_cast<const char*>(buf);
             while (n > 0) {
@@ -6499,7 +6527,11 @@ struct ChunkedKnnAccumulator {
                 if (is_final) {
                     // chunk c 在最终文件里是第 [chunk_start, chunk_start+chunk_c_size) 行
                     const off_t ofs = hdr + static_cast<off_t>(chunk_start) * M * 4;
-                    if (!pwrite_all(fd_knn, run_nbrs.data(), run_nbrs.size() * sizeof(int32_t), ofs) ||
+                    if (map_knn) {
+                        write_mapped(map_knn, run_nbrs.data(), run_nbrs.size() * sizeof(int32_t), static_cast<size_t>(ofs));
+                        if (map_dist)
+                            write_mapped(map_dist, run_dists.data(), run_dists.size() * sizeof(float), static_cast<size_t>(ofs));
+                    } else if (!pwrite_all(fd_knn, run_nbrs.data(), run_nbrs.size() * sizeof(int32_t), ofs) ||
                         (fd_dist >= 0 && !pwrite_all(fd_dist, run_dists.data(), run_dists.size() * sizeof(float), ofs)))
                         throw std::runtime_error("ChunkedKnnAccumulator: final pwrite failed for chunk " + std::to_string(c));
                     if (base_iter >= 0) { std::filesystem::remove(np); std::filesystem::remove(dp); }
@@ -6529,6 +6561,8 @@ struct ChunkedKnnAccumulator {
             kth_valid = true;
         }
         if (is_final) {
+            if (map_knn) { ::munmap(map_knn, map_bytes); map_knn = nullptr; }
+            if (map_dist) { ::munmap(map_dist, map_bytes); map_dist = nullptr; }
             if (::close(fd_knn) != 0 || (fd_dist >= 0 && ::close(fd_dist) != 0))
                 throw std::runtime_error("ChunkedKnnAccumulator: close failed for final outputs");
             final_written = true;

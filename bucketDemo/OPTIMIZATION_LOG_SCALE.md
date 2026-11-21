@@ -20,7 +20,9 @@ Wait 26.4), prune 46.3, optimize 30.0; recall@10 0.7267 / 0.8340 / 0.9109 (same-
 Previous: **304.42 s** (S4 re-judged 2026-11-19, "accepted (compute gain, disk-bound)"; reps 304.4 / 299.4 / 365.0, GPUs 0,1;
 `runs/scale4/sift100M_auto_g2`) — Step 6 85.2, Wait 33.5, optimize 35.0; recall@10 0.7272 / 0.8334 / 0.9120. Previous best
 307.50 (S1). S9 (optimize src-split) accepted under the compute-gain rule without a new best (311.50 s, slow-disk period). Compute metrics for the fast-disk re-check are in the S3 / S4 re-judge entry below.
-**G = 4: 213.84 s** (S20, 2026-11-20, GPUs 0–3, `runs/scale20/sift100M_auto_g4`) — bucket2 145.1, prune 49.9, optimize 16.3;
+**G = 4: 205.25 s** (S26, 2026-11-21, GPUs 0–3, `runs/scale26/sift100M_auto_g4`) — bucket2 141.9 (Wait 21.2), prune 47.4, optimize 16.1;
+recall@10 0.7260 / 0.8335 / 0.9112; peak RSS 95.4 GB. Speedup vs 1 GPU 2.09×.
+Previous **G = 4: 213.84 s** (S20, 2026-11-20, GPUs 0–3, `runs/scale20/sift100M_auto_g4`) — bucket2 145.1, prune 49.9, optimize 16.3;
 recall@10 0.7258 / 0.8333 / 0.9095; peak RSS 95.1 GB. Speedup vs 1 GPU 2.01×.
 Previous **G = 4: 222.82 s** (S19, 2026-11-20, GPUs 0–3, `runs/scale19g4/sift100M_auto_g4`) — bucket2 145.1 (Step 4 34.0, Step 4.5 6.3,
 Step 6 51.7, Wait 26.3), prune 49.0, optimize 27.2; recall@10 0.7251 / 0.8332 / 0.9100. Speedup vs 1 GPU 1.93×.
@@ -539,3 +541,31 @@ prune 3.84 / optimize 2.04 GB; sift1M_large 1.95 / 0.60 / 0.50 GB), applied by j
 only; optimize-bucket2's best.json untouched). Later changes may not exceed 1.2×. **S20 guard re-judged: ACCEPT** (also ACCEPT
 against the pre-S20 level from runs/scale19: sift10M optimize 2.04 ≤ 1.2 × 1.60 + 0.2). **S20 accepted**; best_scale.json updated:
 G = 2 251.87 s, G = 4 213.84 s. "Arrival records etc. under one host budget" → backlog S21.
+
+### S26 — final merge writes vector_knn through a MAP_SHARED mapping — ACCEPT (2026-11-21)
+
+**Why.** S25 diagnostics: the final merge (Wait 24.5–26 s at G = 2 and 4) spends most of its time in `write_running`
+(sum 1154 s over 80 threads), i.e. the chunk threads `pwrite` the final `vector_knn` (25.6 GB) into one file through the page
+cache. S20 measured that buffered writes to one file do not scale with threads (per-inode lock, `/` ~1.0–1.2 GB/s) →
+25.6 GB / ~1.05 GB/s ≈ 24 s ≈ Wait. **Change** (`ChunkedKnnAccumulator::merge_iteration`, final round only): output file opened
+O_RDWR and mapped `MAP_SHARED`; each chunk's rows are `memcpy`'d into the mapping (= the file write, same buffered, no-fsync
+semantics), and the fully covered pages are released right away with `madvise(MADV_DONTNEED)` (shared file mapping: only the
+PTEs go, dirty data stays in the page cache) → RSS does not grow with the file; virtual size = file size (1B: 256 GB virtual,
+no memory). Same file bytes. `BUCKET2_FINAL_MMAP=0` (or a failed mmap) = old pwrite. Pattern from S20 (optimize final_graph mmap).
+Implementation only (no memory fast path, no host-budget change).
+
+| SIFT100M | total (median ×3) | vs best | bucket2 | Wait (reps) | prune | optimize | same-period ref (`BUCKET2_FINAL_MMAP=0`, ×1) |
+|---|---|---|---|---|---|---|---|
+| G = 4 | **205.25** | **−4.0 %** (213.84) | 141.85 | 20.7 / 21.2 / 22.6 | 47.4 | 16.1 | 209.08 (bucket2 142.84, Wait 25.5) |
+| G = 2 | 253.52 | +0.7 % (251.87) | 192.18 (best 196.09) | 20.6 / 20.2 / 20.5 | 44.8 | 17.0 | 269.09 (bucket2 197.13, Wait 26.4, prune 51.8, slow-disk period) |
+
+Wait −4.3 s (G = 4) / −6 s (G = 2) vs the refs; on /dev/shm (M1) Wait was 19.5–21 s, so the final merge is now essentially at
+its CPU floor (decode of round-1 kept + round-2 arrivals, 154 GB moved). Recall@10 L 32 / 64 / 128: G = 2 0.7280 / 0.8342 /
+0.9111, G = 4 0.7260 / 0.8335 / 0.9112 (QPS within gates). Peak RSS G = 2 92.4, G = 4 95.4 GB (unchanged). Single-GPU guard
+ACCEPT (sift10M Wait 3.3–3.6 s, unchanged at that size; memory vs guard_mem_ref). **ACCEPT** on G = 4; best_scale.json: G = 4
+→ 205.25 s; G = 2 best stays 251.87 s (judge `--update` had written the slower 253.52 — restored by hand; no ratchet).
+
+| speedup vs 1 GPU (429.56 s) | Step 4 | Step 6 | Wait | prune | optimize | total |
+|---|---|---|---|---|---|---|
+| G = 2 (S26) | 1.87× | 1.92× | 1.65× | 1.24× | 2.32× | 1.69× |
+| G = 4 (S26) | 3.02× | 3.06× | 1.59× | 1.18× | 2.45× | 2.09× |
