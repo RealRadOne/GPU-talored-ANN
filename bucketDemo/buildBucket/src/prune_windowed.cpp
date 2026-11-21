@@ -604,7 +604,9 @@ int main(int argc, char** argv)
                     std::vector<double> ucost(static_cast<size_t>(n_buckets));
                     for (int32_t p = 0; p < n_buckets; ++p)
                         ucost[static_cast<size_t>(p)] = static_cast<double>(offsets_new[static_cast<size_t>(p) + 1] - offsets_new[static_cast<size_t>(p)]) + 1.0;
-                    spot::SegmentScheduler S("prune", n_buckets, ws, cuts, owners, spot::options_from_env(shared), ucost);
+                    auto sopt = spot::options_from_env(shared);
+                    if (!std::getenv("BUCKET2_SPOT_MIN_STEAL_S")) sopt.min_steal_s = 4.0;   // 每个租约 ~2–3 s 固定开销 (规划 + 桶池冷启动)
+                    spot::SegmentScheduler S("prune", n_buckets, ws, cuts, owners, sopt, ucost);
                     std::vector<prune_windowed_gpu::ChunkStats> st(ws.size());
                     std::vector<std::exception_ptr> exc(ws.size());
                     std::vector<std::mutex> dev_m(static_cast<size_t>(G));
@@ -621,7 +623,7 @@ int main(int argc, char** argv)
                                     const int64_t e = S.end_of(L);
                                     if (L.begin < 0 || e > n_buckets || L.begin >= e) return;   // bounds check
                                     prune_windowed_gpu::ChunkHooks hk;
-                                    hk.claim = [&](int p0, int p1) { return S.may_start(L, p0, p1); };
+                                    hk.claim = [&](int p0, int p1) { return static_cast<int>(S.may_start_clip(L, p0, p1)); };
                                     hk.done = [&](int p0, int p1) {
                                         if (p0 < 0 || p1 > n_buckets || p0 >= p1) throw std::runtime_error("spot prune: bad chunk");
                                         if (S.commit(L, p1))
@@ -633,7 +635,7 @@ int main(int argc, char** argv)
                                         [&](int64_t lo, int64_t n, int32_t* c, T* v) { load_rows(lo, n, c, v); },
                                         [&](const uint32_t* rows, int64_t row0, int64_t n) {
                                             auto tw0 = Clock::now();
-                                            writer.write_rows_at(rows, row0, n, false);
+                                            writer.write_rows_at(rows, row0, n, false, true);
                                             std::lock_guard<std::mutex> lk(sink_mtx);
                                             t_sink += std::chrono::duration<double>(Clock::now() - tw0).count();
                                         },

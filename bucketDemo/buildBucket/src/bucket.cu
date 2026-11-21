@@ -2543,7 +2543,9 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
                     if (ws[w].device == g && (o < 0 || (ws[static_cast<size_t>(o)].ondemand && !ws[w].ondemand))) o = static_cast<int>(w);
                 owners.push_back(o);
             }
-            spot::SegmentScheduler S("step4", N_nc, ws, cuts, owners, spot::options_from_env(shared));
+            auto sopt4 = spot::options_from_env(shared);
+            if (!std::getenv("BUCKET2_SPOT_MIN_STEAL_S")) sopt4.min_steal_s = 0.5;   // 同一实例代内租约很便宜 (索引已建好)
+            spot::SegmentScheduler S("step4", N_nc, ws, cuts, owners, sopt4);
             s4st.assign(ws.size(), S4Stat{});
             std::vector<std::mutex> dev_m(static_cast<size_t>(G4));
             exc.assign(ws.size(), nullptr);
@@ -10392,7 +10394,9 @@ int run_pipeline_impl(
                             if (ws6[w].device == g && (o < 0 || (ws6[static_cast<size_t>(o)].ondemand && !ws6[w].ondemand))) o = static_cast<int>(w);
                         owners6.push_back(o);
                     }
-                    spot::SegmentScheduler S6("step6", npos, ws6, cuts6, owners6, spot::options_from_env(shared6), wcost);
+                    auto sopt6 = spot::options_from_env(shared6);
+                    if (!std::getenv("BUCKET2_SPOT_MIN_STEAL_S")) sopt6.min_steal_s = 4.0;   // 每个租约重建 future_access / 缓存
+                    spot::SegmentScheduler S6("step6", npos, ws6, cuts6, owners6, sopt6, wcost);
                     std::vector<std::mutex> dev_m(static_cast<size_t>(G6));
                     exc.assign(ws6.size(), nullptr);
                     for (size_t w = 0; w < ws6.size(); ++w) {

@@ -243,6 +243,8 @@ struct Options {
     double rescue_after_s = 2.0;    // 所有 spot worker 都不可用多久之后 on-demand 救场
     int64_t min_split_units = 1;    // 偷 / 切分后每一半至少这么多单元
     bool   allow_steal = true;      // spot 关闭时 options_from_env 设成 false → 跟原来的静态切分完全一样
+    double min_steal_s = 0.0;       // 只偷预计剩余时间 (从 issued 起，按 victim 本租约的每单元 EWMA) ≥ 这么多秒的段
+                                    // (每个租约有固定开销的阶段: 小段来回偷比不偷还慢)。victim 还没有提交 (EWMA 未知) → 按代价照偷
     bool   verbose = true;
 };
 
@@ -365,6 +367,29 @@ public:
         }
         s.issued = std::max(s.issued, u1);
         return true;
+    }
+
+    // 同 may_start，但 u1 越过 (被偷后变小的) 段 end 时截到 end: 返回实际声明的 u1' (u0 < u1' ≤ u1)，不能开始 → -1。
+    // 单元大小可变的阶段 (prune 的块) 用: 块跨过新 end 时截断，而不是停掉整个租约。
+    int64_t may_start_clip(const Lease& L, int64_t u0, int64_t u1) {
+        int64_t e;
+        {
+            const Seg& s = seg(static_cast<size_t>(L.seg));
+            std::lock_guard<std::mutex> lk(s.m);
+            e = s.end;
+        }
+        const int64_t u1c = std::min(u1, e);
+        if (u1c <= u0) return -1;
+        // end 只会变小 (偷的切点 ≥ issued，而 issued 在 may_start 里推进)；在两次加锁之间又被切小 → may_start 失败，重试一次
+        if (may_start(L, u0, u1c)) return u1c;
+        {
+            const Seg& s = seg(static_cast<size_t>(L.seg));
+            std::lock_guard<std::mutex> lk(s.m);
+            e = s.end;
+        }
+        const int64_t u1d = std::min(u1, e);
+        if (u1d <= u0 || u1d == u1c) return -1;
+        return may_start(L, u0, u1d) ? u1d : -1;
     }
 
     // 提交 [cursor, new_cursor)。合法 (还是 owner、实例没过抢占时刻、单调) 时在段的提交锁内执行 fn
@@ -692,6 +717,8 @@ private:
             if (s.owner < 0 || s.owner == w) continue;
             const int64_t from = std::max(s.issued, s.cursor);
             if (s.end - from < 2 * opt_.min_split_units) continue;
+            if (opt_.min_steal_s > 0 && s.ewma_unit_s > 0 &&
+                s.ewma_unit_s * static_cast<double>(s.end - from) < opt_.min_steal_s) continue;   // 剩下的太少，不值得偷
             const double c = cost(from, s.end);
             if (c > vic_cost) { vic_cost = c; vic = &s; }
         }
@@ -801,6 +828,7 @@ inline Options options_from_env(bool shared_mode) {
     if (const char* e = std::getenv("BUCKET2_SPOT_OD_SHARE")) o.ondemand_share = std::atof(e);
     if (const char* e = std::getenv("BUCKET2_SPOT_RESCUE_S")) o.rescue_after_s = std::atof(e);
     if (const char* e = std::getenv("BUCKET2_SPOT_QUIET")) o.verbose = e[0] != '1';
+    if (const char* e = std::getenv("BUCKET2_SPOT_MIN_STEAL_S")) o.min_steal_s = std::atof(e);
     return o;
 }
 

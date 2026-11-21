@@ -15,17 +15,19 @@ Design: `bucketDemo/SPOT_DESIGN.md` (user decisions 2026-11-20/21). Skill: `.cla
 
 ## Current best
 
-SP4 baseline (2026-11-21, `runs/spot4`, SIFT100M auto, median of 3; preempts = sum over the 3 stages and both rounds, median rep):
+After SP5 (2026-11-21, `runs/spot5`, SIFT100M auto, median of 3; best of SP4 / SP5 per key, never ratcheted up):
 
-| config | total (s) | bucket2 | Step 4 | Step 6 | prune | optimize | preempts S4/S6/prune | notes |
+| config | total (s) | bucket2 | Step 4 | Step 6 | prune | optimize | from | notes |
 |---|---|---|---|---|---|---|---|---|
-| sift100M_auto_g2_spott1 | 280.84 | 209.3 | 53.8 | 102.1 | 48.6 | 22.9 | 0 / 2 / 1 | |
-| sift100M_auto_g4_spott1 | 274.00 | 175.2 | 63.9 | 58.8 | 75.4 | 23.2 | 6 / 4 / 5 | reps 274.6 / 258.1 / 274.0 |
-| sift100M_auto_g1_spott1 | 386.77 | 316.3 | 100.9 | 162.3 | 48.6 | 22.7 | 2 / 2 / 0 | shared mode |
+| sift100M_auto_g2_spott1 | 279.85 | 209.7 | 53.7 | 103.1 | 47.4 | 22.8 | SP5 | |
+| sift100M_auto_g4_spott1 | 256.30 | 177.0 | 63.7 | 60.1 | 57.3 | 22.6 | SP5 | reps 256.3 / 269.6 / 256.3 |
+| sift100M_auto_g1_spott1 | 386.77 | 316.3 | 100.9 | 162.3 | 48.6 | 22.7 | SP4 | SP5 398.1 (−2.9 %, kept SP4) |
+| no-event: g1 / g2 / g4 `_spotnone` | 371.9 / 258.1 / 215.4 | | | | | | SP5 | bucket2 + prune vs plain: +0.7 / +0.4 / +1.5 % |
+| plain: g1 / g2 / g4 | 370.0 / 252.2 / 205.6 | | | | | | SP4 | spot OFF reference |
 
 ## Ideas backlog (O iterations, after P4)
 
-- **O12 no-event overhead (FIRST)** — SP4: `_spotnone` vs plain (bucket2 + prune) G=1 +1.1 %, G=2 +3.1 %, **G=4 +19.8 %** (prune 47.7 → 75.1 s, Step 6 52.6 → 61.5 s; G=4 none reps 218.9 / 250.2 / 252.7 bimodal). The overhead gate requires ≤ +3 %. G=2 prune log: the on-demand worker finishes its half at 31 s, steals 22k buckets from the spot worker's tail, the stolen lease cold-starts (plan 2.65 s, empty pool, 4.50 vs 4.26 × N rows loaded) and ends at 47.9 s, later than the victim would have. Combines O4 / O10 / O11: steal only when the remaining cost of the victim ≫ the thief's per-lease setup, steal from the victim's tail by *time* (EWMA rate) not by unit cost, prune: truncate a plan at `end_of(L)` instead of stopping. Even G=1 (no steals) has prune 42.0 → 47.0 s: check the spot path's `write_rows_at` (pwrite, not counted) vs the sequential writer, and the per-lease setup.
+- ~~**O12 no-event overhead**~~ → done in SP5 (accepted). Original note: — SP4: `_spotnone` vs plain (bucket2 + prune) G=1 +1.1 %, G=2 +3.1 %, **G=4 +19.8 %** (prune 47.7 → 75.1 s, Step 6 52.6 → 61.5 s; G=4 none reps 218.9 / 250.2 / 252.7 bimodal). The overhead gate requires ≤ +3 %. G=2 prune log: the on-demand worker finishes its half at 31 s, steals 22k buckets from the spot worker's tail, the stolen lease cold-starts (plan 2.65 s, empty pool, 4.50 vs 4.26 × N rows loaded) and ends at 47.9 s, later than the victim would have. Combines O4 / O10 / O11: steal only when the remaining cost of the victim ≫ the thief's per-lease setup, steal from the victim's tail by *time* (EWMA rate) not by unit cost, prune: truncate a plan at `end_of(L)` instead of stopping. Even G=1 (no steals) has prune 42.0 → 47.0 s: check the spot path's `write_rows_at` (pwrite, not counted) vs the sequential writer, and the per-lease setup.
 
 - **O1 Step 4 commit granularity** — in spot mode commit sub-batches (smaller Nv for the search loop, or split one search batch into k commits) so a preemption loses ≤ ~1 s instead of a whole ~8 s batch (SIFT100M).
 - **O2 hand off at notice** — at NOTICE, give `[issued, end)` back to the pool immediately (not at Down) so another worker starts while the noticed worker drains its in-flight units.
@@ -129,4 +131,33 @@ SP4 baseline (2026-11-21, `runs/spot4`, SIFT100M auto, median of 3; preempts = s
 - G=1: step4 0/2/1/2/6, 1/1/1/2/6, 0/2/1/2/6; step6 0/1/1/2/4, 0/3/3/3/5, 1/1/0/2/4; prune never preempted under t1 (sparse trace, ~4 trace hours per build).
 
 **Slowdown under t1 vs spot none:** G=2 +6.3 % total (Step 6 +16 s: 2 preemptions / round of the spot device), G=4 +9.5 % (Step 4 +30 s: the 8 s search batches lost at each preemption + reaps → O1), G=1 +3.3 %.
+
+### SP5 — O12: no-event overhead (2026-11-21) — **ACCEPTED** (G=4 t1 −6.5 %, no-event overhead gate now passes at G=1/2/4)
+
+**Diagnosis (SP4 logs).** (a) G=4 prune `_spotnone` rep1: 15 steals between 44.6 and 73.7 s over [176794, 177097) — a thief cuts the victim's range, the victim's next *planned* chunk crosses the new end, `may_start(p0, p1)` fails, the whole lease ends, the rest is re-acquired and re-planned (~2–3 s per prune lease: planning + bucket pool cold start) → a slowly converging ping-pong. Step 6 has the same tail pattern (per-lease setup). (b) G=1 prune (no steals at all) 42.0 → 47.0 s: write 13.3 → 19.4 s, load 14.7 → 20.5 s — the spot path wrote with `write_rows_at` (one single-threaded pwrite per sink call) while plain G=1 uses `write_rows` (64 MB pieces, OpenMP-parallel pwrite).
+
+**What (implementation only).**
+1. `StreamingGraphWriter::write_rows_at(..., count, parallel)`: `parallel=true` = the same 64 MB-piece parallel pwrite as `write_rows`; used by the spot prune sink only (default false → the plain multi-GPU path is unchanged).
+2. `SegmentScheduler::may_start_clip(L, u0, u1)`: claims `[u0, min(u1, end))`; `ChunkHooks::claim` now returns the (possibly truncated) chunk end; `run_chunked` truncates the chunk (both planning modes; the planned union is a superset, only rows `[offsets[p0], offsets[p1']))` are computed) instead of ending the lease.
+3. `Options::min_steal_s` (env `BUCKET2_SPOT_MIN_STEAL_S`): a segment is only stolen when the victim's estimated remaining time (units from `issued` × its per-unit EWMA of this lease) ≥ `min_steal_s` (unknown EWMA → steal by cost as before). Defaults set by the stages: Step 6 / prune 4 s (per-lease setup), Step 4 0.5 s (leases inside one epoch are cheap).
+4. Unit test: +2 cases (`clip_dedicated_g4`, `clip_epochs_shared_g1`: prune-style over-long chunks through `may_start_clip`, tiny `min_steal_s`) — ALL PASS, TSan clean.
+
+**Correctness** (`PRUNE_CACHE_MB=4000 spot_det.sh sift10M G d2_gG`): G=2 **EQUAL** (prune: preempts 3, rejected 2234 — the clip path under stealing + preemption), G=1 **EQUAL** (step 4 / 6: 18 preemptions), G=4 **EQUAL**.
+
+**SIFT100M (median of 3; plain from SP4, spot-OFF path unchanged):**
+
+| G | config | total (s) (reps) | vs SP4 | bucket2 | Step 4 | Step 6 | prune | bucket2 + prune vs plain | recall@10 itopk 32/64/128 |
+|---|---|---|---|---|---|---|---|---|---|
+| 2 | spot none | 258.09 (261.6 / 258.1 / 253.4) | 264.24 → −2.3 % | 190.7 | 53.7 | 82.7 | 44.7 (49.1) | **+0.4 %** (was +3.1 %) | 0.7249 / 0.8330 / 0.9117 |
+| 2 | spot t1 | 279.85 (280.7 / 279.9 / 278.4) | 280.84 → +0.4 % | 209.7 | 53.7 | 103.1 | 47.4 (48.6) | +9.5 % | 0.7265 / 0.8334 / 0.9116 |
+| 4 | spot none | 215.42 (220.7 / 215.4 / 215.1) | 250.15 → **−13.9 %** | 140.7 | 34.1 | 52.1 (61.5) | 51.5 (75.1) | **+1.5 %** (was +19.8 %) | 0.7250 / 0.8320 / 0.9108 |
+| 4 | spot t1 | 256.30 (256.3 / 269.6 / 256.3) | 274.00 → **−6.5 %** | 177.0 | 63.7 | 60.1 | 57.3 (75.4) | +23.8 % | 0.7250 / 0.8335 / 0.9114 |
+| 1 | spot none | 371.90 (371.9 / 369.3 / 376.3) | 374.43 → −0.7 % | 305.3 | 93.4 | 158.2 | 44.5 (47.0; write 19.4 → 18.1 s) | **+0.7 %** | 0.7250 / 0.8326 / 0.9103 |
+| 1 | spot t1 | 398.12 (398.1 / 384.5 / 401.3) | 386.77 → −2.9 % | 326.0 | 111.1 (100.9) | 162.5 | 49.7 | +8.1 % | 0.7240 / 0.8329 / 0.9105 |
+
+judge (`JUDGE_BENCH` = the three `_spott1` keys): **ACCEPT** (G=4 +6.5 %, G=2 +0.4 %, G=1 −2.9 % within ±3 %; quality / defects pass). G=1 t1 is noisy (reps 384–401 s; Step 4 +10 s where a preemption lands in the 8 s search batches — O1); its best stays at the SP4 value (restored, never ratcheted). `_spotnone` entries updated (all faster).
+
+**`[spot]` under t1, G=4** (steals / drains / reaped / preempts / setups): prune 2/3/0/4/7, 14/2/0/4/7, 2/4/0/5/8 (SP4: 13/3/0/5/7, 3/3/0/4/7, 10/4/0/5/7); step6 3/3/1/4/9, 3/3/0/4/9, 2/3/1/4/9; step4 23/1/1/6/13, 23/2/0/6/13, 24/2/0/6/13 (the Step-4 steals are 0.5 s-threshold steals inside one epoch — cheap).
+
+**Remaining no-event gap.** G=4 prune 51.5 vs plain 47.7 s: the on-demand worker still steals 16k buckets at 26.9 s and a spot worker 14k at 37.2 s (2 extra cold leases). The next big item under t1 is Step 4 (G=4 63.7 vs 34.1 s none: lost 8 s batches + re-setup after joins) → O1 / O3.
 

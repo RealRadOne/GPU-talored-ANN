@@ -9,6 +9,7 @@
 using namespace spot;
 
 static int g_fail = 0;
+static bool g_clip = false;
 #define CHECK(c, msg) do { if (!(c)) { std::cerr << "FAIL: " << msg << " (" #c ")\n"; ++g_fail; } } while (0)
 
 // 一个 worker 的处理函数: 每次声明 [u, u+b) (b 随机 1..maxb)，"计算" 后提交。pipelined=true 时
@@ -32,8 +33,13 @@ static void proc_units(SegmentScheduler& S, const Lease& L, Sim& sim, int maxb, 
     for (;;) {
         const int64_t e = S.end_of(L);
         if (u >= e) break;
-        const int64_t b = std::min<int64_t>(e, u + 1 + static_cast<int64_t>(rng() % static_cast<unsigned>(maxb)));
-        if (!S.may_start(L, u, b)) break;
+        int64_t b = std::min<int64_t>(e, u + 1 + static_cast<int64_t>(rng() % static_cast<unsigned>(maxb)));
+        if (g_clip) {   // prune 风格: 先按旧 end 规划一个可能越界的块，may_start_clip 截断
+            b = u + 1 + static_cast<int64_t>(rng() % static_cast<unsigned>(maxb));
+            b = S.may_start_clip(L, u, b);
+            if (b <= u) break;
+            if (b > S.end_of(L)) { std::cerr << "FAIL: clip beyond end\n"; ++g_fail; }
+        } else if (!S.may_start(L, u, b)) break;
         inflight.emplace_back(u, b);
         u = b;
         if (static_cast<int>(inflight.size()) >= depth) commit_front();
@@ -158,6 +164,13 @@ int main() {
     // 8-10) run_worker_epochs (Step 4 风格)
     run_case("epochs_dedicated_g4", 4, true, nullptr, 40000, true, 12, false, true);
     run_case("epochs_shared_g1", 1, true, nullptr, 20000, true, 8, false, true);
+    // 11) may_start_clip (prune 风格) + 最小偷段时间
+    g_clip = true;
+    setenv("BUCKET2_SPOT_MIN_STEAL_S", "0.002", 1);
+    run_case("clip_dedicated_g4", 4, true, nullptr, 40000, true, 12);
+    run_case("clip_epochs_shared_g1", 1, true, nullptr, 20000, true, 8, false, true);
+    g_clip = false;
+    unsetenv("BUCKET2_SPOT_MIN_STEAL_S");
     // 7) n = 0
     run_case("empty", 2, true, nullptr, 0, false, 0);
     if (g_fail) { std::cerr << g_fail << " check(s) failed\n"; return 1; }

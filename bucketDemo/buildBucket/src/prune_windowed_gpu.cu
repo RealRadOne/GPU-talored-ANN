@@ -736,8 +736,13 @@ void run_chunked(int64_t N, int M, int D, const uint32_t* h_offsets, int n_bucke
             };
             int32_t last_started = -1;
             for (int32_t c = 0; c < static_cast<int32_t>(plans.size()); ++c) {
-                const Plan& pl = plans[static_cast<size_t>(c)];
-                if (hooks && hooks->claim && !hooks->claim(pl.p0, pl.p1)) break;   // spot: 停止开新块
+                Plan& pl = plans[static_cast<size_t>(c)];
+                if (hooks && hooks->claim) {   // spot: 段被偷小 → 块截到新 end (U 是超集，只多装几个桶)；不能开始 → 停
+                    const int p1c = hooks->claim(pl.p0, pl.p1);
+                    if (p1c <= pl.p0) break;
+                    if (p1c > pl.p1) throw std::runtime_error("prune_windowed_gpu: claim grew a chunk");
+                    pl.p1 = p1c;
+                }
                 last_started = c;
                 const int b = c & 1;
                 double t0 = omp_get_wtime();
@@ -867,7 +872,12 @@ void run_chunked(int64_t N, int M, int D, const uint32_t* h_offsets, int n_bucke
                 rows += add;
                 ++p1;
             }
-            if (hooks && hooks->claim && !hooks->claim(p0, p1)) break;   // spot: 停止开新块
+            if (hooks && hooks->claim) {   // spot: 段被偷小 → 块截到新 end；不能开始 → 停
+                const int p1c = hooks->claim(p0, p1);
+                if (p1c <= p0) break;
+                if (p1c > p1) throw std::runtime_error("prune_windowed_gpu: claim grew a chunk");
+                p1 = p1c;
+            }
             // ---- 布局: 上一块已在显存里的桶排前面 (按旧行号，旧布局里连续的仍连续 → run 少)，
             //      其余桶按 id 排在后面 (相邻 id 合并成连续段并行读 + 一次 H2D)。kernel 只经 cbase 找行，
             //      布局顺序不影响结果。
