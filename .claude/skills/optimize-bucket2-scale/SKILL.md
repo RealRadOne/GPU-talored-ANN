@@ -190,7 +190,7 @@ python3 $S/judge.py $R/sift100M_auto_g2 [$R/sift100M_auto_g4] --md
 plus the single-GPU `--quick` verdict (det*.txt optional). Rules in **Goal and bench set**.
 
 ### 5a. ACCEPT
-1. Same judge command with `--update` (add `--add-new` if G = 4 has no best yet).
+1. Same judge command with `--update` (add `--add-new` if G = 4 has no best yet). `--update` writes every judged config: if one config was slower than its best (accepted on the other), restore that entry from HEAD — never ratchet a best upwards (S26).
 2. Append `### S<N> — <idea>` to `OPTIMIZATION_LOG_SCALE.md`: idea, source (cuVS / TAGORE function), class,
    GPUs used, judge tables, **per-stage speedup vs 1 GPU** table (G = 2, G = 4), det check, single-GPU guard.
    Update **Current best**.
