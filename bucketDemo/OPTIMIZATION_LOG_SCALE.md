@@ -52,7 +52,7 @@ Item names below are backlog labels, not iteration numbers (iterations are logge
   serial prefix over N; reduce on GPU (peer add into GPU 0, or per-GPU dst-range counts) + parallel prefix.
 - **S14 — analysed (S12 entry): shared host link, not fixable at G = 2.** ~~GPU 0 H2D 2× slower than GPU 1 in optimize count / fill~~ (same bytes; NUMA placement of `h_fwd_all` pages read by
   `parallel_pread_file`, or PCIe topology). Check `numactl`/`move_pages` of the first half; interleave or bind the pread threads.
-- **S21 (next, user 2026-11-20) — bring the in-memory fast paths under one host budget.** Inventory (2026-11-21): bucket2 already gates
+- **S21 — done as S27 (2026-11-21).** ~~bring the in-memory fast paths under one host budget.** Inventory (2026-11-21): bucket2 already gates
   each fast path on its own cap (dataset_env.py: CACHE_MB, BUCKET_MEM_MB, ARRIVAL_MEM_MB each ≤ HOST_BUDGET_MB / 4 = 50 GB at the 200 GB
   default; `host_raw_budget` = bucket_mem_mb gates ooc `raw_host` (N·D·2) and Step 4.5 `keep_blob` / `r1_blob`), but the caps are
   independent and r1_blob + BucketVectorAccumulator memory mode + kept round-1 arrivals + round-2 arrivals + Step 6 host cache can be
@@ -577,3 +577,23 @@ ACCEPT (sift10M Wait 3.3–3.6 s, unchanged at that size; memory vs guard_mem_re
 |---|---|---|---|---|---|---|
 | G = 2 (S26) | 1.87× | 1.92× | 1.65× | 1.24× | 2.32× | 1.69× |
 | G = 4 (S26) | 3.02× | 3.06× | 1.59× | 1.18× | 2.45× | 2.09× |
+
+### S27 (= backlog S21) — one host budget for all bucket2 in-memory fast paths — accepted (user-requested, speed-neutral) (2026-11-21)
+
+**Change.** New `--host-budget-mb` (run_pipeline / mgpu_run pass `BUCKET2_HOST_BUDGET_MB` from dataset_env.py = HOST_BUDGET_MB,
+env override for fallback tests; 0 = no shared cap). One process-wide accountant `g_host_budget` (atomic used / peak, `try_reserve`,
+`reserve_up_to`, `release`). Consumers reserve before taking the fast path, else the existing disk / out-of-core path:
+arrival block admission (ChunkedKnnAccumulator flush; released where `arrival_mem_bytes` drops), BucketVectorAccumulator memory
+mode (buffer counted; file mode now also frees the buffer), Step 4.5 `r1_blob` (shared_ptr deleter releases; denied → windowed
+reorder + file reads), out-of-core `raw_host` (N·D·2; released after the last round), Step 6 host bucket cache (`reserve_up_to`,
+cache shrinks to what is granted, released on return). Per-component caps (--cache-mb / --bucket-mem-mb / --arrival-mem-mb) stay
+as upper bounds. End-of-build line `[HostBudget] cap / peak reserved / denied`.
+
+**Fallback (search-evaluated):** SIFT10M with `BUCKET2_HOST_BUDGET_MB=3000` (`runs/scale27/sift10M_fallback3g`): bucket records →
+file mode, Step 6 cache 15.7 GB → 3.1 / 0.6 GB, arrival blocks to disk (25 932 denials); recall@10 0.8320 / 0.9210 / 0.9691 /
+0.9901 / 0.9972 (= fast path), 0 defects; 38.92 s (+12 % vs the fast path, expected); peak RSS 14.5 → 10.3 GB.
+
+**Default budget (200 GB, nothing denied):** SIFT100M G = 2 ×3 **250.73 s** (−0.5 % vs 251.87), G = 4 ×3 **205.24 s** (= 205.25);
+peak reserved 95.8 GB (peak RSS G = 2 92.6, G = 4 94.8 GB, unchanged); recall@10 G = 2 0.7268 / 0.8330 / 0.9117, G = 4 0.7274 /
+0.8334 / 0.9108. Single-GPU guard ACCEPT (sift10M peak reserved 23.9 GB incl. the full cache budget, 0 denied). judge verdict
+REJECT only for "no config ≥ 3 % faster" — not applicable to this requested robustness change; best_scale.json unchanged.

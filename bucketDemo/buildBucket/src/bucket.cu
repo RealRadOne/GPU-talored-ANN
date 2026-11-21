@@ -115,6 +115,44 @@ cuvs::neighbors::cagra::device_padded_index<T, uint32_t> make_padded_cagra_index
  * Configuration for flexible data loading and GPU KMeans++ centroid generation
  * Based on user requirements and DiskANN design patterns
  */
+// S21 (scale loop, user 2026-11-20): 所有 host 内存快路径 (arrival 记录放内存、BucketVectorAccumulator 内存模式、
+// Step 4.5 r1_blob、out-of-core raw_host、Step 6 host bucket 缓存) 共用一个用户给的预算 (--host-budget-mb)。
+// 每个快路径先 try_reserve，拿不到就走原来的磁盘 / out-of-core 路径；用完 release。cap = 0 = 不限 (原来各自的上限照旧)。
+// 各组件原有的上限 (--cache-mb / --bucket-mem-mb / --arrival-mem-mb) 仍然是各自的上界。
+struct HostBudget {
+    std::atomic<size_t> used{0}, peak{0};
+    size_t cap = 0;
+    std::atomic<size_t> denied{0};
+    bool try_reserve(size_t b) {
+        if (b == 0) return true;
+        size_t cur = used.load(std::memory_order_relaxed);
+        for (;;) {
+            if (cap > 0 && cur + b > cap) { denied.fetch_add(1, std::memory_order_relaxed); return false; }
+            if (used.compare_exchange_weak(cur, cur + b, std::memory_order_relaxed)) break;
+        }
+        size_t nu = cur + b, pk = peak.load(std::memory_order_relaxed);
+        while (nu > pk && !peak.compare_exchange_weak(pk, nu, std::memory_order_relaxed)) {}
+        return true;
+    }
+    void release(size_t b) { if (b) used.fetch_sub(b, std::memory_order_relaxed); }
+    // 最多拿 b (cap = 0 时全给)，返回拿到的字节数 (缓存类: 小一点只影响 I/O，不影响结果)
+    size_t reserve_up_to(size_t b) {
+        if (cap == 0) { try_reserve(b); return b; }
+        size_t cur = used.load(std::memory_order_relaxed);
+        for (;;) {
+            const size_t g = (cur >= cap) ? 0 : std::min(b, cap - cur);
+            if (g == 0) { if (b) denied.fetch_add(1, std::memory_order_relaxed); return 0; }
+            if (used.compare_exchange_weak(cur, cur + g, std::memory_order_relaxed)) {
+                size_t nu = cur + g, pk = peak.load(std::memory_order_relaxed);
+                while (nu > pk && !peak.compare_exchange_weak(pk, nu, std::memory_order_relaxed)) {}
+                if (g < b) denied.fetch_add(1, std::memory_order_relaxed);
+                return g;
+            }
+        }
+    }
+};
+static HostBudget g_host_budget;
+
 struct LoadConfig {
     // Memory limits
     size_t cpu_limit_bytes;        // CPU memory limit, default 16GB
@@ -154,6 +192,8 @@ struct LoadConfig {
     size_t bucket_mem_mb = 0;
     // out-of-core Step 6 arrival 记录放内存的预算 (MB, 0 = 全部落盘)，见 ChunkedKnnAccumulator::mem_arrival
     size_t arrival_mem_mb = 0;
+    // S21: 所有 host 内存快路径共用的预算 (MB, 0 = 不限)，见 HostBudget
+    size_t host_budget_mb = 0;
 
     // Output
     bool save_dists;               // 写 vector_dists.bin (default true)；流水线后续阶段不读它
@@ -621,6 +661,10 @@ LoadConfig parse_load_config(const po::variables_map& vm) {
     if (vm.count("arrival-mem-mb")) {
         config.arrival_mem_mb = vm["arrival-mem-mb"].as<size_t>();
     }
+    if (vm.count("host-budget-mb")) {
+        config.host_budget_mb = vm["host-budget-mb"].as<size_t>();
+        g_host_budget.cap = config.host_budget_mb << 20;   // S21
+    }
     if (vm.count("skip-dists")) {
         config.save_dists = !vm["skip-dists"].as<bool>();
     }
@@ -967,13 +1011,21 @@ struct BucketVectorAccumulator {
         }
 
         in_memory = static_cast<size_t>(pos) <= mem_budget;
-        if (in_memory) {
-            if (static_cast<size_t>(pos) > mem_cap) {
+        // S21: 内存模式的缓冲区 (mem_cap 字节) 记在共用 host 预算上；扩容拿不到预算 → 这一轮走文件模式
+        if (in_memory && static_cast<size_t>(pos) > mem_cap) {
+            const size_t old_cap = mem_cap;
+            mem.reset(); mem_cap = 0; g_host_budget.release(old_cap);
+            if (g_host_budget.try_reserve(static_cast<size_t>(pos))) {
                 mem.reset(new char[static_cast<size_t>(std::max<int64_t>(pos, 1))]);   // 不初始化: 每个字节都会被 add 写一次
                 mem_cap = static_cast<size_t>(pos);
+            } else {
+                in_memory = false;
+                std::cout << "[HostBudget] bucket records " << pos / 1e9 << " GB denied (used " << g_host_budget.used.load() / 1e9
+                          << " / " << g_host_budget.cap / 1e9 << " GB) -> file mode\n";
             }
-            return;
         }
+        if (in_memory) return;
+        if (mem_cap > 0) { mem.reset(); g_host_budget.release(mem_cap); mem_cap = 0; }   // S21: 文件模式不再占着内存缓冲
         if (merged_out.is_open()) merged_out.close();
         merged_out.clear();
         merged_out.open(merged_path, std::ios::binary | std::ios::out | std::ios::trunc);
@@ -6175,6 +6227,11 @@ struct ChunkedKnnAccumulator {
         size_t cur = arrival_mem_bytes->load(std::memory_order_relaxed);
         while (cur + b.cap <= arrival_mem_budget)
             if (arrival_mem_bytes->compare_exchange_weak(cur, cur + b.cap, std::memory_order_relaxed)) { to_mem = true; break; }
+        // S21: 还要能从共用的 host 预算里拿到这一块，拿不到就照旧落盘
+        if (to_mem && !g_host_budget.try_reserve(b.cap)) {
+            arrival_mem_bytes->fetch_sub(b.cap, std::memory_order_relaxed);
+            to_mem = false;
+        }
         {
             std::unique_lock<std::mutex> lk;
             if (lanes.size() > 1) lk = std::unique_lock<std::mutex>(chunk_mtx[static_cast<size_t>(c)]);
@@ -6511,6 +6568,7 @@ struct ChunkedKnnAccumulator {
                     for (const auto& blk : blocks) freed += blk.cap;
                     std::vector<MemBlock>().swap(blocks);
                     arrival_mem_bytes->fetch_sub(freed, std::memory_order_relaxed);
+                    g_host_budget.release(freed);   // S21
                 }
                 n_records += n_file;
                 if (had_file && !keep) std::filesystem::remove(ip);
@@ -7179,8 +7237,13 @@ void build_vector_knn_with_tensorcore(
     // GPU 端 bucket 缓存跟 host 缓存用同一份未来访问表 (8-bit / float32 数据、预算 > 0 时用)
     std::vector<std::vector<int32_t>> future_access_dev;
     if (use_dev_cache) future_access_dev = future_access;
+    // S21: host bucket 缓存预算记在共用 host 预算上 (拿到多少用多少，函数返回时释放)
+    const size_t cache_granted = g_host_budget.reserve_up_to(cache_bytes);
+    if (cache_granted < cache_bytes)
+        std::cout << "  [HostBudget] Step 6 host bucket cache " << cache_bytes / 1e6 << " -> " << cache_granted / 1e6 << " MB\n";
+    struct S21CacheRelease { size_t b; ~S21CacheRelease() { g_host_budget.release(b); } } cache_release{cache_granted};
     bucket_order::BeladyBucketCache<VecBucket<DataT>> bucket_cache(
-        std::move(future_access), cache_bytes, vec_bucket_bytes);
+        std::move(future_access), cache_granted, vec_bucket_bytes);
     auto bucket_loader = [&](int32_t bid) {
         VecBucket<DataT> vb;
         bucket_vecs.read_bucket(bid, vb.ids, vb.vecs);
@@ -9134,8 +9197,20 @@ int run_pipeline_impl(
                                                           : config.cpu_limit_bytes / 4;
         // 测试用: BUCKET2_HOST_RAW_BUDGET_MB 覆盖 (小数据集上走 SIFT100M 的 keep_blob / S18 路径做逐字节检查)
         if (const char* e = std::getenv("BUCKET2_HOST_RAW_BUDGET_MB")) host_raw_budget = static_cast<size_t>(std::atoll(e)) << 20;
-        const bool ooc_host_raw = !gres &&
+        bool ooc_host_raw = !gres &&
             static_cast<size_t>(N) * D * sizeof(DataT) * 2 <= host_raw_budget;
+        // S21: 整份 raw_host (按 2 份计，跟上面的判断一样) 记在共用 host 预算上；拿不到 → 不留 raw_host (读文件)
+        size_t ooc_raw_reserved = 0;
+        if (ooc_host_raw) {
+            const size_t want = static_cast<size_t>(N) * D * sizeof(DataT) * 2;
+            if (g_host_budget.try_reserve(want)) ooc_raw_reserved = want;
+            else {
+                ooc_host_raw = false;
+                std::cout << "[HostBudget] out-of-core raw_host " << want / 1e9 << " GB denied (used " << g_host_budget.used.load() / 1e9
+                          << " / " << g_host_budget.cap / 1e9 << " GB) -> read from file\n";
+            }
+        }
+        struct S21Release { size_t& b; ~S21Release() { g_host_budget.release(b); b = 0; } } ooc_raw_release{ooc_raw_reserved};
         // Step 4 / round 2..t bucket 写的整份数据 (当前坐标系): raw_host (ooc_host_raw)，否则 S18: round 2 (iter == 1)
         // 用 Step 4.5 留下的 r1_blob (= data_reordered 的内容)，不读后台还在写的文件
         int iter_now = 0;
@@ -9537,7 +9612,10 @@ int run_pipeline_impl(
                 centroid_global_indices, assignments, *bucket_vecs_ptr,
                 512LL * 1024 * 1024, host_raw_now());
             // 最后一轮写完 bucket 之后 Step 6 只读 bucket_vecs，原始数据不再需要
-            if (ooc_host_raw && iter + 1 == iterations) { join_reorder_write(); raw_host = HostRawVec(); }
+            if (ooc_host_raw && iter + 1 == iterations) {
+                join_reorder_write(); raw_host = HostRawVec();
+                g_host_budget.release(ooc_raw_reserved); ooc_raw_reserved = 0;   // S21
+            }
             // S18: round 2 的 Step 4 + bucket 写已经用完 r1_blob；后面的轮次 (iterations > 2) 要读 data_reordered 文件
             if (r1_blob && iter == 1) { r1_blob.reset(); if (iter + 1 < iterations) join_reorder_write(); }
         }
@@ -9740,9 +9818,16 @@ int run_pipeline_impl(
                 // #91: 多轮、整份重排数据放得进 host 预算时单窗: 输入只读一遍 (原来 2 窗各读一遍)，窗缓冲留作
                 // r1_blob (round 2 的重新采样 + round 1 Step 6 直接用，不再从刚写的文件读回)。BUCKET2_R1_BLOB=0 关掉。
                 // 参考 cuVS cagra_ace.cuh::ace_check_use_disk_mode: 放得进内存就走内存模式，放不下才落盘再读
-                const bool keep_blob = iterations > 1 && !win_env &&
+                bool keep_blob = iterations > 1 && !win_env &&
                     static_cast<size_t>(N) * static_cast<size_t>(row_bytes) <= host_raw_budget &&
                     !(std::getenv("BUCKET2_R1_BLOB") && std::getenv("BUCKET2_R1_BLOB")[0] == '0');
+                // S21: r1_blob 记在共用 host 预算上 (r1_blob 的 deleter 释放)；拿不到 → 原来的多窗 + 读文件路径
+                const size_t blob_bytes_s21 = static_cast<size_t>(N) * static_cast<size_t>(row_bytes);
+                if (keep_blob && !g_host_budget.try_reserve(blob_bytes_s21)) {
+                    keep_blob = false;
+                    std::cout << "[HostBudget] r1_blob " << blob_bytes_s21 / 1e9 << " GB denied (used " << g_host_budget.used.load() / 1e9
+                              << " / " << g_host_budget.cap / 1e9 << " GB) -> windowed reorder\n";
+                }
                 const int64_t win_rows = keep_blob ? N : std::max<int64_t>(1, std::min<int64_t>(N, win_bytes / row_bytes));
                 // S18 (user 2026-11-20: Step 4.5 may overlap GPU stages): keep_blob 时 data_reordered 后台写。BUCKET2_REORDER_BG=0 关掉
                 const bool bg_write = keep_blob && !(std::getenv("BUCKET2_REORDER_BG") && std::getenv("BUCKET2_REORDER_BG")[0] == '0');
@@ -9795,7 +9880,7 @@ int run_pipeline_impl(
                 if (!bg_write && ::close(out_fd) != 0) io_ok = false;
                 if (!io_ok) { if (bg_write) ::close(out_fd); throw std::runtime_error("Inline reorder: I/O failed writing " + data_reordered_path); }
                 if (keep_blob) {
-                    r1_blob = std::shared_ptr<char[]>(win.release());
+                    r1_blob = std::shared_ptr<char[]>(win.release(), [blob_bytes_s21](char* p) { delete[] p; g_host_budget.release(blob_bytes_s21); });
                     if (bg_write) {
                         // S18: data_reordered 在后台按 64 MB 片顺序写，每片 sync_file_range 发起回写、等 4 片之前的写完:
                         // 脏页不超过 ~256 MB，写速跟着磁盘走。S6 (一次全写进页缓存) 让 12.8 GB 脏页跟 round 1 Step 6
@@ -10323,6 +10408,8 @@ int run_pipeline_impl(
         if (neighbors_m > 0) {
             std::cout << "  Step 6   (Per-vector KNN, merge included):      " << elapsed_step6 << "s\n";
             std::cout << "  Wait     (final iteration's background merge):  " << elapsed_final_merge_wait << "s" << rss_note() << "\n";
+            std::cout << "  [HostBudget] cap " << g_host_budget.cap / 1e9 << " GB (0 = none), peak reserved "
+                      << g_host_budget.peak.load() / 1e9 << " GB, denied/shrunk " << g_host_budget.denied.load() << "\n";   // S21
             std::cout << "  Write    (close + .npy convert):    " << elapsed_write_knn << "s\n";
         }
         std::cout << "  --------------------------------\n";
@@ -10423,6 +10510,10 @@ int main(int argc, char** argv) {
             ("kmeans-train-fraction", po::value<float>(),
                 "Step 2 (dataset fits on GPU): train KMeans|| on this random fraction of the points "
                 "(centroid count stays N*centroid-ratio; default 1.0 = all points)")
+            ("host-budget-mb", po::value<size_t>(),
+                "One host-memory budget in MB shared by all in-memory fast paths (arrival records, bucket records, "
+                "Step 4.5 reordered blob, out-of-core raw data, Step 6 host bucket cache); a fast path that does not fit "
+                "falls back to the disk path (default 0 = no shared cap, per-component caps only)")
             ("arrival-mem-mb", po::value<size_t>(),
                 "Out-of-core Step 6: keep the per-round arrival records in host memory up to this budget in MB "
                 "(default 0 = all on disk); the rest is written to the chunk files as before")
