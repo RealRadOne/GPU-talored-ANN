@@ -52,6 +52,10 @@ prune 44.7, optimize 35.8); 4 GPUs 347.79 s (Step 4 42.3, Step 6 121.8, Wait 50.
 
 ## Ideas backlog (largest multi-GPU gap first)
 
+- **S34 (next) — final-merge CPU (Wait ≈ 21 s, now the largest non-scaling part).** S32 G = 4 run: merge_iteration(iter = 1) wall 22.8 s,
+  sum over 954 chunks: merge_cpu 821 s (≈ 10.3 s on 80 threads, ~4 µs per arrival record, ~200 M records from round 1 kept + round 2),
+  write_running 525 s (mmap copy + faults, ≈ 6.6 s), alloc 20, reads 30; slowest chunk 3.1 s. Ideas: faster record decode (varint) +
+  top-64 merge (sort-free insertion with early reject by the running k-th distance, SIMD dedup), chunk scheduling largest-first.
 Item names below are backlog labels, not iteration numbers (iterations are logged as `### S<N>` under Iterations).
 
 - **S10 — done (partly: warm-up + staging threads; GPU-side count reduction not done).** optimize count phase (4.2 s at G = 2): each GPU D2Hs a full N×4 B count array and the host sums G arrays +
