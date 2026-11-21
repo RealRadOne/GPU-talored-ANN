@@ -63,6 +63,7 @@
 
 #include "bucket_order.hpp"
 #include "graph_io.hpp"
+#include "spot_sched.hpp"
 #include "load.hpp"
 #include "prune_windowed_core.hpp"
 #include "prune_windowed_gpu.hpp"
@@ -130,6 +131,8 @@ static void read_dataset_chunk(const std::string& path, const std::string& ext,
 
 int main(int argc, char** argv)
 {
+    // spot 模拟 (BUCKET2_SPOT_DIR): 必须在任何线程 / CUDA 之前
+    spot::Client::get().init();
     try {
         po::options_description desc("Windowed approximate CAGRA prune for oversized graphs");
         desc.add_options()

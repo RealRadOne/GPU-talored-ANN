@@ -39,6 +39,24 @@ for rd in sorted(glob.glob(os.path.join(out, "rep*"))):
         f = os.path.join(rd, q + ".json")
         if os.path.exists(f) and os.path.getsize(f):
             r[q] = json.loads(open(f).read().strip().splitlines()[-1])
+    # spot simulation (optimize-bucket2-spot): scheduler stats lines "[spot] stage=..." of bucket2 / prune and the
+    # simulator's event log
+    sp = {"stages": []}
+    for lg in ("bucket2.log", "prune.log"):
+        f = os.path.join(rd, lg)
+        if os.path.exists(f):
+            for m in re.finditer(r"^\[spot\] stage=(\S+) (.*)$", open(f).read(), re.M):
+                kv = dict(x.split("=", 1) for x in m.group(2).split() if "=" in x)
+                kv["stage"] = m.group(1)
+                sp["stages"].append(kv)
+    f = os.path.join(rd, "spot_events.log")
+    if os.path.exists(f):
+        ev = open(f).read()
+        sp["events"] = {e: len(re.findall(r" inst=\d+ " + e + r" ", ev)) for e in ("notice", "preempt", "join")}
+    if sp["stages"] or "events" in sp:
+        for key in ("rejected_units", "preempts", "steals", "setups", "reaped", "drains"):
+            sp[key] = sum(int(x.get(key, 0)) for x in sp["stages"])
+        r["spot"] = sp
     reps.append(r)
 
 if not reps:
@@ -57,6 +75,9 @@ res = {
     "peak_rss_gb": {s: max(r["peak_rss_gb"].get(s, 0) for r in reps) for s in stage_names},
     "gpu_peak_mib": max((r["gpu_peak_mib"] or 0) for r in reps),
 }
+if os.environ.get("SPOT", "0") == "1":   # spot run: config key gets _spot<TAG> (judge.py)
+    res["spot"] = os.environ.get("SPOT_TAG", "") or "none"
+    res["spot_reps"] = [r.get("spot", {}) for r in reps]
 for q in ("knn_similarity", "search", "a1_stats"):
     if q in reps[-1]:
         res[q] = reps[-1][q]

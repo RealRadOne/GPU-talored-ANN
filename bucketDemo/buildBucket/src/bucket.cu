@@ -68,6 +68,7 @@
 #include "utils.hpp"
 #include "load.hpp"
 #include "bucket_build.cuh"
+#include "spot_sched.hpp"
 #include "bucket_order.hpp"
 #include "graph_io.hpp"
 #include "reordered_dataset_io.hpp"
@@ -10450,6 +10451,8 @@ int run_pipeline_impl(
 //   .ibin      → int32_t
 //   .ubin      → uint32_t
 int main(int argc, char** argv) {
+    // spot 模拟 (BUCKET2_SPOT_DIR): 必须在任何线程 / CUDA 之前 (屏蔽 SIGUSR1、映射 spot_sim.py 的状态文件)
+    spot::Client::get().init();
     try {
         // ---- 提高 RLIMIT_NOFILE ----
         // ChunkedKnnAccumulator 在 Step 6 build 期间给每个 chunk 常驻打开一个

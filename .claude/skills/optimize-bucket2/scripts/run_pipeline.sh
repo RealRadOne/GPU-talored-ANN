@@ -90,6 +90,7 @@ timed() {  # timed NAME CMD... -> $OUT/rep$R/NAME.{log,time}; returns cmd exit c
 GPU_RETRIES=0
 rep_retry_or_fail() {  # rep_retry_or_fail STAGE
   kill "$SMI" 2>/dev/null; wait "$SMI" 2>/dev/null
+  spot_stop
   if ! gpu_is_free "$GPU" && (( GPU_RETRIES < 10 )); then
     GPU_RETRIES=$((GPU_RETRIES + 1))
     echo "[gpu] GPU $GPU taken by another process during rep $R (stage $1): discarding this rep, rerunning"
@@ -97,6 +98,30 @@ rep_retry_or_fail() {  # rep_retry_or_fail STAGE
   fi
   echo "$1 FAILED"; exit 3
 }
+
+# ---- spot simulation (optimize-bucket2-spot, branch spot/bucket2) ----
+# SPOT=1: replay SPOT_TRACE (CSV; empty = no events) with spot_sim.py during bucket2 + prune, scale SPOT_SCALE
+# (trace s per real s, default 60), optional SPOT_NOTICE_REAL_S; bucket2 / prune_windowed read the state file via
+# BUCKET2_SPOT_DIR (src/spot_sched.hpp). optimize_chunked stays single-GPU on the on-demand device (user 2026-11-20).
+SPOT_SIM=$ROOT/.claude/skills/optimize-bucket2-spot/scripts/spot_sim.py
+SPOT_DIR=""; SPOT_PID=""
+spot_start() {
+  [[ ${SPOT:-0} == 1 ]] || return 0
+  SPOT_DIR=/dev/shm/spot_sim/$(basename "$OUT")_rep${R}_$$; rm -rf "$SPOT_DIR"; mkdir -p "$SPOT_DIR"
+  local na=(); [[ -n ${SPOT_NOTICE_REAL_S:-} ]] && na=(--notice-real-s "$SPOT_NOTICE_REAL_S")
+  "$PY" -I "$SPOT_SIM" run --trace "${SPOT_TRACE:-}" --dir "$SPOT_DIR" --n-inst "${MGPU:-1}" --scale "${SPOT_SCALE:-60}" \
+    "${na[@]}" --log "$RD/spot_events.log" > /dev/null 2>&1 9>&- &
+  SPOT_PID=$!
+  export BUCKET2_SPOT_DIR=$SPOT_DIR
+  echo "${SPOT_TRACE:-none} scale=${SPOT_SCALE:-60} notice_real_s=${SPOT_NOTICE_REAL_S:-scaled} mode=${BUCKET2_SPOT_MODE:-default}" > "$RD/spot.txt"
+}
+spot_stop() {
+  [[ -n $SPOT_PID ]] && { kill "$SPOT_PID" 2>/dev/null; wait "$SPOT_PID" 2>/dev/null; }
+  [[ -n $SPOT_DIR ]] && rm -rf "$SPOT_DIR"
+  SPOT_PID=""; SPOT_DIR=""; unset BUCKET2_SPOT_DIR
+}
+trap spot_stop EXIT
+if [[ ${SPOT:-0} == 1 ]] && (( ${MGPU:-1} > 1 )); then CHUNKED_EXTRA="${CHUNKED_EXTRA/--num-gpus $MGPU/--num-gpus 1}"; fi
 
 for ((R = 0; R < REPS; R++)); do
   select_gpu
@@ -131,6 +156,7 @@ for ((R = 0; R < REPS; R++)); do
   # GPU-resident path: bucket2 does prune + reverse edges + id translation in-process
   # and writes final_graph.bin itself (user decision 2026-10-21); out-of-core ignores it
   [[ $MODE == auto ]] && B2_FLAGS+=(--fused-optimize-degree "$OUTPUT_DEGREE")
+  spot_start
   # shellcheck disable=SC2086
   timed bucket2 "$BIN/bucket2" "${B2_FLAGS[@]}" $BUCKET2_EXTRA || { rep_retry_or_fail bucket2; continue; }
   O=$W/$TAG
@@ -158,6 +184,7 @@ for ((R = 0; R < REPS; R++)); do
       $( [[ ${A4_POOL:-0} == 1 ]] && echo --pool-graph "$O/centroid_pool.bin" ) \
       $( [[ ${B13_DISTS:-0} == 1 ]] && echo --dists "$O/vector_dists.bin" ) \
       || { rep_retry_or_fail prune; continue; }
+    spot_stop   # optimize_chunked: no spot (single on-demand GPU)
     # shellcheck disable=SC2086
     timed optimize_chunked "$BIN/optimize_chunked" -g "$O/forward_graph_reordered.bin" \
       -o "$O/graph_new_ids.bin" -m E --bucket-offsets "$O/bucket_offsets.bin" \
@@ -171,6 +198,7 @@ for ((R = 0; R < REPS; R++)); do
     timed translate "$BIN/translate_ids" -g "$O/graph_new_ids.bin" -p "$O/inverse_perm.bin" \
       -o "$O/final_graph.bin" || { rep_retry_or_fail translate; continue; }
   fi
+  spot_stop
   kill $SMI; wait $SMI 2>/dev/null
   if ! gpu_is_free "$GPU" && (( GPU_RETRIES < 10 )); then   # timing shared with someone else: invalid
     GPU_RETRIES=$((GPU_RETRIES + 1))
