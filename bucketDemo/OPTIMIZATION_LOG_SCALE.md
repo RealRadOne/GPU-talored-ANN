@@ -10,7 +10,9 @@ as reference.
 
 ## Current best
 
-**G = 2: 251.87 s** (S20, 2026-11-20, GPUs 2,3, `runs/scale20/sift100M_auto_g2`) — bucket2 196.1, prune 39.7, optimize 17.7;
+**G = 2: 237.33 s** (S32, 2026-11-21, GPUs 2,3, `runs/scale32/sift100M_auto_g2`) — bucket2 190.8, prune 29.8, optimize 17.0;
+recall@10 0.7243 / 0.8319 / 0.9100; peak RSS 92.4 GB. Speedup vs 1 GPU 1.81×.
+Previous **G = 2: 251.87 s** (S20, 2026-11-20, GPUs 2,3, `runs/scale20/sift100M_auto_g2`) — bucket2 196.1, prune 39.7, optimize 17.7;
 recall@10 0.7263 / 0.8329 / 0.9108; peak RSS 92.0 GB. Speedup vs 1 GPU 1.71×.
 Previous **G = 2: 268.24 s** (S19 = S17 + S18, 2026-11-20, GPUs 2,3, `runs/scale19/sift100M_auto_g2`) — bucket2 197.0 (Step 4 53.7,
 Step 4.5 4.7, Step 6 83.6, Wait 26.0), prune 42.1, optimize 28.9; recall@10 0.7272 / 0.8343 / 0.9114. Speedup vs 1 GPU 1.60×.
@@ -20,7 +22,9 @@ Wait 26.4), prune 46.3, optimize 30.0; recall@10 0.7267 / 0.8340 / 0.9109 (same-
 Previous: **304.42 s** (S4 re-judged 2026-11-19, "accepted (compute gain, disk-bound)"; reps 304.4 / 299.4 / 365.0, GPUs 0,1;
 `runs/scale4/sift100M_auto_g2`) — Step 6 85.2, Wait 33.5, optimize 35.0; recall@10 0.7272 / 0.8334 / 0.9120. Previous best
 307.50 (S1). S9 (optimize src-split) accepted under the compute-gain rule without a new best (311.50 s, slow-disk period). Compute metrics for the fast-disk re-check are in the S3 / S4 re-judge entry below.
-**G = 4: 205.25 s** (S26, 2026-11-21, GPUs 0–3, `runs/scale26/sift100M_auto_g4`) — bucket2 141.9 (Wait 21.2), prune 47.4, optimize 16.1;
+**G = 4: 189.89 s** (S32, 2026-11-21, GPUs 0–3, `runs/scale32/sift100M_auto_g4`) — bucket2 143.2, prune 29.5, optimize 17.4;
+recall@10 0.7254 / 0.8339 / 0.9105; peak RSS 95.6 GB. Speedup vs 1 GPU 2.26×.
+Previous **G = 4: 205.25 s** (S26, 2026-11-21, GPUs 0–3, `runs/scale26/sift100M_auto_g4`) — bucket2 141.9 (Wait 21.2), prune 47.4, optimize 16.1;
 recall@10 0.7260 / 0.8335 / 0.9112; peak RSS 95.4 GB. Speedup vs 1 GPU 2.09×.
 Previous **G = 4: 213.84 s** (S20, 2026-11-20, GPUs 0–3, `runs/scale20/sift100M_auto_g4`) — bucket2 145.1, prune 49.9, optimize 16.3;
 recall@10 0.7258 / 0.8333 / 0.9095; peak RSS 95.1 GB. Speedup vs 1 GPU 2.01×.
@@ -102,6 +106,13 @@ outputs must stay byte-identical to today's.**
   12.8 GB final write (disk-bound) → at most a few seconds. Source: cuVS `mg/snmg.cuh` sharded build.
 
 ## Awaiting approval
+
+- **S32 follow-up — msTuring100M bucket2 memory (needs a user decision, 2026-11-21):** since S18/S19 the float32 Step 4.5 `r1_blob`
+  (40 GB) is kept into round 2 → msTuring100M bucket2 peak RSS 103.6 → 141.1 GB (judge memory gate vs the S12 milestone fails; it is within
+  the 200 GB host budget and every fast path is now budget-accounted, S27). Side effect: data_reordered is evicted from the page cache →
+  prune load 44–51 → 109–120 s (S29–S31). Options: (a) rebaseline the msTuring100M memory reference to the current level (r1_blob is a
+  budget-gated fast path); (b) keep r1_blob only when N·row ≤ host budget / 8 (msTuring100M would drop it: bucket2 +~110 s, prune −~80 s,
+  measured S29 `BUCKET2_R1_BLOB=0`); (c) free r1_blob earlier / write-through so data_reordered stays cached. Waiting for the user.
 
 - **User decisions 2026-11-20 (later):** (a) memory: in-memory fast paths only within one user-given host budget (reuse / unify
   HOST_BUDGET_MB → --host-budget-mb / --bucket-mem-mb / --arrival-mem-mb / --cache-mb), never "if it fits / RAM is free";
@@ -601,3 +612,27 @@ file mode, Step 6 cache 15.7 GB → 3.1 / 0.6 GB, arrival blocks to disk (25 932
 peak reserved 95.8 GB (peak RSS G = 2 92.6, G = 4 94.8 GB, unchanged); recall@10 G = 2 0.7268 / 0.8330 / 0.9117, G = 4 0.7274 /
 0.8334 / 0.9108. Single-GPU guard ACCEPT (sift10M peak reserved 23.9 GB incl. the full cache budget, 0 denied). judge verdict
 REJECT only for "no config ≥ 3 % faster" — not applicable to this requested robustness change; best_scale.json unchanged.
+
+### S32 — prune `Staging::par_copy` capped at 8 OpenMP threads — ACCEPT (2026-11-21)
+
+**Found by** the S31 sampler (msTuring100M G = 2, 5 s vmstat): in prune's second half the runqueue was ≈ 160 on 80 cores with
+sy ≈ 48 % and no disk reads. B12's row loads were already capped at 8 threads per GPU, but `prune_windowed_gpu::Staging::par_copy`
+(pinned staging copy used by `stg.h2d` for every small upload: runs / cbase / slot tables) opened a full 80-thread team from each GPU
+thread on every call → G × 80 threads plus GOMP spin-waiting (same pattern as S10 / S23). **Change:** `num_threads(8)` (env
+`BUCKET2_PRUNE_COPY_THREADS`, same default as `BUCKET2_PRUNE_LOAD_THREADS`). Same bytes. Implementation only.
+
+| SIFT100M | total (×3) | vs best | prune (reps) | same-period ref (`COPY_THREADS=80`, ×1) |
+|---|---|---|---|---|
+| G = 4 | **189.89** | **−7.5 %** (205.25) | 29.5 / 30.5 / 28.2 | prune 47.03 (bucket2 138.1) |
+| G = 2 | **237.33** | **−5.8 %** (251.87) | 29.8 / 29.6 / 29.8 | prune 43.97 (bucket2 189.8) |
+
+Prune −14 s (G = 2) / −17.5 s (G = 4): G = 4 prune is no longer slower than G = 2. Recall@10 G = 2 0.7243 / 0.8319 / 0.9100, G = 4
+0.7254 / 0.8339 / 0.9105 (within gates). Peak RSS unchanged (92.4 / 95.6 GB). Single-GPU guard ACCEPT. best_scale.json: G = 2 237.33,
+G = 4 189.89. msTuring100M G = 2 ×1: **490.03 s** (−12.7 % vs 561.61; bucket2 321.7, prune 149.0 — d2h+sink 21–25 → 12.5–15.8 s, load
+still 109–120 s from the page-cache eviction, see Awaiting approval), recall@10 0.6103 / 0.7168 / 0.8058; judge fails only on the
+pre-existing bucket2 peak RSS (141.1 vs 1.2 × 103.6 GB, same as the S29 HEAD milestone) → msTuring best not updated.
+
+| speedup vs 1 GPU (429.56 s) | Step 4 | Step 6 | Wait | prune | optimize | total |
+|---|---|---|---|---|---|---|
+| G = 2 (S32) | — | — | — | 1.87× | 2.32× | 1.81× |
+| G = 4 (S32) | — | — | — | 1.89× | 2.27× | 2.26× |
