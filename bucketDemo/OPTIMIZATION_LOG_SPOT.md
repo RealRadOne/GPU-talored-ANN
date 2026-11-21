@@ -10,17 +10,22 @@ Design: `bucketDemo/SPOT_DESIGN.md` (user decisions 2026-11-20/21). Skill: `.cla
 | P1 | Step 4 on the scheduler (SPOT_DESIGN §4.1) + `spot_det.sh sift10M {1,2,4} d1_g*` EQUAL | **done 2026-11-21** (SP1; det with denser `d2_g*`) |
 | P2 | Step 6 on the scheduler (§4.2) + det EQUAL | **done 2026-11-21** (SP2) |
 | P3 | prune on the scheduler (§4.3) + det EQUAL | **done 2026-11-21** (SP3) |
-| P4 | baseline: SIFT100M G=1/2/4 × {plain (spot off), SPOT none, SPOT t1} → `state/best_spot.json`, **Current best** | todo |
+| P4 | baseline: SIFT100M G=1/2/4 × {plain (spot off), SPOT none, SPOT t1} → `state/best_spot.json`, **Current best** | **done 2026-11-21** (SP4; no-event overhead gate fails at G=4 → first O iteration) |
 | O* | optimization iterations (Ideas backlog) | — |
 
 ## Current best
 
-(empty until P4)
+SP4 baseline (2026-11-21, `runs/spot4`, SIFT100M auto, median of 3; preempts = sum over the 3 stages and both rounds, median rep):
 
-| config | total (s) | Step 4 | Step 6 | prune | lost (rejected units) | preempts | notes |
-|---|---|---|---|---|---|---|---|
+| config | total (s) | bucket2 | Step 4 | Step 6 | prune | optimize | preempts S4/S6/prune | notes |
+|---|---|---|---|---|---|---|---|---|
+| sift100M_auto_g2_spott1 | 280.84 | 209.3 | 53.8 | 102.1 | 48.6 | 22.9 | 0 / 2 / 1 | |
+| sift100M_auto_g4_spott1 | 274.00 | 175.2 | 63.9 | 58.8 | 75.4 | 23.2 | 6 / 4 / 5 | reps 274.6 / 258.1 / 274.0 |
+| sift100M_auto_g1_spott1 | 386.77 | 316.3 | 100.9 | 162.3 | 48.6 | 22.7 | 2 / 2 / 0 | shared mode |
 
 ## Ideas backlog (O iterations, after P4)
+
+- **O12 no-event overhead (FIRST)** — SP4: `_spotnone` vs plain (bucket2 + prune) G=1 +1.1 %, G=2 +3.1 %, **G=4 +19.8 %** (prune 47.7 → 75.1 s, Step 6 52.6 → 61.5 s; G=4 none reps 218.9 / 250.2 / 252.7 bimodal). The overhead gate requires ≤ +3 %. G=2 prune log: the on-demand worker finishes its half at 31 s, steals 22k buckets from the spot worker's tail, the stolen lease cold-starts (plan 2.65 s, empty pool, 4.50 vs 4.26 × N rows loaded) and ends at 47.9 s, later than the victim would have. Combines O4 / O10 / O11: steal only when the remaining cost of the victim ≫ the thief's per-lease setup, steal from the victim's tail by *time* (EWMA rate) not by unit cost, prune: truncate a plan at `end_of(L)` instead of stopping. Even G=1 (no steals) has prune 42.0 → 47.0 s: check the spot path's `write_rows_at` (pwrite, not counted) vs the sequential writer, and the per-lease setup.
 
 - **O1 Step 4 commit granularity** — in spot mode commit sub-batches (smaller Nv for the search loop, or split one search batch into k commits) so a preemption loses ≤ ~1 s instead of a whole ~8 s batch (SIFT100M).
 - **O2 hand off at notice** — at NOTICE, give `[issued, end)` back to the pool immediately (not at Down) so another worker starts while the noticed worker drains its in-flight units.
@@ -99,4 +104,29 @@ Design: `bucketDemo/SPOT_DESIGN.md` (user decisions 2026-11-20/21). Skill: `.cla
 | 4 | d2_g4 | **EQUAL** | segments 8, steals 3, drains 3, reaped 3, preempts 8, setups 10 | 7.95 → 16.72 |
 
 **Quality (normal mode, G=2, `PRUNE_CACHE_MB=4000`, 1 rep):** spot d2: recall@10 itopk 32/64/128 = 0.8078 / 0.9075 / 0.9618 (prune preempts 2); same-setting plain reference = 0.8101 / 0.9080 / 0.9615 → spot within normal-mode noise; 0 defects. Both are below the default-path best (0.8315 / 0.9208): that gap is the chunked prune path itself vs the batched one at SIFT10M (pre-existing on main, not spot-related; noted for the main loops).
+
+### SP4 — P4: SIFT100M baseline (2026-11-21) — **done**
+
+`runs/spot4`, chain G = 2 → 4 → 1 (all four GPUs were free for G=4), each config `run_pipeline -d sift100M -m auto` (3 reps, search eval on the last rep), plain = `MGPU=G` (optimize_chunked multi-GPU), spot = `SPOT=1` (optimize_chunked `--num-gpus 1` on the on-demand device, user decision). Recorded with `JUDGE_BEST=state/best_spot.json judge.py --update --add-new` (9 keys: `sift100M_auto_g{2,4}`, `sift100M_auto` (G=1 plain), `_g{1,2,4}_spotnone`, `_g{1,2,4}_spott1`).
+
+| G | config | total (s) (reps) | bucket2 | Step 4 | Step 6 | prune | optimize | bucket2 + prune | recall@10 itopk 32/64/128 | defects |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 2 | plain | 252.23 (250.2 / 252.2 / 252.6) | 191.9 | 53.9 | 83.7 | 42.7 | 17.6 | 234.6 | 0.7265 / 0.8336 / 0.9110 | 0 |
+| 2 | spot none | 264.24 (262.4 / 264.2 / 270.7) | 192.8 | 53.6 | 85.8 | 49.1 | 22.9 | 241.9 (**+3.1 %**) | 0.7275 / 0.8355 / 0.9112 | 0 |
+| 2 | spot t1 | 280.84 (282.7 / 280.8 / 279.4) | 209.3 | 53.8 | 102.1 | 48.6 | 22.9 | 257.9 (+9.9 %) | 0.7275 / 0.8340 / 0.9110 | 0 |
+| 4 | plain | 205.56 (203.4 / 206.3 / 205.6) | 141.6 | 33.7 | 52.6 | 47.7 | 16.1 | 189.3 | 0.7278 / 0.8335 / 0.9116 | 0 |
+| 4 | spot none | 250.15 (218.9 / 250.2 / 252.7) | 151.7 | 34.2 | 61.5 | 75.1 | 22.6 | 226.8 (**+19.8 %**) | 0.7256 / 0.8330 / 0.9110 | 0 |
+| 4 | spot t1 | 274.00 (274.6 / 258.1 / 274.0) | 175.2 | 63.9 | 58.8 | 75.4 | 23.2 | 250.6 (+32.4 %) | 0.7248 / 0.8315 / 0.9106 | 0 |
+| 1 | plain | 370.03 (370.0 / 371.1 / 368.3) | 305.4 | 93.2 | 158.7 | 42.0 | 23.7 | 347.4 | 0.7248 / 0.8319 / 0.9105 | 0 |
+| 1 | spot none | 374.43 (374.4 / 377.4 / 371.0) | 304.1 | 94.0 | 158.3 | 47.0 | 22.3 | 351.1 (+1.1 %) | 0.7274 / 0.8344 / 0.9106 | 0 |
+| 1 | spot t1 | 386.77 (386.8 / 395.8 / 386.0) | 316.3 | 100.9 | 162.3 | 48.6 | 22.7 | 364.9 (+5.0 %) | 0.7242 / 0.8319 / 0.9097 | 0 |
+
+**Overhead gate** (`_spotnone` ≤ plain + 3 %). The gate is applied to **bucket2 + prune** (the spot stages), not the total: in spot mode optimize_chunked deliberately runs on 1 GPU (user decision) while plain uses G (+5–6 s at G=2/4). G=1 passes (+1.1 %), G=2 is borderline (+3.1 %), **G=4 fails (+19.8 %)** → O12 is the first O iteration. Search quality is unchanged everywhere (spot vs plain within normal-mode noise, 0 defects).
+
+**`[spot]` per rep under t1** (steals / drains / reaped / preempts / setups):
+- G=2: step4 0/0/0/0/4 every rep; step6 3/2/1/2/5, 4/1/1/2/5, 3/1/0/1/5; prune 0/1/0/1/3, 2/1/0/1/3, 0/1/0/1/3.
+- G=4: step4 1/1/0/6/12, 23/1/0/6/13, 22/1/1/6/13; step6 13/3/0/5/10, 3/3/1/4/9, 3/3/0/4/9; prune 13/3/0/5/7, 3/3/0/4/7, 10/4/0/5/7. Step-4 rejected_units 54–84 M per rep are the O9 over-count (a rejected commit is counted from the new owner's cursor).
+- G=1: step4 0/2/1/2/6, 1/1/1/2/6, 0/2/1/2/6; step6 0/1/1/2/4, 0/3/3/3/5, 1/1/0/2/4; prune never preempted under t1 (sparse trace, ~4 trace hours per build).
+
+**Slowdown under t1 vs spot none:** G=2 +6.3 % total (Step 6 +16 s: 2 preemptions / round of the spot device), G=4 +9.5 % (Step 4 +30 s: the 8 s search batches lost at each preemption + reaps → O1), G=1 +3.3 %.
 
