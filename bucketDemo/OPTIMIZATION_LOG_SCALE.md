@@ -107,6 +107,7 @@ outputs must stay byte-identical to today's.**
 - **S13 — approved 2026-11-19, tried, rejected (see Tried & rejected).**
 ## Tried & rejected
 
+- **S22 (2026-11-20) — prune multi-GPU position cut by cost** (rows + 390·positions, env `BUCKET2_PRUNE_CUT_ROWS_PER_POS`) instead of rows only. SIFT100M G = 2 ×3 254.78 s (+1.2 % vs 251.87), G = 4 ×3 211.24 s (−1.2 % vs 213.84) → REJECT (< 3 %). Same-period row-cut refs (×1): prune G = 2 46.19 vs 41.97 s, G = 4 47.65 vs 48.58 s. Per-GPU plan+load at G = 4 balanced better (6.5 / 10.0 / 11.5 / 15.2 s vs ref 6.3 / 7.3 / 12.7 / 17.0) but the first GPUs then get more rows and their d2h+sink grows (ref 15.0–20.3 → 20.4–23.1 s): prune per GPU is bound by d2h+sink (write), plan+load is pipelined behind it. Not a compute gain (G = 4 prune not lower). Guard ACCEPT, recall unchanged. Patch `bucketDemo/patches/scale22_prune_cost_cut.patch`. Lesson: next prune work must cut the sink/write per GPU, not plan+load.
 - **S19 — accepted (see Iterations), was pending:** det 2 EQUAL (plain + forced S18 path), guard ACCEPT; the SIFT100M
   part did not start: `/` 198 GB < 200 GB before the same-period ref (chain order: ref first, then G = 2 ×3). Patch
   `bucketDemo/patches/scale19_s17_s18_combined.patch`; resume (`runs/scale19/chain.sh` minus the done parts) when disk ≥ 200 GB.
