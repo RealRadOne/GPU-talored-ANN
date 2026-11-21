@@ -52,7 +52,7 @@ Item names below are backlog labels, not iteration numbers (iterations are logge
   serial prefix over N; reduce on GPU (peer add into GPU 0, or per-GPU dst-range counts) + parallel prefix.
 - **S14 — analysed (S12 entry): shared host link, not fixable at G = 2.** ~~GPU 0 H2D 2× slower than GPU 1 in optimize count / fill~~ (same bytes; NUMA placement of `h_fwd_all` pages read by
   `parallel_pread_file`, or PCIe topology). Check `numactl`/`move_pages` of the first half; interleave or bind the pread threads.
-- **S21 — done as S27 (2026-11-21).** ~~bring the in-memory fast paths under one host budget.** Inventory (2026-11-21): bucket2 already gates
+- **S21 — done as S27 (2026-11-21).** Was: bring the in-memory fast paths under one host budget.** Inventory (2026-11-21): bucket2 already gates
   each fast path on its own cap (dataset_env.py: CACHE_MB, BUCKET_MEM_MB, ARRIVAL_MEM_MB each ≤ HOST_BUDGET_MB / 4 = 50 GB at the 200 GB
   default; `host_raw_budget` = bucket_mem_mb gates ooc `raw_host` (N·D·2) and Step 4.5 `keep_blob` / `r1_blob`), but the caps are
   independent and r1_blob + BucketVectorAccumulator memory mode + kept round-1 arrivals + round-2 arrivals + Step 6 host cache can be
