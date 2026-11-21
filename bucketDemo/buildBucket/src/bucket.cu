@@ -1769,15 +1769,22 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
     }
     struct S4Stat { double setup = 0, read = 0, cu = 0, search = 0, dl = 0, wall = 0; int64_t Nv = 0, n = 0; };
     std::vector<S4Stat> s4st(static_cast<size_t>(G4));
-    auto top2_worker = [&](const int wi, const int64_t nc_begin, const int64_t nc_end,
-                           CentroidT* d_centroids, uint32_t* d_graph, const size_t Mbatch_bytes) {
+    // spot (SPOT_DESIGN §4.1): S != nullptr → 这次调用 = 一个实例代 (epoch)。[nc_begin, nc_end) 是第一个租约
+    // (*L0) 的范围上界 (nc_begin = L0->begin)，批循环每批前 may_start、批完成后 commit；租约做完 / 停下后 (*next)(L)
+    // 换下一个租约，false → teardown 返回。S == nullptr: 原来的静态区间 [nc_begin, nc_end)。
+    auto top2_worker = [&](const int wi, int64_t nc_begin, int64_t nc_end,
+                           CentroidT* d_centroids, uint32_t* d_graph, const size_t Mbatch_bytes,
+                           spot::SegmentScheduler* S = nullptr, spot::Lease* L0 = nullptr,
+                           const std::function<bool(spot::Lease&)>* next = nullptr) {
     const auto w_t0 = Clock::now();
     double t_setup = 0, t_read = 0, t_convert_upload = 0, t_search = 0, t_download = 0;
     // 这张卡的批大小 (显存按本卡算；只影响搜索分批，不影响 4d 的批次)
     int64_t Nv = 1;
     {
         const size_t rem = (Mbatch_bytes > constant_gpu) ? (Mbatch_bytes - constant_gpu) : 0;
-        Nv = std::max<int64_t>(1, std::min<int64_t>(static_cast<int64_t>(rem / per_point_bytes), std::max<int64_t>(1, nc_end - nc_begin)));
+        // spot: 租约会变 (偷 / 换段)，批大小按整个 stage 的行数封顶 (G=1 时跟原来相同)
+        const int64_t span = S ? N_nc : nc_end - nc_begin;
+        Nv = std::max<int64_t>(1, std::min<int64_t>(static_cast<int64_t>(rem / per_point_bytes), std::max<int64_t>(1, span)));
     }
     if (nc_end <= nc_begin) return;
     // ================================================================
@@ -2003,12 +2010,21 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
     // 每个点的 top-2 与分批无关。BUCKET2_STEP4_PF_DIV=1 关掉。参考 TAGORE large_index.cu 的 GPU–CPU–disk 流水线。
     const int64_t pf_div = std::max<int64_t>(1, std::getenv("BUCKET2_STEP4_PF_DIV")
                                                   ? std::atoll(std::getenv("BUCKET2_STEP4_PF_DIV")) : 4);
+    const int64_t batch_len = prefetch_io ? std::max<int64_t>(1, (Nv + pf_div - 1) / pf_div) : Nv;
     auto batch_end_of = [&](int64_t bs) {
-        const int64_t len = prefetch_io ? std::max<int64_t>(1, (Nv + pf_div - 1) / pf_div) : Nv;
-        return std::min(bs + len, nc_end);
+        return std::min(bs + batch_len, nc_end);
     };
-    auto start_io = [&](int64_t bs, int slot) {
-        const int64_t be = batch_end_of(bs);
+    // 领下一批 [bs, be): 返回 be，没有下一批 (区间做完 / spot: 段被偷到这里、实例被抢占、通知期来不及) → -1
+    spot::Lease* Lc = L0;
+    auto claim = [&](int64_t bs) -> int64_t {
+        if (!S) return bs < nc_end ? batch_end_of(bs) : -1;
+        const int64_t e = std::min<int64_t>(S->end_of(*Lc), N_nc);
+        if (bs >= e) return -1;
+        const int64_t be = std::min(bs + batch_len, e);
+        return S->may_start(*Lc, bs, be) ? be : -1;
+    };
+    auto start_io = [&](int64_t bs, int64_t be, int slot) {
+        if (bs < 0 || be > N_nc || bs >= be) throw std::runtime_error("batch_assign: prefetch batch out of bounds");
         const int64_t lo = non_centroid_indices[bs], hi = non_centroid_indices[be - 1];
         T* dst = d_raw_pf[slot];
         int io_dev = 0;
@@ -2024,22 +2040,42 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
     };
     if (prefetch_io) {
         size_t max_raw = 0;   // 所有批里最长的 [lo, hi] 区间 (元素)
-        for (int64_t bs = nc_begin; bs < nc_end; ) {
-            const int64_t be = batch_end_of(bs);
-            const int64_t lo = non_centroid_indices[bs], hi = non_centroid_indices[be - 1];
-            bs = be;
-            if (lo < 0 || hi >= N || lo > hi)   // bounds check
-                throw std::runtime_error("batch_assign: prefetch range out of bounds");
-            max_raw = std::max(max_raw, static_cast<size_t>(hi - lo + 1) * D);
+        if (!S) {
+            for (int64_t bs = nc_begin; bs < nc_end; ) {
+                const int64_t be = batch_end_of(bs);
+                const int64_t lo = non_centroid_indices[bs], hi = non_centroid_indices[be - 1];
+                bs = be;
+                if (lo < 0 || hi >= N || lo > hi)   // bounds check
+                    throw std::runtime_error("batch_assign: prefetch range out of bounds");
+                max_raw = std::max(max_raw, static_cast<size_t>(hi - lo + 1) * D);
+            }
+        } else {
+            // spot: 批可以从任意行开始 (租约起点任意) → 取任意 batch_len 行窗口的最长区间 (行号递增，窗口取满时最长)
+            int64_t mx = 0;
+            #pragma omp parallel for schedule(static) reduction(max:mx)
+            for (int64_t bs = 0; bs < N_nc; ++bs) {
+                const int64_t be = std::min(bs + batch_len, N_nc);
+                const int64_t lo = non_centroid_indices[bs], hi = non_centroid_indices[be - 1];
+                mx = std::max(mx, (lo < 0 || hi >= N || lo > hi) ? INT64_MAX / 2 : hi - lo + 1);
+            }
+            if (mx > N) throw std::runtime_error("batch_assign: prefetch range out of bounds");
+            max_raw = static_cast<size_t>(mx) * D;
         }
         for (auto& b : d_raw_pf) CUDA_CHECK(cudaMalloc(&b, max_raw * sizeof(T)));
         d_raw_cap = max_raw;
         CUDA_CHECK(cudaMalloc(&d_local_rows, Nv * sizeof(int32_t)));
         CUDA_CHECK(cudaStreamCreateWithFlags(&copy_stream, cudaStreamNonBlocking));
     }
-    for (int64_t batch_start = nc_begin, batch_end = 0; batch_start < nc_end; batch_start = batch_end) {
-        batch_end = batch_end_of(batch_start);
+    int64_t n_done = 0;   // 这个 worker 提交的行数
+    for (;;) {   // 每个租约一次 (spot 关闭: 只有一次)
+    if (S) { nc_begin = Lc->begin; nc_end = N_nc; }
+    int64_t next_be = claim(nc_begin);
+    for (int64_t batch_start = nc_begin, batch_end = 0; next_be > 0; batch_start = batch_end) {
+        batch_end = next_be;
+        next_be = -1;
         int64_t batch_size = batch_end - batch_start;
+        if (batch_start < 0 || batch_end > N_nc || batch_size <= 0)   // bounds check
+            throw std::runtime_error("batch_assign: batch out of bounds");
 
         // ---- 4a: 读取 batch 数据 (一次连续区间读)，转换为 CentroidT，上传到 GPU ----
         // non_centroid_indices 在这个 batch 内基本连续 (只跳过零星的 centroid
@@ -2056,11 +2092,12 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
                 throw std::runtime_error("batch_assign: host_raw range out of bounds");
             raw_ptr = host_raw + static_cast<size_t>(batch_lo) * D;
         } else if (prefetch_io) {
-            if (!io_next.valid()) start_io(batch_start, pf_slot);   // 第一批
+            if (!io_next.valid()) start_io(batch_start, batch_end, pf_slot);   // 第一批
             io_next.get();   // 本批已在 d_raw_pf[pf_slot] (读 + H2D 的等待时间算在 read 里)
             d_raw_range = d_raw_pf[pf_slot];
             pf_slot ^= 1;    // 另一个 buffer 上一批的 gather 已同步完成
-            if (batch_end < nc_end) start_io(batch_end, pf_slot);
+            next_be = claim(batch_end);   // 预读之前先领下一批 (spot: 领到才读)
+            if (next_be > 0) start_io(batch_end, next_be, pf_slot);
         } else {
             int32_t N_tmp, D_tmp;
             load::read_bigann_raw_range<T>(input_path, batch_lo, batch_hi - batch_lo + 1,
@@ -2409,16 +2446,25 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
         t_download += std::chrono::duration<double>(tb4 - tb3).count();
 
         // ---- 4d 之前: 本批 top-2 (+ 距离) 写进全局数组 (4d 在所有卡算完后按单卡批次做) ----
-        std::memcpy(h_top2_all.data() + static_cast<size_t>(batch_start) * TOP_K, h_top2.data(),
-                    static_cast<size_t>(batch_size) * TOP_K * sizeof(uint32_t));
-        if (rule_dj)
-            std::memcpy(h_top2_d_all.data() + static_cast<size_t>(batch_start) * TOP_K, h_top2_d.data(),
-                        static_cast<size_t>(batch_size) * TOP_K * sizeof(float));
-        if (((batch_start - nc_begin) / Nv) % 10 == 0 || batch_end == nc_end) {
+        auto write_back = [&] {
+            std::memcpy(h_top2_all.data() + static_cast<size_t>(batch_start) * TOP_K, h_top2.data(),
+                        static_cast<size_t>(batch_size) * TOP_K * sizeof(uint32_t));
+            if (rule_dj)
+                std::memcpy(h_top2_d_all.data() + static_cast<size_t>(batch_start) * TOP_K, h_top2_d.data(),
+                            static_cast<size_t>(batch_size) * TOP_K * sizeof(float));
+        };
+        if (!S) { write_back(); n_done += batch_size; }
+        else if (S->commit(*Lc, batch_end, write_back)) n_done += batch_size;   // false: 被拒收 (过了抢占时刻 / 不再是 owner)
+        if (!S && (((batch_start - nc_begin) / Nv) % 10 == 0 || batch_end == nc_end)) {
             std::cout << "[BatchAssign" << (G4 > 1 ? " gpu" + std::to_string(wi) : std::string()) << "] "
                       << batch_end - nc_begin << "/" << nc_end - nc_begin << "\n";
         }
+        if (!S) next_be = (prefetch_io ? next_be : claim(batch_end));
+        else if (!prefetch_io) next_be = claim(batch_end);
     }
+    if (prefetch_io && io_next.valid()) io_next.get();   // 不应发生 (只预读领到的批)；保险
+    if (!S || !(*next)(*Lc)) break;
+    }   // 租约循环
 
     // ================================================================
     // Step 6: 释放 per-batch GPU buffer（centroid 和 graph 保留）
@@ -2451,12 +2497,15 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
     if (d_local_rows) CUDA_CHECK(cudaFree(d_local_rows));
     // NOTE: d_centroids 和 d_graph 由 caller 管理，本函数不释放
     auto& stw = s4st[static_cast<size_t>(wi)];
-    stw.setup = t_setup; stw.read = t_read; stw.cu = t_convert_upload; stw.search = t_search; stw.dl = t_download;
-    stw.Nv = Nv; stw.n = nc_end - nc_begin;
-    stw.wall = std::chrono::duration<double>(Clock::now() - w_t0).count();
+    // spot: 一个 worker 多个实例代 → 累加
+    stw.setup += t_setup; stw.read += t_read; stw.cu += t_convert_upload; stw.search += t_search; stw.dl += t_download;
+    stw.Nv = Nv; stw.n += n_done;
+    stw.wall += std::chrono::duration<double>(Clock::now() - w_t0).count();
+    if (S) S->note_setup(wi, t_setup);
     };   // top2_worker
 
-    if (G4 == 1) {
+    const bool spot4 = spot::Client::get().enabled() && !is_pq && !gpu_query_loader;
+    if (G4 == 1 && !spot4) {
         top2_worker(0, 0, N_nc, d_centroids, d_graph, Mbatch_bytes);
     } else {
         // centroid / 图复制到其他卡 (peer copy)；每张卡的批显存按它自己的空闲显存算
@@ -2479,7 +2528,49 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
         CUDA_CHECK(cudaSetDevice(dev0));
         std::vector<std::thread> th;
         std::vector<std::exception_ptr> exc(static_cast<size_t>(G4));
-        for (int g = 0; g < G4; ++g) {
+        if (spot4) {
+            // ---- spot (SPOT_DESIGN §4.1): 单元 = non-centroid 行；初始切分 = 原来的 N_nc*g/G4，每段预留给该设备的
+            // spot worker (dedicated: 设备 0 = on-demand worker)。每个 worker 线程按实例代调 top2_worker；
+            // 同一张卡上的 worker (shared 模式的救场 worker) 用设备锁串行 (不能同时占显存)。
+            bool shared = false;
+            auto ws = spot::make_workers(G4, &shared);
+            std::vector<int64_t> cuts{0};
+            std::vector<int> owners;
+            for (int g = 0; g < G4; ++g) {
+                cuts.push_back(N_nc * (g + 1) / G4);
+                int o = -1;
+                for (size_t w = 0; w < ws.size(); ++w)
+                    if (ws[w].device == g && (o < 0 || (ws[static_cast<size_t>(o)].ondemand && !ws[w].ondemand))) o = static_cast<int>(w);
+                owners.push_back(o);
+            }
+            spot::SegmentScheduler S("step4", N_nc, ws, cuts, owners, spot::options_from_env(shared));
+            s4st.assign(ws.size(), S4Stat{});
+            std::vector<std::mutex> dev_m(static_cast<size_t>(G4));
+            exc.assign(ws.size(), nullptr);
+            for (size_t w = 0; w < ws.size(); ++w) {
+                th.emplace_back([&, w] {
+                    const int g = ws[w].device;
+                    try {
+                        if (g < 0 || g >= G4) throw std::runtime_error("spot step4: bad worker device");
+                        CUDA_CHECK(cudaSetDevice(g == 0 ? dev0 : g));
+                        S.run_worker_epochs(static_cast<int>(w), [&](spot::Lease& L, const std::function<bool(spot::Lease&)>& next) {
+                            std::lock_guard<std::mutex> dl(dev_m[static_cast<size_t>(g)]);
+                            top2_worker(static_cast<int>(w), L.begin, N_nc, dc[static_cast<size_t>(g)], dg[static_cast<size_t>(g)],
+                                        mb[static_cast<size_t>(g)], &S, &L, &next);
+                            CUDA_CHECK(cudaDeviceSynchronize());
+                        });
+                    } catch (...) { exc[w] = std::current_exception(); }
+                });
+            }
+            for (auto& t : th) t.join();
+            th.clear();
+            S.print_stats(std::cout);
+            std::string why;
+            bool exc_any = false;
+            for (auto& e : exc) if (e) exc_any = true;
+            if (!exc_any && !S.verify_complete(&why)) throw std::runtime_error("spot step4: incomplete: " + why);
+        }
+        for (int g = 0; g < G4 && !spot4; ++g) {
             const int64_t b = N_nc * g / G4, e = N_nc * (g + 1) / G4;
             th.emplace_back([&, g, b, e] {
                 try {
@@ -2508,9 +2599,9 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
         t_convert_upload = std::max(t_convert_upload, w.cu); t_search = std::max(t_search, w.search);
         t_download = std::max(t_download, w.dl);
     }
-    if (G4 > 1)
-        for (int g = 0; g < G4; ++g) {
-            const auto& w = s4st[static_cast<size_t>(g)];
+    if (G4 > 1 || spot4)
+        for (size_t g = 0; g < s4st.size(); ++g) {
+            const auto& w = s4st[g];
             std::cout << "  [Step4 gpu" << g << "] points=" << w.n << " Nv=" << w.Nv << std::fixed << std::setprecision(3)
                       << " setup=" << w.setup << "s read=" << w.read << "s convert_upload=" << w.cu
                       << "s search=" << w.search << "s download=" << w.dl << "s wall=" << w.wall << "s\n";

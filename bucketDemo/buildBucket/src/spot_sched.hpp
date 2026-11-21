@@ -322,7 +322,8 @@ public:
     }
 
     // 领一段。Got: L 有效，从 L.begin 开始做；Done: 整个 stage 做完；Lost: 实例不可用 (被抢占 / 通知期)
-    Acq acquire(int w, Lease& L) {
+    // block=false: 只试一次 (救场 worker 用: 没活就结束这一代、释放显存)，没分到 → Lost
+    Acq acquire(int w, Lease& L, bool block = true) {
         const bool od = workers_[static_cast<size_t>(w)].ondemand;
         bool counted_wait = false;
         for (;;) {
@@ -338,6 +339,7 @@ public:
                     ++wst_[static_cast<size_t>(w)].leases;
                     return Acq::Got;
                 }
+                if (!block) { if (counted_wait) --waiting_spot_; return Acq::Lost; }
             }
             cl_.wait_change(g, 0.02);
         }
@@ -352,6 +354,7 @@ public:
         if (s.owner != L.worker || s.token != L.token) return false;
         if (u0 >= s.end || u1 > s.end || u1 <= u0) return false;
         if (v.state == kDown) return false;
+        if (rescue_should_yield(L.worker)) return false;   // shared 模式: spot 实例回来了 → 救场 worker 让出
         if (v.state == kNotice) {
             const double per = s.ewma_unit_s > 0 ? s.ewma_unit_s : 0.0;
             const double est = per * static_cast<double>((std::max<int64_t>(s.issued, u0) - s.cursor) + (u1 - u0));
@@ -462,6 +465,59 @@ public:
         }
     }
 
+    // ---- 按实例代 (epoch) 的 worker 循环 (setup / 处理 / teardown 写在一个函数里的阶段用，例如 Step 4) ----
+    // 每一代: 等实例 Up → 领到第一段 → body(L, next)。body 里: (懒) setup，调 note_setup；处理 L (may_start /
+    // commit)；然后 next(L): 释放当前租约、领下一段 (true，L 换成新租约) 或者这一代结束 (false: 被抢占 / stage 做完 /
+    // 救场 worker 没活了)；false 之后 body teardown 并返回。body 没调到 false 就返回 (异常以外不应发生) → 这里释放。
+    template <class Body>
+    void run_worker_epochs(int w, Body&& body) {
+        auto& ws = wst_[static_cast<size_t>(w)];
+        const bool rescue = workers_[static_cast<size_t>(w)].ondemand && !opt_.ondemand_participates && cl_.enabled();
+        uint64_t last = UINT64_MAX, ep = 0;
+        while (wait_worker_up(w, last, &ep)) {
+            Lease L;
+            Acq a = acquire(w, L);
+            if (a == Acq::Done) break;
+            if (a == Acq::Lost) { last = ep; ws.preempts.fetch_add(1); continue; }
+            bool active = true, done = false, was_lost = false;
+            int64_t c0 = cursor_of(L);
+            Lease* cur = &L;
+            std::function<bool(Lease&)> next = [&](Lease& X) -> bool {
+                cur = &X;
+                const int64_t c1 = cursor_of(X);
+                release(X);
+                active = false;
+                if (lost(w, ep)) {
+                    if (opt_.verbose)
+                        log_line("worker " + std::to_string(w) + " (dev " + std::to_string(workers_[static_cast<size_t>(w)].device) +
+                                 ") preempted; this lease committed [" + std::to_string(c0) + "," + std::to_string(c1) + ")");
+                    was_lost = true;
+                    return false;
+                }
+                const Acq b = acquire(w, X, !rescue);
+                if (b == Acq::Got) { active = true; c0 = cursor_of(X); return true; }
+                if (b == Acq::Done) done = true;
+                else if (!rescue) was_lost = true;
+                return false;
+            };
+            try {
+                body(L, next);
+            } catch (...) {
+                if (active) release(*cur);   // 别让其他 worker 永远等这一段
+                throw;
+            }
+            if (active) release(*cur);
+            if (done) break;
+            if (was_lost) { last = ep; ws.preempts.fetch_add(1); }
+            else last = UINT64_MAX;   // 救场 worker 让出 (不是抢占): 下次任意 epoch
+        }
+    }
+    void note_setup(int w, double seconds) {
+        auto& ws = wst_[static_cast<size_t>(w)];
+        ws.setups.fetch_add(1);
+        ws.setup_ns.fetch_add(static_cast<int64_t>(seconds * 1e9));
+    }
+
     void print_stats(std::ostream& os) const {
         std::lock_guard<std::mutex> lk(gm_);
         const double wall = ns2s(now_ns() - t0_);
@@ -521,6 +577,14 @@ private:
         std::atomic<int64_t> units{0}, commits{0}, leases{0}, rejected_commits{0}, rejected_units{0};
         std::atomic<int64_t> setups{0}, setup_ns{0}, preempts{0};
     };
+
+    // shared 模式的救场 worker: 有 spot 实例 Up 就停止开新单元 (它跟 spot 实例同卡，不能同时占显存)
+    bool rescue_should_yield(int w) const {
+        if (!workers_[static_cast<size_t>(w)].ondemand || opt_.ondemand_participates || !cl_.enabled()) return false;
+        for (size_t i = 0; i < workers_.size(); ++i)
+            if (!workers_[i].ondemand && worker_up(static_cast<int>(i))) return true;
+        return false;
+    }
 
     int64_t cursor_of(const Lease& L) const {
         const Seg& s = seg(static_cast<size_t>(L.seg));

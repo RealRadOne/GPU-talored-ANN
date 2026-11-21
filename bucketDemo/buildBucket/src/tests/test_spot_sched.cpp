@@ -42,7 +42,7 @@ static void proc_units(SegmentScheduler& S, const Lease& L, Sim& sim, int maxb, 
 }
 
 static void run_case(const char* name, int G, bool spot_on, const char* mode, int64_t n, bool pipelined, int events,
-                     bool hard_only = false) {
+                     bool hard_only = false, bool epochs = false) {
     std::cout << "=== " << name << " ===\n";
     Client& cl = Client::get();
     if (spot_on) cl.test_enable(G);
@@ -98,7 +98,28 @@ static void run_case(const char* name, int G, bool spot_on, const char* mode, in
     }
     std::vector<std::thread> th;
     std::atomic<int> setups{0}, teardowns{0};
-    for (size_t w = 0; w < ws.size(); ++w) {
+    // epochs: run_worker_epochs (Step 4 风格) + 每设备一把 epoch 锁 (同卡的 worker 不能同时持有资源)
+    std::vector<std::mutex> dev_m(static_cast<size_t>(G));
+    std::vector<std::atomic<int>> dev_active(static_cast<size_t>(G));
+    for (auto& a : dev_active) a = 0;
+    std::atomic<int> dev_overlap{0};
+    for (size_t w = 0; w < ws.size() && epochs; ++w) {
+        th.emplace_back([&, w] {
+            std::mt19937 rng(static_cast<unsigned>(w * 7919 + 1));
+            const int d = ws[w].device;
+            S.run_worker_epochs(static_cast<int>(w), [&](Lease& L, const std::function<bool(Lease&)>& next) {
+                std::lock_guard<std::mutex> dl(dev_m[static_cast<size_t>(d)]);
+                if (dev_active[static_cast<size_t>(d)].fetch_add(1) != 0) dev_overlap++;
+                setups++;
+                S.note_setup(static_cast<int>(w), 0.002);
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                do { proc_units(S, L, sim, 16, 20, pipelined, rng); } while (next(L));
+                dev_active[static_cast<size_t>(d)].fetch_sub(1);
+                teardowns++;
+            });
+        });
+    }
+    for (size_t w = 0; w < ws.size() && !epochs; ++w) {
         th.emplace_back([&, w] {
             std::mt19937 rng(static_cast<unsigned>(w * 7919 + 1));
             S.run_worker(static_cast<int>(w),
@@ -117,6 +138,7 @@ static void run_case(const char* name, int G, bool spot_on, const char* mode, in
     CHECK(S.verify_complete(&why), name << ": verify_complete: " << why);
     CHECK(bad == 0, name << ": units committed != 1: missing=" << zero << " duplicated=" << dup);
     CHECK(setups == teardowns, name << ": setup/teardown mismatch");
+    CHECK(dev_overlap == 0, name << ": two workers held the same device at once");
     S.print_stats(std::cout);
 }
 
@@ -133,6 +155,9 @@ int main() {
     run_case("shared_g1", 1, true, nullptr, 20000, true, 6);
     // 6) shared G = 4, 只有硬抢占
     run_case("shared_g4_hard", 4, true, "shared", 40000, true, 10, true);
+    // 8-10) run_worker_epochs (Step 4 风格)
+    run_case("epochs_dedicated_g4", 4, true, nullptr, 40000, true, 12, false, true);
+    run_case("epochs_shared_g1", 1, true, nullptr, 20000, true, 8, false, true);
     // 7) n = 0
     run_case("empty", 2, true, nullptr, 0, false, 0);
     if (g_fail) { std::cerr << g_fail << " check(s) failed\n"; return 1; }
