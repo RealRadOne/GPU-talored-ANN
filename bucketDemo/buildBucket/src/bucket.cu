@@ -7197,7 +7197,10 @@ void build_vector_knn_with_tensorcore(
     const float* seed_kth = nullptr,   // (N,) 上一轮 merge 后每点 running 第 M 个距离 (#62)
     // 多 GPU: 只处理处理顺序里的 [pos_begin, pos_end) 段 (调用方每张卡一段，已 cudaSetDevice)；默认整段
     int32_t pos_begin = 0, int32_t pos_end = -1,
-    int acc_lane = 0)   // 多 GPU: 写 arrival 用的 lane (= 卡号；调用方先 acc.set_lanes(G))
+    int acc_lane = 0,   // 多 GPU: 写 arrival 用的 lane (= 卡号；调用方先 acc.set_lanes(G))
+    // spot (SPOT_DESIGN §4.2): 这次调用 = 一个租约 [pos_begin, pos_end)；每个位置前 may_start (段被偷 / 抢占 →
+    // 停止发新桶，排空后返回)，scatter 线程按位置的连续前缀 commit (append 进 lane)，被拒收的桶丢弃
+    spot::SegmentScheduler* spot_S = nullptr, const spot::Lease* spot_L = nullptr)
 {
     auto func_t0 = std::chrono::high_resolution_clock::now();
     constexpr bool want_distances = true;  // 合并去重总是需要距离
@@ -7610,6 +7613,7 @@ void build_vector_knn_with_tensorcore(
         int     bucket_size = 0;
         int     actual_M    = 0;
         bool    fused_out   = false; // dists 紧跟在 h_out 的 ids 后面 (block top-M 路径)
+        int32_t pos         = -1;    // 这个桶在本次调用里的位置 (spot 提交用)
     };
     Pending pending[MAX_SLOTS]{};   // 全部默认初始化为 {-1, 0, 0}
 
@@ -7652,6 +7656,7 @@ void build_vector_knn_with_tensorcore(
     // 只按入队顺序 (seq) 把编码好的记录追加进 chunk 写缓冲 + flush，跟单线程时写出的字节完全一样。
     struct ScatterJob {
         int bs = 0, aM = 0;
+        int32_t pos = -1;               // 本次调用里的位置 (spot 提交用)
         uint64_t seq = 0;
         std::vector<int32_t> gid, nb;
         std::vector<float>   d;
@@ -7686,6 +7691,49 @@ void build_vector_knn_with_tensorcore(
         if (!scatter_exc) scatter_exc = std::current_exception();
         scatter_queue.clear();
         scatter_encoded.clear();
+    };
+    // ---- spot 提交 (只在 spot_S 时用): scatter 的顺序不一定是位置顺序 (slot 轮转 + 空桶跳过 + 尾部按 slot 号)，
+    // 所以按位置攒住编码好的 job，位置连续前缀完成时一次 commit(L, pos_begin + p, append 这些 job)。
+    // 主线程对每个位置先 may_start，确定它有没有 job (空桶 / actual_M <= 0 没有) 后写 spot_has_job[p]，
+    // 再发布 spot_resolved = p + 1 (release)；只有 resolved 的位置才能算完成。
+    std::vector<uint8_t> spot_has_job(spot_S ? static_cast<size_t>(n_pos) : 0, 0);
+    std::atomic<int32_t> spot_resolved{0};
+    int32_t spot_next = 0;   // 第一个还没提交的位置 (scatter 线程; 收尾时主线程)
+    std::map<int32_t, std::unique_ptr<ScatterJob>> spot_held;
+    int64_t spot_rejected_buckets = 0;
+    auto spot_resolve = [&](int32_t p, bool has_job) {
+        if (!spot_S) return;
+        spot_has_job[static_cast<size_t>(p)] = has_job ? 1 : 0;
+        spot_resolved.store(p + 1, std::memory_order_release);
+    };
+    auto spot_flush = [&]() {   // scatter 线程 (或 scatter 线程退出后的主线程) 调用
+        const int32_t res = spot_resolved.load(std::memory_order_acquire);
+        int32_t p = spot_next;
+        std::vector<std::unique_ptr<ScatterJob>> batch;
+        while (p < res) {
+            if (spot_has_job[static_cast<size_t>(p)]) {
+                auto it = spot_held.find(p);
+                if (it == spot_held.end()) break;
+                batch.push_back(std::move(it->second));
+                spot_held.erase(it);
+            }
+            ++p;
+        }
+        if (p == spot_next) return;
+        const bool ok = spot_S->commit(*spot_L, static_cast<int64_t>(pos_begin) + p, [&] {
+            for (auto& job : batch) {
+                size_t beg = 0;
+                for (int i = 0; i < job->bs; ++i) {
+                    const size_t end = job->enc_end[static_cast<size_t>(i)];
+                    acc.append_encoded(job->gid[static_cast<size_t>(i)], job->enc.data() + beg, end - beg, acc_lane);
+                    beg = end;
+                }
+            }
+        });
+        if (!ok) spot_rejected_buckets += static_cast<int64_t>(batch.size());
+        spot_next = p;
+        std::lock_guard<std::mutex> lk(scatter_mtx);
+        for (auto& job : batch) if (scatter_free.size() < kScatterFreeMax) scatter_free.push_back(std::move(job));
     };
     std::vector<std::thread> enc_threads;
     for (int t = 0; t < n_enc; ++t) enc_threads.emplace_back([&]() {
@@ -7744,6 +7792,15 @@ void build_vector_knn_with_tensorcore(
                 }
                 t_scatter_wait += std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - tw0).count();
                 auto ts0 = std::chrono::high_resolution_clock::now();
+                if (spot_S) {
+                    if (job->pos < 0 || job->pos >= n_pos || spot_held.count(job->pos))   // bounds check
+                        throw std::runtime_error("build_vector_knn: spot scatter job with bad position");
+                    spot_held.emplace(job->pos, std::move(job));
+                    spot_flush();
+                    t_scatter_worker += std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - ts0).count();
+                    scatter_cv.notify_all();
+                    continue;
+                }
                 size_t beg = 0;
                 for (int i = 0; i < job->bs; ++i) {
                     const size_t end = job->enc_end[static_cast<size_t>(i)];
@@ -7791,7 +7848,7 @@ void build_vector_knn_with_tensorcore(
         }
         if (!job) job = std::make_unique<ScatterJob>();
         const size_t n_out = static_cast<size_t>(bs) * aM;
-        job->bs = bs; job->aM = aM;
+        job->bs = bs; job->aM = aM; job->pos = pending[slot].pos;
         job->gid.assign(h_ids_bucket[slot], h_ids_bucket[slot] + bs);
         job->nb.assign(h_out[slot], h_out[slot] + n_out);
         const float* hd = pending[slot].fused_out
@@ -8295,9 +8352,14 @@ void build_vector_knn_with_tensorcore(
         }
     } prod_join{prod_thread, stage_mtx, stage_cv, stage_abort};
 
+    bool spot_stopped = false;
     for (int32_t pos = 0; pos < n_pos; ++pos) {
+        if (spot_S && !spot_S->may_start(*spot_L, static_cast<int64_t>(pos_begin) + pos, static_cast<int64_t>(pos_begin) + pos + 1)) {
+            spot_stopped = true;   // 段被偷到这里 / 实例被抢占 / 通知期来不及: 不再发新桶
+            break;
+        }
         int64_t c = bucket_order_seq[pos];
-        if (bucket_count[c] == 0) continue;
+        if (bucket_count[c] == 0) { spot_resolve(pos, false); continue; }
 
         // slot 必须按遍历位置 pos 轮转 (不是按桶 id c)——c 现在是按 DiskJoin
         // 顺序跳着走的，只有 pos 才是真正连续递增的循环步数，slot 轮转要靠它
@@ -8333,6 +8395,7 @@ void build_vector_knn_with_tensorcore(
             }
             stage_cv.notify_all();
             t_wait_producer += diag_secs(dt2, diag_now());
+            spot_resolve(pos, false);
             continue;
         }
         std::memcpy(h_ids_bucket[slot], staged_ids_bucket[slot].data(),
@@ -8573,10 +8636,15 @@ void build_vector_knn_with_tensorcore(
         }
         t_submit += diag_secs(dt3, diag_now());
 
-        pending[slot] = {c, bucket_size, actual_M, fused_out};
+        pending[slot] = {c, bucket_size, actual_M, fused_out, pos};
+        spot_resolve(pos, true);
         ++processed_buckets;
     }
 
+    if (spot_stopped) {   // producer 可能在等这些位置的 slot 腾出来 → 让它退出
+        { std::lock_guard<std::mutex> lk(stage_mtx); stage_abort = true; }
+        stage_cv.notify_all();
+    }
     prod_thread.join();   // 已经全部消费完；ProducerJoin 析构时 joinable() 为 false
 
     // ---- Tail flush: 处理两 slot 上的最后未消费结果 ----
@@ -8593,6 +8661,13 @@ void build_vector_knn_with_tensorcore(
         for (auto& e : enc_threads) e.join();
         scatter_thread.join();
         if (scatter_exc) std::rethrow_exception(scatter_exc);
+        if (spot_S) {
+            spot_flush();   // 尾部的空桶 / 最后一批 (scatter 线程已退出，这里单线程)
+            if (!spot_held.empty())
+                throw std::runtime_error("build_vector_knn: spot jobs left uncommitted (" + std::to_string(spot_held.size()) + ")");
+            if (spot_rejected_buckets > 0)
+                std::cout << "  [VectorKNN] spot: " << spot_rejected_buckets << " finished buckets rejected (lane " << acc_lane << ")\n";
+        }
         std::cout << "  [VectorKNN] scatter worker: " << std::fixed << std::setprecision(3)
                   << t_scatter_worker << "s, encode " << t_scatter_encode_ns.load() / 1e9 << "s on "
                   << n_enc << " threads (tail drain "
@@ -10242,7 +10317,8 @@ int run_pipeline_impl(
             // (每卡一条写入 lane，S2；merge 结果跟记录到达顺序无关 → vector_knn 跟单卡相同)。host 缓存预算按卡数平分。
             auto run_step6 = [&](auto& reader, const std::vector<int32_t>* order_in, const float* seed) {
                 const int G6 = std::max(1, g_num_gpus);
-                if (G6 == 1) {
+                const bool spot6 = spot::Client::get().enabled();
+                if (G6 == 1 && !spot6) {
                     build_vector_knn_with_tensorcore<DataT>(
                         N, D, reader, graph_ptr, n_centroids, graph_K, neighbors_m, *knn_acc,
                         centroid_knn_graph_host.data(), K, order_window_arg, step6_cache_bytes,
@@ -10260,7 +10336,9 @@ int run_pipeline_impl(
                 }
                 const auto& ord = *order_in;
                 const int32_t npos = static_cast<int32_t>(ord.size());
-                knn_acc->set_lanes(G6);   // S2: 每张卡一条写入 lane
+                bool shared6 = false;
+                const auto ws6 = spot6 ? spot::make_workers(G6, &shared6) : std::vector<spot::WorkerSpec>{};
+                knn_acc->set_lanes(spot6 ? static_cast<int>(ws6.size()) : G6);   // S2: 每张卡一条写入 lane (spot: 每个 worker 一条)
                 // S3 (scale loop): 按估计代价切，不按点数切。桶 c 的代价 ≈ s_c × pool_c (pool = 自己 + K 个邻居桶，
                 // 跟 max_pool_size_ub 同一个上界) + 每桶固定开销 κ × 平均 s·pool。按点数切时大桶区段的卡慢得多
                 // (SIFT100M G=2 round 1: 51.4 vs 36.9 s，0.76 vs 0.28 ms/桶；S2 之后 50.2 vs 34.5 s)。κ 扫描 (G=2, round 1 / 2 的
@@ -10302,6 +10380,49 @@ int run_pipeline_impl(
                 CUDA_CHECK(cudaGetDevice(&dev0));
                 std::vector<std::thread> th;
                 std::vector<std::exception_ptr> exc(static_cast<size_t>(G6));
+                if (spot6) {
+                    // ---- spot (SPOT_DESIGN §4.2): 单元 = 处理顺序里的位置；初始切分 = 上面的代价切分 (每段预留给该设备的
+                    // spot worker; dedicated: 设备 0 = on-demand worker)，偷按 wcost 对半。每个租约调一次
+                    // build_vector_knn_with_tensorcore([L.begin, end))，同卡 worker 用设备锁串行。lane = worker 下标。
+                    std::vector<int64_t> cuts6(cut.begin(), cut.end());
+                    std::vector<int> owners6;
+                    for (int g = 0; g < G6; ++g) {
+                        int o = -1;
+                        for (size_t w = 0; w < ws6.size(); ++w)
+                            if (ws6[w].device == g && (o < 0 || (ws6[static_cast<size_t>(o)].ondemand && !ws6[w].ondemand))) o = static_cast<int>(w);
+                        owners6.push_back(o);
+                    }
+                    spot::SegmentScheduler S6("step6", npos, ws6, cuts6, owners6, spot::options_from_env(shared6), wcost);
+                    std::vector<std::mutex> dev_m(static_cast<size_t>(G6));
+                    exc.assign(ws6.size(), nullptr);
+                    for (size_t w = 0; w < ws6.size(); ++w) {
+                        th.emplace_back([&, w] {
+                            const int g = ws6[w].device;
+                            try {
+                                if (g < 0 || g >= G6) throw std::runtime_error("spot step6: bad worker device");
+                                CUDA_CHECK(cudaSetDevice(g == 0 ? dev0 : g));
+                                S6.run_worker(static_cast<int>(w), [] {}, [&](const spot::Lease& L) {
+                                    std::lock_guard<std::mutex> dl(dev_m[static_cast<size_t>(g)]);
+                                    const int64_t e = S6.end_of(L);
+                                    if (L.begin < 0 || e > npos || L.begin >= e) return;   // bounds check (段被偷空)
+                                    build_vector_knn_with_tensorcore<DataT>(
+                                        N, D, reader, graph_ptr, n_centroids, graph_K, neighbors_m, *knn_acc,
+                                        centroid_knn_graph_host.data(), K, order_window_arg, step6_cache_bytes / G6,
+                                        order_in, config.gpu_bucket_cache_mb << 20, seed,
+                                        static_cast<int32_t>(L.begin), static_cast<int32_t>(e), static_cast<int>(w), &S6, &L);
+                                    CUDA_CHECK(cudaDeviceSynchronize());
+                                }, [] {});
+                            } catch (...) { exc[w] = std::current_exception(); }
+                        });
+                    }
+                    for (auto& t : th) t.join();
+                    CUDA_CHECK(cudaSetDevice(dev0));
+                    for (auto& e : exc) if (e) std::rethrow_exception(e);
+                    S6.print_stats(std::cout);
+                    std::string why;
+                    if (!S6.verify_complete(&why)) throw std::runtime_error("spot step6: incomplete: " + why);
+                    return;
+                }
                 for (int g = 0; g < G6; ++g) {
                     th.emplace_back([&, g] {
                         try {

@@ -8,7 +8,7 @@ Design: `bucketDemo/SPOT_DESIGN.md` (user decisions 2026-11-20/21). Skill: `.cla
 |---|---|---|
 | P0 | infrastructure: `src/spot_sched.hpp` (Client + SegmentScheduler), unit test (`src/tests/test_spot_sched.cpp`, TSan clean), cross-process e2e (`src/tests/test_spot_e2e.cpp`), `spot_sim.py` (gen / run / show), run_pipeline `SPOT=1` hooks, summarize / judge `_spot<TAG>` keys, `spot_build.sh`, `spot_det.sh`, traces `t1_g{1,2,4}`, `d1_g{1,2,4}`; `Client::init()` at the top of bucket2 / prune_windowed `main()` | **done 2026-11-21** (set up interactively, see commit) |
 | P1 | Step 4 on the scheduler (SPOT_DESIGN §4.1) + `spot_det.sh sift10M {1,2,4} d1_g*` EQUAL | **done 2026-11-21** (SP1; det with denser `d2_g*`) |
-| P2 | Step 6 on the scheduler (§4.2) + det EQUAL | todo |
+| P2 | Step 6 on the scheduler (§4.2) + det EQUAL | **done 2026-11-21** (SP2) |
 | P3 | prune on the scheduler (§4.3) + det EQUAL | todo |
 | P4 | baseline: SIFT100M G=1/2/4 × {plain (spot off), SPOT none, SPOT t1} → `state/best_spot.json`, **Current best** | todo |
 | O* | optimization iterations (Ideas backlog) | — |
@@ -30,6 +30,7 @@ Design: `bucketDemo/SPOT_DESIGN.md` (user decisions 2026-11-20/21). Skill: `.cla
 - **O6 Step 6 per-lease setup** — `future_access` / Belady tables, slot buffers re-created per lease: keep them per epoch, rebuild only the future table (or incrementally) when a lease starts.
 - **O7 prune per-lease plan** — re-plan only the remaining range; keep the bucket pool across leases of the same epoch.
 - **O9 rejected-units accounting** — `commit` counts a rejected commit as `new_cursor - s.cursor`; after a reap + re-grant that is the distance from the *new* owner's cursor (SP1: G=1 rejected_units=9.98M for one ~2.5M batch). Pass the unit start `u0` to `commit` so lost work = `new_cursor - u0`. Needed before P4 / loss-cut judgements.
+- **O10 tail ping-pong** — SP2 logs: at the stage end both workers steal 3–29 positions from each other repeatedly, each Step 6 lease paying a full setup. Minimum steal size by cost (e.g. ≥ 2 × the per-lease setup time × the victim's unit rate) or no stealing below a threshold.
 - **O8 reap latency** — acquire() is the only place that reaps; reap from the Client monitor thread on Down so idle workers wake immediately.
 
 ## Awaiting approval
@@ -61,4 +62,22 @@ Design: `bucketDemo/SPOT_DESIGN.md` (user decisions 2026-11-20/21). Skill: `.cla
 (rejected_units > 0 in every run, but over-counted — see O9.)
 
 **Quality (normal mode, `SPOT=1 d2_g2 MGPU=2 sift10M auto`, 1 rep):** recall@10 itopk 32/64/128 = 0.8336 / 0.9213 / 0.9695 vs best `sift10M_auto` 0.8315 / 0.9208 / 0.9703; knn recall@10 0.7211 vs 0.7227; 0 bad ids / self loops / dup edges. Pass.
+
+### SP2 — P2: Step 6 on the SegmentScheduler (2026-11-21) — **done**
+
+**What.**
+- `run_step6` (bucket.cu): spot ON → always the threaded path (G=1 too), workers from `make_workers(G6)`, initial cuts = the S3 cost cuts reserved for each device's spot worker (dedicated: device 0 = on-demand), `unit_cost = wcost` (steals split by cost), one arrival lane per worker (`set_lanes(workers)`, lane = worker index). `run_worker` with no-op setup / teardown; `proc(L)` = one `build_vector_knn_with_tensorcore(pos_begin = L.begin, pos_end = end_of(L), lane = w, &S, &L)` call per lease under a per-device mutex (shared mode: rescue + spot worker on device 0 never overlap). So the per-call setup (bucket order slice, future_access / Belady tables, slot buffers, caches) is redone **per lease** for now (→ O6).
+- `build_vector_knn_with_tensorcore`: new trailing args `spot_S`, `spot_L`. Main loop: `may_start(pos)` before every position (empty ones too); false → stop issuing, `stage_abort` the producer (it may wait for a slot that is never consumed), drain slots / encoders / scatter, return. Scatter order is *not* position order (slot rotation + empty buckets skipped + tail flush by slot index), so in spot mode the scatter thread holds encoded jobs by position and commits the contiguous completed prefix: the main loop publishes per position `has_job` + `spot_resolved = pos + 1` (release) once it knows whether the bucket produces a job (empty / `actual_M <= 0` → none); the scatter thread (and the main thread after the scatter join, for trailing empty positions) runs `commit(L, pos_begin + p, append_encoded of the held jobs)`; rejected → the jobs are dropped (counted, printed). Bounds checks on job positions; leftover held jobs throw. Spot OFF: unchanged path (direct append, no holding).
+
+**Correctness (deterministic, `spot_det.sh sift10M G d2_gG`)** — all 5 artifacts byte-identical:
+
+| G | GPUs | result | step6 [spot] round 1 / round 2 | bucket2 plain → spot (s) |
+|---|---|---|---|---|
+| 2 | 2,3 | **EQUAL** (1st run MISMATCH-VACUOUS: no preemption landed in a spot stage; rerun) | steals 7, drains 2, preempts 3, setups 5 / steals 2, drains 2, preempts 3, setups 4 | 21.64 → 31.36 |
+| 1 | 2 (shared) | **EQUAL** | drains 2, reaped 3, preempts 5, rejected 0, setups 7 / drains 2, reaped 4, preempts 6, rejected 17, setups 7 | 28.14 → 40.64 |
+| 4 | 2,3,0,1 | **EQUAL** | steals 1, drains 2, reaped 2, preempts 8, rejected 12, setups 9 / steals 4, drains 6, reaped 2, preempts 12, rejected 112, setups 16 | 19.66 → 36.12 |
+
+**Quality (normal mode, `SPOT=1 d2_g2 MGPU=2 sift10M auto`, 1 rep, logs kept):** recall@10 itopk 32/64/128 = 0.8314 / 0.9218 / 0.9688 (best 0.8315 / 0.9208 / 0.9703), knn recall@10 0.7235; 0 defects. The log shows step-4 reap + on-demand steal, step-6 preemptions mid-lease (`committed [6583,12126)`), rejected commits 5/18, steals of the tail by both workers.
+
+**Note.** Under the dense d2 traces spot bucket2 is much slower than plain (G=4 +84 %, G=1 +44 %): instance down time + the per-lease Step 6 setup (16 setups in one G=4 round) + tail ping-pong (steals of 3–29 positions). O6 (per-epoch setup) and O4 (minimum steal size) address that after P4.
 
