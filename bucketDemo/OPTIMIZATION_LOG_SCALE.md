@@ -56,6 +56,11 @@ prune 44.7, optimize 35.8); 4 GPUs 347.79 s (Step 4 42.3, Step 6 121.8, Wait 50.
 
 ## Ideas backlog (largest multi-GPU gap first)
 
+- **Status 2026-11-21 (after S36): quick implementation wins exhausted.** Remaining gaps vs 1 GPU at G = 4 (S34): Wait 20 s (= vector_knn 25.6 GB
+  into the page cache at ~1.5 GB/s via mmap; merge CPU already halved), Step 6 50 s (arrival scatter-bound), Step 4.5 order wait 2 s, Steps 1–3 16 s
+  (disk read-bound Step 1). Larger candidates (bigger code changes, ask before starting): (1) S9 compact vector_knn (varint / delta, ~17–19 GB
+  instead of 25.6; prune range reader + eval script must read it), (2) bucketed O(1) priority queue for the bucket order (≤ 2 s at G = 4),
+  (3) combine the saved small-win patches (S35: −0.9 % at both G) if the user accepts consistent sub-3 % gains.
 - **S34 — done (2026-11-21), see Iterations.** Was: final-merge CPU (Wait ≈ 21 s, now the largest non-scaling part).** S32 G = 4 run: merge_iteration(iter = 1) wall 22.8 s,
   sum over 954 chunks: merge_cpu 821 s (≈ 10.3 s on 80 threads, ~4 µs per arrival record, ~200 M records from round 1 kept + round 2),
   write_running 525 s (mmap copy + faults, ≈ 6.6 s), alloc 20, reads 30; slowest chunk 3.1 s. Ideas: faster record decode (varint) +
