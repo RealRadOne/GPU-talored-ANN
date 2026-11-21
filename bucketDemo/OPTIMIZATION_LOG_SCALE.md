@@ -10,7 +10,9 @@ as reference.
 
 ## Current best
 
-**G = 2: 237.33 s** (S32, 2026-11-21, GPUs 2,3, `runs/scale32/sift100M_auto_g2`) — bucket2 190.8, prune 29.8, optimize 17.0;
+**G = 2: 234.23 s** (S34, 2026-11-21, GPUs 2,3, `runs/scale34/sift100M_auto_g2`) — bucket2 189.0 (Wait 18.7), prune 29.1, optimize 16.8;
+recall@10 0.7249 / 0.8327 / 0.9113; peak RSS 93.2 GB. Speedup vs 1 GPU 1.83×.
+Previous **G = 2: 237.33 s** (S32, 2026-11-21, GPUs 2,3, `runs/scale32/sift100M_auto_g2`) — bucket2 190.8, prune 29.8, optimize 17.0;
 recall@10 0.7243 / 0.8319 / 0.9100; peak RSS 92.4 GB. Speedup vs 1 GPU 1.81×.
 Previous **G = 2: 251.87 s** (S20, 2026-11-20, GPUs 2,3, `runs/scale20/sift100M_auto_g2`) — bucket2 196.1, prune 39.7, optimize 17.7;
 recall@10 0.7263 / 0.8329 / 0.9108; peak RSS 92.0 GB. Speedup vs 1 GPU 1.71×.
@@ -22,7 +24,9 @@ Wait 26.4), prune 46.3, optimize 30.0; recall@10 0.7267 / 0.8340 / 0.9109 (same-
 Previous: **304.42 s** (S4 re-judged 2026-11-19, "accepted (compute gain, disk-bound)"; reps 304.4 / 299.4 / 365.0, GPUs 0,1;
 `runs/scale4/sift100M_auto_g2`) — Step 6 85.2, Wait 33.5, optimize 35.0; recall@10 0.7272 / 0.8334 / 0.9120. Previous best
 307.50 (S1). S9 (optimize src-split) accepted under the compute-gain rule without a new best (311.50 s, slow-disk period). Compute metrics for the fast-disk re-check are in the S3 / S4 re-judge entry below.
-**G = 4: 189.89 s** (S32, 2026-11-21, GPUs 0–3, `runs/scale32/sift100M_auto_g4`) — bucket2 143.2, prune 29.5, optimize 17.4;
+**G = 4: 183.33 s** (S34, 2026-11-21, GPUs 0–3, `runs/scale34/sift100M_auto_g4`) — bucket2 140.2 (Wait 20.2), prune 26.3, optimize 16.3;
+recall@10 0.7266 / 0.8343 / 0.9113; peak RSS 97.3 GB. Speedup vs 1 GPU 2.34×.
+Previous **G = 4: 189.89 s** (S32, 2026-11-21, GPUs 0–3, `runs/scale32/sift100M_auto_g4`) — bucket2 143.2, prune 29.5, optimize 17.4;
 recall@10 0.7254 / 0.8339 / 0.9105; peak RSS 95.6 GB. Speedup vs 1 GPU 2.26×.
 Previous **G = 4: 205.25 s** (S26, 2026-11-21, GPUs 0–3, `runs/scale26/sift100M_auto_g4`) — bucket2 141.9 (Wait 21.2), prune 47.4, optimize 16.1;
 recall@10 0.7260 / 0.8335 / 0.9112; peak RSS 95.4 GB. Speedup vs 1 GPU 2.09×.
@@ -52,7 +56,7 @@ prune 44.7, optimize 35.8); 4 GPUs 347.79 s (Step 4 42.3, Step 6 121.8, Wait 50.
 
 ## Ideas backlog (largest multi-GPU gap first)
 
-- **S34 (next) — final-merge CPU (Wait ≈ 21 s, now the largest non-scaling part).** S32 G = 4 run: merge_iteration(iter = 1) wall 22.8 s,
+- **S34 — done (2026-11-21), see Iterations.** Was: final-merge CPU (Wait ≈ 21 s, now the largest non-scaling part).** S32 G = 4 run: merge_iteration(iter = 1) wall 22.8 s,
   sum over 954 chunks: merge_cpu 821 s (≈ 10.3 s on 80 threads, ~4 µs per arrival record, ~200 M records from round 1 kept + round 2),
   write_running 525 s (mmap copy + faults, ≈ 6.6 s), alloc 20, reads 30; slowest chunk 3.1 s. Ideas: faster record decode (varint) +
   top-64 merge (sort-free insertion with early reject by the running k-th distance, SIMD dedup), chunk scheduling largest-first.
@@ -641,3 +645,21 @@ pre-existing bucket2 peak RSS (141.1 vs 1.2 × 103.6 GB, same as the S29 HEAD mi
 |---|---|---|---|---|---|---|
 | G = 2 (S32) | — | — | — | 1.87× | 2.32× | 1.81× |
 | G = 4 (S32) | — | — | — | 1.89× | 2.27× | 2.26× |
+
+### S34 — final merge: hash-set dedup in `merge_one_record` — ACCEPT (2026-11-21)
+
+**Why.** After S26 the final merge (Wait ≈ 21 s) was mostly CPU: S32 G = 4 merge_cpu summed over 954 chunks 821 s (~4 µs per
+arrival record). Each record merge sorted the running row's ids (`std::sort`, ~64 ids) and binary-searched every new id, collecting
+into a `vector<pair>`. **Change:** running ids go into a thread-local open-addressing hash set (≥ 4·na slots, generation stamps, no
+clearing), O(1) dedup; output built in fixed arrays. Merge order and the tie rule (`run_dists[i] <= new_dists[j]` takes running)
+unchanged → same output. Implementation only.
+
+| | merge_cpu sum (s) | Wait (s) | total (×3) | vs best |
+|---|---|---|---|---|
+| sift10M (guard) | 75.2 → 37.4 | 3.0 → 2.5–2.9 | ACCEPT | — |
+| SIFT100M G = 4 | 821 → 359–413 | 22.7 → 19.5 / 20.7 / 20.2 | **183.33** | **−3.5 %** (189.89) |
+| SIFT100M G = 2 | ~800 → 353–371 | 20.5 → 18.8 / 18.7 / 17.6 | **234.23** | −1.3 % (237.33) |
+
+Merge CPU halves, Wait −2…−3 s (the rest is the mmap copy / faults and the chunk tail, slowest chunk ~3 s). Part of the G = 4 gain
+is prune variance (26.3 vs 29.5 s). Recall@10 G = 2 0.7249 / 0.8327 / 0.9113, G = 4 0.7266 / 0.8343 / 0.9113; peak RSS 93.2 / 97.3 GB.
+Single-GPU guard ACCEPT. best_scale.json: G = 2 234.23 s, G = 4 183.33 s.
