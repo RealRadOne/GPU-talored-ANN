@@ -27,6 +27,9 @@ After SP5 (2026-11-21, `runs/spot5`, SIFT100M auto, median of 3; best of SP4 / S
 
 ## Ideas backlog (O iterations, after P4)
 
+- **O13 round-2 Step 4 pipelined upload** (prerequisite for O1) — the host_raw path (round 2, data in RAM) uploads each batch synchronously before its search (`h2d_staged` allocates / frees 2 × 64 MB pinned per call; < 512 MB → single-threaded pageable cudaMemcpy). Pipeline it like the prefetch path (upload batch k+1 on a copy stream while batch k searches, persistent pinned staging) → small spot batches cost nothing in round 2; then re-apply SP6's O1 (all rounds Nv/8).
+- **O9 + min_steal_units** — re-apply from the SP6 patch with the next iteration (stats only / prevents 1-unit tail steals in Step 4).
+- **O14 no-event prune / Step 6 tail (G=4, measured same-period)** — SP6b/6c with same-period plain (G=4 b2+prune 189.0, G=1 343.0): spot none G=4 195.4 / 197.4 (+3.4 / +4.4 %), G=1 349.4 (+1.9 %); the excess is prune (51.0–51.6 vs 47.9 s at G=4; 45 vs 40 s at G=1) and Step 6 (52–54 vs 51.3 s) — code unchanged since SP5, so SP5's +1.5 % at G=4 was a lucky draw: **the G=4 overhead gate is borderline at HEAD**. G=4 prune: the on-demand worker steals 16k buckets at ~27 s and a spot worker 14k at ~37 s (each a cold lease: planning + empty bucket pool). Ideas: the on-demand worker in dedicated mode starts with a smaller initial share (it finishes first anyway) so the spot workers finish together without tail steals; keep the prune bucket pool / plan per epoch (O7/O11).
 - ~~**O12 no-event overhead**~~ → done in SP5 (accepted). Original note: — SP4: `_spotnone` vs plain (bucket2 + prune) G=1 +1.1 %, G=2 +3.1 %, **G=4 +19.8 %** (prune 47.7 → 75.1 s, Step 6 52.6 → 61.5 s; G=4 none reps 218.9 / 250.2 / 252.7 bimodal). The overhead gate requires ≤ +3 %. G=2 prune log: the on-demand worker finishes its half at 31 s, steals 22k buckets from the spot worker's tail, the stolen lease cold-starts (plan 2.65 s, empty pool, 4.50 vs 4.26 × N rows loaded) and ends at 47.9 s, later than the victim would have. Combines O4 / O10 / O11: steal only when the remaining cost of the victim ≫ the thief's per-lease setup, steal from the victim's tail by *time* (EWMA rate) not by unit cost, prune: truncate a plan at `end_of(L)` instead of stopping. Even G=1 (no steals) has prune 42.0 → 47.0 s: check the spot path's `write_rows_at` (pwrite, not counted) vs the sequential writer, and the per-lease setup.
 
 - **O1 Step 4 commit granularity** — in spot mode commit sub-batches (smaller Nv for the search loop, or split one search batch into k commits) so a preemption loses ≤ ~1 s instead of a whole ~8 s batch (SIFT100M).
@@ -47,7 +50,7 @@ After SP5 (2026-11-21, `runs/spot5`, SIFT100M auto, median of 3; best of SP4 / S
 
 ## Tried & rejected
 
-(none)
+- **SP6 O1 Step 4 commit granularity** (2026-11-21, patch `bucketDemo/patches/spot6_o1_step4_granularity.patch`, also holds O9 + `min_steal_units`): spot batches Nv/8 in round 1 (prefetch path) cut G=4 t1 Step 4 63.7 → 55–56 s, but round 2 (host_raw, synchronous non-pipelined upload) gets slower with small batches (G=1 convert_upload 3.4 → 11.4 s at Nv/8, → 6.8 s at Nv/5); round-1-only (SP6c) keeps round 2's whole-Nv batches (a preemption there drops ~22 M rows) → G=4 t1 only +1.8 % (< 3 %) → REJECT. Prerequisite found: O13.
 
 ## Iterations
 
@@ -160,4 +163,22 @@ judge (`JUDGE_BENCH` = the three `_spott1` keys): **ACCEPT** (G=4 +6.5 %, G=2 +0
 **`[spot]` under t1, G=4** (steals / drains / reaped / preempts / setups): prune 2/3/0/4/7, 14/2/0/4/7, 2/4/0/5/8 (SP4: 13/3/0/5/7, 3/3/0/4/7, 10/4/0/5/7); step6 3/3/1/4/9, 3/3/0/4/9, 2/3/1/4/9; step4 23/1/1/6/13, 23/2/0/6/13, 24/2/0/6/13 (the Step-4 steals are 0.5 s-threshold steals inside one epoch — cheap).
 
 **Remaining no-event gap.** G=4 prune 51.5 vs plain 47.7 s: the on-demand worker still steals 16k buckets at 26.9 s and a spot worker 14k at 37.2 s (2 extra cold leases). The next big item under t1 is Step 4 (G=4 63.7 vs 34.1 s none: lost 8 s batches + re-setup after joins) → O1 / O3.
+
+### SP6 — O1: Step 4 commit granularity (2026-11-21) — **REJECTED** (patch saved)
+
+**What.** Spot mode Step 4 batches Nv/8 instead of Nv/4 (`BUCKET2_SPOT_STEP4_DIV`, prefetch path; the commit granularity = the batch; a preemption drops the in-flight current + prefetched batch); plus O9 (`commit(..., u0)`: rejected units = `new_cursor − u0`, all three stages pass the start) and `Options::min_steal_units` (Step 4: N_nc/1000 — no tail halving down to 1 unit while the victim has no EWMA yet; SP5 logs showed 20 steals of 1–1500 rows at the end of a round). Variants: SP6 = all rounds Nv/8; SP6b = non-prefetch (host_raw) path capped so a batch is ≥ 512 MB (`h2d_staged`); SP6c = round 1 (prefetch path) only.
+
+**Correctness.** `spot_det.sh` EQUAL for G=2 / 1 / 4 (SP6), G=1 / 2 (SP6b), G=1 (SP6c). O9 works: a step-4 preemption now reports 1.25 M rejected rows at SIFT10M (one Nv/8 batch) instead of 5–20 M.
+
+**SIFT100M (median of 3).** Same-period plain (re-measured in SP6b): G=4 204.71 s (b2+prune 189.0), G=1 365.20 s (b2+prune 343.0) — plain did not drift since SP4.
+
+| variant | G=4 t1 (best 256.30) | G=4 Step 4 under t1 | G=1 t1 (best 386.77) | G=2 t1 (best 279.85) | spot none b2+prune vs same-period plain |
+|---|---|---|---|---|---|
+| SP6 (all rounds /8) | 248.20 (+3.2 %) | 56.2 | 393.13 (−1.6 %) | 283.21 (−1.2 %) | G=1 362.4 vs 343.0 (+5.7 %; round-2 Step 4 48 → 55 s, convert_upload 3.4 → 11.4 s), G=4 197.1 (+4.3 %) |
+| SP6b (round 2 ≥ 512 MB) | 256.03 (+0.1 %; prune 67.5 s draw) | 55.2 | 390.06 (−0.9 %) | — | G=1 358.6 (+4.5 %; convert_upload 6.8 s), G=4 198.4 (+5.0 %), G=2 241.1 |
+| SP6c (round 1 only) | 251.72 (+1.8 %) | 58.5 (round-2 preemptions drop whole 22 M-row batches: rejected 31–42 M) | 382.86 (+1.0 %) | — | G=1 349.4 (**+1.9 %**, Step 4 93.7 = plain), G=4 195.4 / 197.4 rerun (+3.4 / +4.4 %; Step 4 33.0 / 33.6 = plain, excess in prune / Step 6 — O14) |
+
+judge (SP6c G=1 / G=4 + SP6 G=2): **REJECT** — no config ≥ 3 % faster. The Step-4 gain under t1 is real (G=4 Step 4 63.7 → 55–56 s with small batches in both rounds) but in round 2 small batches cost more than they save because that path's upload is synchronous and unpipelined (O13). Search quality unchanged in every run, 0 defects.
+
+**Finding (for O14).** With same-period plain, HEAD's no-event overhead at G=4 is +3.4–4.4 % (prune / Step 6 tails), i.e. SP5's +1.5 % was a favourable draw; the gate is borderline at G=4 and is the next target together with O13.
 
