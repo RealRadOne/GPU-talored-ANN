@@ -1,0 +1,107 @@
+diff --git a/bucketDemo/buildBucket/src/bucket.cu b/bucketDemo/buildBucket/src/bucket.cu
+index 6ea896b..e84fd6a 100644
+--- a/bucketDemo/buildBucket/src/bucket.cu
++++ b/bucketDemo/buildBucket/src/bucket.cu
+@@ -2010,7 +2010,14 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
+     // 每个点的 top-2 与分批无关。BUCKET2_STEP4_PF_DIV=1 关掉。参考 TAGORE large_index.cu 的 GPU–CPU–disk 流水线。
+     const int64_t pf_div = std::max<int64_t>(1, std::getenv("BUCKET2_STEP4_PF_DIV")
+                                                   ? std::atoll(std::getenv("BUCKET2_STEP4_PF_DIV")) : 4);
+-    const int64_t batch_len = prefetch_io ? std::max<int64_t>(1, (Nv + pf_div - 1) / pf_div) : Nv;
++    // spot (O1): 提交粒度 = 批长；抢占丢的是在途的 (当前 + 已领的预读) 批 → spot 模式批更小 (默认 Nv/8，
++    // BUCKET2_SPOT_STEP4_DIV)。每行 top-2 跟分批无关。
++    const int64_t spot_div = std::max<int64_t>(1, std::getenv("BUCKET2_SPOT_STEP4_DIV")
++                                                    ? std::atoll(std::getenv("BUCKET2_SPOT_STEP4_DIV")) : 8);
++    // 非预读路径 (host_raw: 第 2 轮数据已在内存) 保持原来的整批 Nv: 更小的批上传变慢 (SP6: Nv/8 = 350 MB/批走单线程
++    // pageable cudaMemcpy，G=1 convert_upload 3.4 → 11.4 s；SP6b: Nv/5 ≥ 512 MB 走 h2d_staged 仍 3.4 → 6.8 s)。
++    const int64_t div_eff = prefetch_io ? (S ? std::max(spot_div, pf_div) : pf_div) : 1;
++    const int64_t batch_len = prefetch_io ? std::max<int64_t>(1, (Nv + div_eff - 1) / div_eff) : Nv;
+     auto batch_end_of = [&](int64_t bs) {
+         return std::min(bs + batch_len, nc_end);
+     };
+@@ -2454,7 +2461,7 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
+                             static_cast<size_t>(batch_size) * TOP_K * sizeof(float));
+         };
+         if (!S) { write_back(); n_done += batch_size; }
+-        else if (S->commit(*Lc, batch_end, write_back)) n_done += batch_size;   // false: 被拒收 (过了抢占时刻 / 不再是 owner)
++        else if (S->commit(*Lc, batch_end, write_back, batch_start)) n_done += batch_size;   // false: 被拒收 (过了抢占时刻 / 不再是 owner)
+         if (!S && (((batch_start - nc_begin) / Nv) % 10 == 0 || batch_end == nc_end)) {
+             std::cout << "[BatchAssign" << (G4 > 1 ? " gpu" + std::to_string(wi) : std::string()) << "] "
+                       << batch_end - nc_begin << "/" << nc_end - nc_begin << "\n";
+@@ -2545,6 +2552,7 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
+             }
+             auto sopt4 = spot::options_from_env(shared);
+             if (!std::getenv("BUCKET2_SPOT_MIN_STEAL_S")) sopt4.min_steal_s = 0.5;   // 同一实例代内租约很便宜 (索引已建好)
++            sopt4.min_steal_units = std::max<int64_t>(1, N_nc / 1000);   // victim 还没提交时不把尾部切成碎片
+             spot::SegmentScheduler S("step4", N_nc, ws, cuts, owners, sopt4);
+             s4st.assign(ws.size(), S4Stat{});
+             std::vector<std::mutex> dev_m(static_cast<size_t>(G4));
+@@ -7722,6 +7730,7 @@ void build_vector_knn_with_tensorcore(
+             ++p;
+         }
+         if (p == spot_next) return;
++        const int64_t u0c = static_cast<int64_t>(pos_begin) + spot_next;
+         const bool ok = spot_S->commit(*spot_L, static_cast<int64_t>(pos_begin) + p, [&] {
+             for (auto& job : batch) {
+                 size_t beg = 0;
+@@ -7731,7 +7740,7 @@ void build_vector_knn_with_tensorcore(
+                     beg = end;
+                 }
+             }
+-        });
++        }, u0c);
+         if (!ok) spot_rejected_buckets += static_cast<int64_t>(batch.size());
+         spot_next = p;
+         std::lock_guard<std::mutex> lk(scatter_mtx);
+diff --git a/bucketDemo/buildBucket/src/prune_windowed.cpp b/bucketDemo/buildBucket/src/prune_windowed.cpp
+index 3820958..32a5884 100644
+--- a/bucketDemo/buildBucket/src/prune_windowed.cpp
++++ b/bucketDemo/buildBucket/src/prune_windowed.cpp
+@@ -626,7 +626,7 @@ int main(int argc, char** argv)
+                                     hk.claim = [&](int p0, int p1) { return static_cast<int>(S.may_start_clip(L, p0, p1)); };
+                                     hk.done = [&](int p0, int p1) {
+                                         if (p0 < 0 || p1 > n_buckets || p0 >= p1) throw std::runtime_error("spot prune: bad chunk");
+-                                        if (S.commit(L, p1))
++                                        if (S.commit(L, p1, {}, p0))
+                                             writer.add_rows_written(static_cast<int64_t>(offsets_new[static_cast<size_t>(p1)]) -
+                                                                     static_cast<int64_t>(offsets_new[static_cast<size_t>(p0)]));
+                                     };
+diff --git a/bucketDemo/buildBucket/src/spot_sched.hpp b/bucketDemo/buildBucket/src/spot_sched.hpp
+index 992b816..7767557 100644
+--- a/bucketDemo/buildBucket/src/spot_sched.hpp
++++ b/bucketDemo/buildBucket/src/spot_sched.hpp
+@@ -243,6 +243,7 @@ struct Options {
+     double rescue_after_s = 2.0;    // 所有 spot worker 都不可用多久之后 on-demand 救场
+     int64_t min_split_units = 1;    // 偷 / 切分后每一半至少这么多单元
+     bool   allow_steal = true;      // spot 关闭时 options_from_env 设成 false → 跟原来的静态切分完全一样
++    int64_t min_steal_units = 0;    // victim 的 EWMA 未知时: 剩余 (从 issued 起) 少于这么多单元就不偷 (防止尾部无限对半)
+     double min_steal_s = 0.0;       // 只偷预计剩余时间 (从 issued 起，按 victim 本租约的每单元 EWMA) ≥ 这么多秒的段
+                                     // (每个租约有固定开销的阶段: 小段来回偷比不偷还慢)。victim 还没有提交 (EWMA 未知) → 按代价照偷
+     bool   verbose = true;
+@@ -394,7 +395,9 @@ public:
+ 
+     // 提交 [cursor, new_cursor)。合法 (还是 owner、实例没过抢占时刻、单调) 时在段的提交锁内执行 fn
+     // (把结果写进 host 端结构) 再推进 cursor，返回 true；否则丢弃 (返回 false，fn 不执行)。
+-    bool commit(const Lease& L, int64_t new_cursor, const std::function<void()>& fn = {}) {
++    // u0 (可选): 这次提交的单元起点 (= 上一次提交的 new_cursor / L.begin)。拒收时丢失的单元按 new_cursor - u0 计
++    // (不给 u0 时按段当前 cursor 算: 段被回收、重新分配给别人之后那是别人的 cursor，会多算)。
++    bool commit(const Lease& L, int64_t new_cursor, const std::function<void()>& fn = {}, int64_t u0 = -1) {
+         Seg& s = seg(static_cast<size_t>(L.seg));
+         auto& ws = wst_[static_cast<size_t>(L.worker)];
+         std::lock_guard<std::mutex> ck(s.cm);   // 提交锁: 回收 (reap) 要等正在进行的提交做完
+@@ -406,7 +409,7 @@ public:
+             const bool gone = (v.state == kDown) || (v.state == kNotice && t >= v.deadline_ns);
+             if (s.owner != L.worker || s.token != L.token || gone || new_cursor <= s.cursor || new_cursor > s.end) {
+                 ws.rejected_commits.fetch_add(1);
+-                ws.rejected_units.fetch_add(std::max<int64_t>(0, new_cursor - s.cursor));
++                ws.rejected_units.fetch_add(std::max<int64_t>(0, new_cursor - (u0 >= 0 ? u0 : s.cursor)));
+                 return false;
+             }
+             old_cursor = s.cursor;
+@@ -719,6 +722,7 @@ private:
+             if (s.end - from < 2 * opt_.min_split_units) continue;
+             if (opt_.min_steal_s > 0 && s.ewma_unit_s > 0 &&
+                 s.ewma_unit_s * static_cast<double>(s.end - from) < opt_.min_steal_s) continue;   // 剩下的太少，不值得偷
++            if (s.ewma_unit_s <= 0 && s.end - from < opt_.min_steal_units) continue;
+             const double c = cost(from, s.end);
+             if (c > vic_cost) { vic_cost = c; vic = &s; }
+         }

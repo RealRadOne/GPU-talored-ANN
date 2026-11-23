@@ -61,7 +61,9 @@ if not args:
 cand, cand_dirs = {}, {}
 for d in args:
     m = json.load(open(os.path.join(d, "metrics.json")))
-    k = f"{m['dataset']}_{m['mode']}" + (f"_g{m['num_gpus']}" if m.get("num_gpus", 1) > 1 else "")
+    k = f"{m['dataset']}_{m['mode']}" + (f"_g{m['num_gpus']}" if m.get("num_gpus", 1) > 1 or m.get("spot") else "")
+    if m.get("spot"):   # optimize-bucket2-spot: <dataset>_<mode>_g<G>_spot<TAG> (TAG = trace name, 'none' = no events)
+        k += f"_spot{m['spot']}"
     if k in cand:
         sys.exit(f"config {k} given twice")
     cand[k], cand_dirs[k] = m, os.path.abspath(d)
