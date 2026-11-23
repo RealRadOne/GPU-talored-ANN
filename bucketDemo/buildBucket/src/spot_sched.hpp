@@ -243,6 +243,7 @@ struct Options {
     double rescue_after_s = 2.0;    // 所有 spot worker 都不可用多久之后 on-demand 救场
     int64_t min_split_units = 1;    // 偷 / 切分后每一半至少这么多单元
     bool   allow_steal = true;      // spot 关闭时 options_from_env 设成 false → 跟原来的静态切分完全一样
+    int64_t min_steal_units = 0;    // stage 速率未知时: 剩余 (从 issued 起) 少于这么多单元就不偷 (防止尾部无限对半)
     double min_steal_s = 0.0;       // 只偷预计剩余时间 (从 issued 起，按 victim 本租约的每单元 EWMA) ≥ 这么多秒的段
                                     // (每个租约有固定开销的阶段: 小段来回偷比不偷还慢)。victim 还没有提交 (EWMA 未知) → 按代价照偷
     bool   verbose = true;
@@ -394,7 +395,9 @@ public:
 
     // 提交 [cursor, new_cursor)。合法 (还是 owner、实例没过抢占时刻、单调) 时在段的提交锁内执行 fn
     // (把结果写进 host 端结构) 再推进 cursor，返回 true；否则丢弃 (返回 false，fn 不执行)。
-    bool commit(const Lease& L, int64_t new_cursor, const std::function<void()>& fn = {}) {
+    // u0 (可选): 这次提交的单元起点 (= 上一次提交的 new_cursor / L.begin)。拒收时丢失的单元按 new_cursor - u0 计
+    // (不给 u0 时按段当前 cursor 算: 段被回收、重新分配给别人之后那是别人的 cursor，会多算)。
+    bool commit(const Lease& L, int64_t new_cursor, const std::function<void()>& fn = {}, int64_t u0 = -1) {
         Seg& s = seg(static_cast<size_t>(L.seg));
         auto& ws = wst_[static_cast<size_t>(L.worker)];
         std::lock_guard<std::mutex> ck(s.cm);   // 提交锁: 回收 (reap) 要等正在进行的提交做完
@@ -406,7 +409,7 @@ public:
             const bool gone = (v.state == kDown) || (v.state == kNotice && t >= v.deadline_ns);
             if (s.owner != L.worker || s.token != L.token || gone || new_cursor <= s.cursor || new_cursor > s.end) {
                 ws.rejected_commits.fetch_add(1);
-                ws.rejected_units.fetch_add(std::max<int64_t>(0, new_cursor - s.cursor));
+                ws.rejected_units.fetch_add(std::max<int64_t>(0, new_cursor - (u0 >= 0 ? u0 : s.cursor)));
                 return false;
             }
             old_cursor = s.cursor;
@@ -419,6 +422,11 @@ public:
             const double dt = ns2s(t - (s.last_commit_ns ? s.last_commit_ns : s.lease_t0));
             const double per = dt / static_cast<double>(new_cursor - old_cursor);
             s.ewma_unit_s = s.ewma_unit_s > 0 ? 0.7 * s.ewma_unit_s + 0.3 * per : per;
+            {   // stage 级的 秒 / 代价 (偷的时候估计剩余时间: 新租约还没有 EWMA 时也能用)
+                std::lock_guard<std::mutex> rl(rate_m_);
+                rate_time_s_ += dt;
+                rate_cost_ += cost(old_cursor, new_cursor);
+            }
             s.last_commit_ns = t;
             s.cursor = new_cursor;
             s.issued = std::max(s.issued, s.cursor);
@@ -611,6 +619,15 @@ private:
         return false;
     }
 
+    // [from, s.end) 一个 worker 做完的预计秒数: stage 级 秒/代价 (所有提交累计)；还没有提交 → 本租约 EWMA；都没有 → -1
+    double est_time_locked(const Seg& s, int64_t from) const {
+        double rt = 0, rc = 0;
+        { std::lock_guard<std::mutex> rl(rate_m_); rt = rate_time_s_; rc = rate_cost_; }
+        if (rc > 0 && rt > 0) return rt / rc * cost(from, s.end);
+        if (s.ewma_unit_s > 0) return s.ewma_unit_s * static_cast<double>(s.end - from);
+        return -1.0;
+    }
+
     int64_t cursor_of(const Lease& L) const {
         const Seg& s = seg(static_cast<size_t>(L.seg));
         std::lock_guard<std::mutex> lk(s.m);
@@ -717,8 +734,11 @@ private:
             if (s.owner < 0 || s.owner == w) continue;
             const int64_t from = std::max(s.issued, s.cursor);
             if (s.end - from < 2 * opt_.min_split_units) continue;
-            if (opt_.min_steal_s > 0 && s.ewma_unit_s > 0 &&
-                s.ewma_unit_s * static_cast<double>(s.end - from) < opt_.min_steal_s) continue;   // 剩下的太少，不值得偷
+            if (opt_.min_steal_s > 0) {   // 剩下的预计时间太少，不值得偷 (新租约有固定开销)
+                const double est = est_time_locked(s, from);
+                if (est >= 0 && est < opt_.min_steal_s) continue;
+                if (est < 0 && s.end - from < opt_.min_steal_units) continue;
+            }
             const double c = cost(from, s.end);
             if (c > vic_cost) { vic_cost = c; vic = &s; }
         }
@@ -788,6 +808,8 @@ private:
     int n_spot_ = 0;
     int waiting_spot_ = 0;
     int64_t steals_ = 0, drains_ = 0, reaped_ = 0;
+    mutable std::mutex rate_m_;
+    double rate_time_s_ = 0, rate_cost_ = 0;
     int64_t t0_ = 0, last_spot_alive_ns_ = 0;
 };
 

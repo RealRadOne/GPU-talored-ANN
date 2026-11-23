@@ -626,7 +626,7 @@ int main(int argc, char** argv)
                                     hk.claim = [&](int p0, int p1) { return static_cast<int>(S.may_start_clip(L, p0, p1)); };
                                     hk.done = [&](int p0, int p1) {
                                         if (p0 < 0 || p1 > n_buckets || p0 >= p1) throw std::runtime_error("spot prune: bad chunk");
-                                        if (S.commit(L, p1))
+                                        if (S.commit(L, p1, {}, p0))
                                             writer.add_rows_written(static_cast<int64_t>(offsets_new[static_cast<size_t>(p1)]) -
                                                                     static_cast<int64_t>(offsets_new[static_cast<size_t>(p0)]));
                                     };
@@ -635,7 +635,7 @@ int main(int argc, char** argv)
                                         [&](int64_t lo, int64_t n, int32_t* c, T* v) { load_rows(lo, n, c, v); },
                                         [&](const uint32_t* rows, int64_t row0, int64_t n) {
                                             auto tw0 = Clock::now();
-                                            writer.write_rows_at(rows, row0, n, false, true);
+                                            writer.write_rows_at(rows, row0, n, false, G == 1);   // 多卡: 各 worker 已并发写，再分片多线程只会争抢
                                             std::lock_guard<std::mutex> lk(sink_mtx);
                                             t_sink += std::chrono::duration<double>(Clock::now() - tw0).count();
                                         },

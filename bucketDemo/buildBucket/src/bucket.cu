@@ -2454,7 +2454,7 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
                             static_cast<size_t>(batch_size) * TOP_K * sizeof(float));
         };
         if (!S) { write_back(); n_done += batch_size; }
-        else if (S->commit(*Lc, batch_end, write_back)) n_done += batch_size;   // false: 被拒收 (过了抢占时刻 / 不再是 owner)
+        else if (S->commit(*Lc, batch_end, write_back, batch_start)) n_done += batch_size;   // false: 被拒收 (过了抢占时刻 / 不再是 owner)
         if (!S && (((batch_start - nc_begin) / Nv) % 10 == 0 || batch_end == nc_end)) {
             std::cout << "[BatchAssign" << (G4 > 1 ? " gpu" + std::to_string(wi) : std::string()) << "] "
                       << batch_end - nc_begin << "/" << nc_end - nc_begin << "\n";
@@ -2545,6 +2545,7 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
             }
             auto sopt4 = spot::options_from_env(shared);
             if (!std::getenv("BUCKET2_SPOT_MIN_STEAL_S")) sopt4.min_steal_s = 0.5;   // 同一实例代内租约很便宜 (索引已建好)
+            sopt4.min_steal_units = std::max<int64_t>(1, N_nc / 1000);   // stage 速率未知时不把尾部切成碎片
             spot::SegmentScheduler S("step4", N_nc, ws, cuts, owners, sopt4);
             s4st.assign(ws.size(), S4Stat{});
             std::vector<std::mutex> dev_m(static_cast<size_t>(G4));
@@ -7722,6 +7723,7 @@ void build_vector_knn_with_tensorcore(
             ++p;
         }
         if (p == spot_next) return;
+        const int64_t u0c = static_cast<int64_t>(pos_begin) + spot_next;
         const bool ok = spot_S->commit(*spot_L, static_cast<int64_t>(pos_begin) + p, [&] {
             for (auto& job : batch) {
                 size_t beg = 0;
@@ -7731,7 +7733,7 @@ void build_vector_knn_with_tensorcore(
                     beg = end;
                 }
             }
-        });
+        }, u0c);
         if (!ok) spot_rejected_buckets += static_cast<int64_t>(batch.size());
         spot_next = p;
         std::lock_guard<std::mutex> lk(scatter_mtx);
