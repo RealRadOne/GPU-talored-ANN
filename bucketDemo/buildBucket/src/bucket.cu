@@ -6434,29 +6434,48 @@ struct ChunkedKnnAccumulator {
             return;
         }
 
-        id_sort_buf.assign(run_nbrs, run_nbrs + na);
-        std::sort(id_sort_buf.begin(), id_sort_buf.end());
+        // S34 (scale loop): 原来每条记录 std::sort running 的 na 个 id + binary_search 判重、scratch 是 vector<pair> push_back
+        // (最终 merge: SIFT100M 954 chunk 的 merge_cpu 合计 821 s，Wait ≈ 21 s 里的大头)。现在 running id 进一个
+        // 线程局部的开放寻址哈希表 (2^k ≥ 4·na 槽，代际戳免清零)，判重 O(1)；结果写进固定数组。合并顺序、
+        // 并列规则 (run_dists[i] <= new_dists[j] 取 running) 跟原来完全一样 → 输出逐字节相同。
+        (void)scratch; (void)id_sort_buf;
+        constexpr int kMaxM = 1024;
+        if (M > kMaxM) throw std::runtime_error("merge_one_record: M too large");
+        static thread_local int32_t h_key[4 * kMaxM];
+        static thread_local uint32_t h_gen[4 * kMaxM];
+        static thread_local uint32_t gen = 0;
+        static thread_local int32_t o_nbrs[kMaxM];
+        static thread_local float o_dists[kMaxM];
+        if (++gen == 0) { std::fill(h_gen, h_gen + 4 * kMaxM, 0u); gen = 1; }
+        int hbits = 4; while ((1 << hbits) < 4 * na) ++hbits;
+        const uint32_t hmask = (1u << hbits) - 1u;
+        auto hslot = [&](int32_t id) { return (static_cast<uint32_t>(id) * 2654435761u) >> (32 - hbits); };
+        for (int k = 0; k < na; ++k) {
+            uint32_t h = hslot(run_nbrs[k]);
+            while (h_gen[h] == gen && h_key[h] != run_nbrs[k]) h = (h + 1) & hmask;
+            h_gen[h] = gen; h_key[h] = run_nbrs[k];
+        }
+        auto in_run = [&](int32_t id) {
+            uint32_t h = hslot(id);
+            while (h_gen[h] == gen) { if (h_key[h] == id) return true; h = (h + 1) & hmask; }
+            return false;
+        };
 
-        scratch.clear();
+        int written = 0;
         int i = 0, j = 0;
-        while (static_cast<int>(scratch.size()) < M && (i < na || j < nb)) {
+        while (written < M && (i < na || j < nb)) {
             bool take_a = (j >= nb) || (i < na && run_dists[i] <= new_dists[j]);
             if (take_a) {
-                scratch.push_back({run_dists[i], run_nbrs[i]});
+                o_dists[written] = run_dists[i]; o_nbrs[written] = run_nbrs[i]; ++written;
                 ++i;
             } else {
                 int32_t id = new_nbrs[j];
-                bool dup = std::binary_search(id_sort_buf.begin(), id_sort_buf.end(), id);
-                if (!dup) scratch.push_back({new_dists[j], id});
+                if (!in_run(id)) { o_dists[written] = new_dists[j]; o_nbrs[written] = id; ++written; }
                 ++j;
             }
         }
-
-        int written = static_cast<int>(scratch.size());
-        for (int k = 0; k < written; ++k) {
-            run_dists[k] = scratch[k].first;
-            run_nbrs[k]  = scratch[k].second;
-        }
+        std::memcpy(run_dists, o_dists, static_cast<size_t>(written) * sizeof(float));
+        std::memcpy(run_nbrs, o_nbrs, static_cast<size_t>(written) * sizeof(int32_t));
         for (int k = written; k < M; ++k) {
             run_nbrs[k] = -1;
             run_dists[k] = std::numeric_limits<float>::infinity();

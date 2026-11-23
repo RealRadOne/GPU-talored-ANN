@@ -412,7 +412,14 @@ struct Staging {
     }
     static void par_copy(void* dst, const void* src, size_t n) {
         const int64_t pieces = static_cast<int64_t>((n + (size_t(1) << 20) - 1) >> 20);
-        #pragma omp parallel for schedule(static)
+        // scale S32: 每张卡一个线程都在调 par_copy，原来每次开满 omp 线程 (80) → G 个 80 线程的组 + 空转等待
+        // (msTuring100M G = 2 prune 尾段 runqueue ≈ 160、sy 48 %)，同 S10 / S23。限到 8 线程 (跟 load_threads 默认一样)，
+        // BUCKET2_PRUNE_COPY_THREADS 可改。字节相同。
+        static const int copy_threads = [] {
+            const char* e = std::getenv("BUCKET2_PRUNE_COPY_THREADS");
+            return std::max(1, std::min(omp_get_max_threads(), e ? std::atoi(e) : 8));
+        }();
+        #pragma omp parallel for schedule(static) num_threads(copy_threads)
         for (int64_t i = 0; i < pieces; ++i) {
             const size_t off = static_cast<size_t>(i) << 20;
             std::memcpy(static_cast<char*>(dst) + off, static_cast<const char*>(src) + off,
