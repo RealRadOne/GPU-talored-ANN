@@ -121,7 +121,9 @@ spot_stop() {
   SPOT_PID=""; SPOT_DIR=""; unset BUCKET2_SPOT_DIR
 }
 trap spot_stop EXIT
-if [[ ${SPOT:-0} == 1 ]] && (( ${MGPU:-1} > 1 )); then CHUNKED_EXTRA="${CHUNKED_EXTRA/--num-gpus $MGPU/--num-gpus 1}"; fi
+# optimize_chunked: single GPU in spot AND plain runs on this branch (user 2026-11-23: same optimize for both, so
+# plain vs spot compares only the spot stages); OPT_MGPU=1 restores multi-GPU optimize for plain runs.
+if (( ${MGPU:-1} > 1 )) && [[ ${SPOT:-0} == 1 || ${OPT_MGPU:-0} != 1 ]]; then CHUNKED_EXTRA="${CHUNKED_EXTRA/--num-gpus $MGPU/--num-gpus 1}"; fi
 
 for ((R = 0; R < REPS; R++)); do
   select_gpu
