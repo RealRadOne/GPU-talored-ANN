@@ -15,15 +15,15 @@ Design: `bucketDemo/SPOT_DESIGN.md` (user decisions 2026-11-20/21). Skill: `.cla
 
 ## Current best
 
-After SP5 (2026-11-21, `runs/spot5`, SIFT100M auto, median of 3; best of SP4 / SP5 per key, never ratcheted up):
+After SP8 (2026-11-23, `runs/merge1`, SIFT100M auto, median of 3; spot/bucket2 with scale S29–S36 merged; optimize_chunked on **1 GPU in plain and spot runs**, so plain vs spot compares only the spot stages; best per key, never ratcheted up):
 
 | config | total (s) | bucket2 | Step 4 | Step 6 | prune | optimize | from | notes |
 |---|---|---|---|---|---|---|---|---|
-| sift100M_auto_g2_spott1 | 279.85 | 209.7 | 53.7 | 103.1 | 47.4 | 22.8 | SP5 | |
-| sift100M_auto_g4_spott1 | 256.30 | 177.0 | 63.7 | 60.1 | 57.3 | 22.6 | SP5 | reps 256.3 / 269.6 / 256.3 |
-| sift100M_auto_g1_spott1 | 386.77 | 316.3 | 100.9 | 162.3 | 48.6 | 22.7 | SP4 | SP5 398.1 (−2.9 %, kept SP4) |
-| no-event: g1 / g2 / g4 `_spotnone` | 371.9 / 258.1 / 215.4 | | | | | | SP5 | bucket2 + prune vs plain: +0.7 / +0.4 / +1.5 % |
-| plain: g1 / g2 / g4 | 370.0 / 252.2 / 205.6 | | | | | | SP4 | spot OFF reference |
+| sift100M_auto_g2_spott1 | 259.79 | 207.8 | 53.3 | 102.7 | 30.2 | 22.0 | SP8 | SP5 279.85 |
+| sift100M_auto_g4_spott1 | 230.80 | 174.4 | 64.7 | 58.2 | 31.0 | 22.7 | SP8 | SP5 256.30 |
+| sift100M_auto_g1_spott1 | 386.77 | 316.3 | 100.9 | 162.3 | 48.6 | 22.7 | SP4 | SP8 387.95 (−0.3 %, kept SP4) |
+| no-event: g1 / g2 / g4 `_spotnone` | 365.3 / 240.8 / 191.4 | | | | | | SP8 | bucket2 + prune vs plain: −0.1 / +0.2 / +2.5 % |
+| plain: g1 / g2 / g4 | 364.6 / 239.5 / 193.1 | | | | | | SP8 | spot OFF reference, 1-GPU optimize (multi-GPU optimize: G=2 234.6, G=4 179.7) |
 
 ## Ideas backlog (O iterations, after P4)
 
@@ -207,3 +207,32 @@ G=1 t1 history (no G=1-relevant change since SP5: no steals in shared mode): 398
 
 **Next (not started; loop stopped by the user after SP7):** O13 (pipelined round-2 Step 4 upload) then re-apply O1; G=4 prune no-event tail (51.0 vs 47.9 s).
 
+### SP8 — merge scale S29-S36 + single-GPU optimize in plain runs (2026-11-23) — **done (verification passed)**
+
+**What.** `53b42cd` merges opt/bucket2-loop (scale S29–S36: S32 prune par_copy cap, S34 final-merge hash-set dedup) into spot/bucket2. `run_pipeline.sh`: optimize_chunked now runs on **1 GPU in plain (spot off) runs too** (user 2026-11-23), so plain vs spot differs only in Step 4 / Step 6 / prune; `OPT_MGPU=1` restores multi-GPU optimize for plain runs. `spot_build.sh` follows the same rule.
+
+**Correctness.** `spot_det.sh sift10M G d2_gG` (spot vs plain, byte identity): G=4 / 2 / 1 **EQUAL**.
+
+**SIFT100M (median of 3, `runs/merge1`; G=4 on GPUs 0–3, G=2 on 2,3).** G=4 and G=2 plain were rerun with 1-GPU optimize (`chain2b.sh`): the first G=4 plain and the first G=2 plain (started 17:58, before the 18:00 script change) used multi-GPU optimize; kept as `*_plain_optmgpu`.
+
+| G | config | total | bucket2 | Step 4 | Step 6 | prune | optimize | b2+prune |
+|---|---|---|---|---|---|---|---|---|
+| 4 | plain | 193.08 | 140.9 | 33.6 | 53.6 | 26.6 | 22.6 | 167.5 |
+| 4 | plain (multi-GPU optimize) | 179.70 | 138.0 | 34.0 | 51.6 | 27.4 | 15.6 | 165.5 |
+| 4 | spot none | 191.36 | 141.3 | 34.4 | 52.1 | 30.4 | 22.0 | 171.7 (**+2.5 %**) |
+| 4 | spot t1 | 230.80 | 174.4 | 64.7 | 58.2 | 31.0 | 22.7 | 205.4 |
+| 2 | plain | 239.50 | 188.2 | 53.4 | 82.8 | 29.7 | 22.3 | 217.9 |
+| 2 | plain (multi-GPU optimize) | 234.63 | 188.6 | 53.4 | 83.3 | 30.4 | 16.8 | 219.0 |
+| 2 | spot none | 240.78 | 189.1 | 54.1 | 82.5 | 29.2 | 22.4 | 218.3 (**+0.2 %**) |
+| 2 | spot t1 | 259.79 | 207.8 | 53.3 | 102.7 | 30.2 | 22.0 | 238.0 |
+| 1 | plain | 364.56 | 304.2 | 92.8 | 158.2 | 38.6 | 21.9 | 342.9 |
+| 1 | spot none | 365.26 | 303.9 | 93.7 | 157.6 | 38.6 | 22.4 | 342.4 (**−0.1 %**) |
+| 1 | spot t1 | 387.95 | 326.8 | 111.4 | 163.9 | 38.9 | 22.8 | 365.7 |
+
+No-event overhead (spot none vs plain): b2+prune −0.1 / +0.2 / +2.5 %, total +0.2 / +0.5 / −0.9 % (G=1 / 2 / 4); gate (+3 %) passes at every G. Remaining G=4 gap is the spot prune tail (30.4 vs 26.6 s). The merge (S32/S34) cut prune by ~9–17 s vs SP7 (G=1 47.6 → 38.6) and t1 totals by 7–11 % at G=2/4.
+
+**Search quality.** Every run: bad_ids = self_loops = dup_edges = 0; recall@10 (CAGRA itopk 32/64/128/256/512) 0.724–0.728 / 0.832–0.834 / 0.911 / 0.959 / 0.983–0.984 for all 11 runs; judge: no quality failures (only "incomplete bench set", expected: the spot loop runs SIFT100M only).
+
+**best_spot.json.** `judge --update --add-new` changes nothing (no new keys, verdict REJECT for the incomplete bench set), so the update was done better-only by hand: 8 keys replaced by faster SP8 runs; `sift100M_auto_g1_spott1` kept at 386.77 (SP8 387.95). Plain keys now hold 1-GPU-optimize totals.
+
+**Note.** `chain2.sh` waited with `pgrep -f "runs/merge1/chain.sh"`, which also matched the Claude session's own command line → deadlock; restarted as `chain2b.sh` without the wait. Use pid files / a done marker instead of `pgrep -f` with a path.

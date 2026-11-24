@@ -56,7 +56,7 @@ stop_sim() {
   SIM_PID=""; SPOT_DIR=""; unset BUCKET2_SPOT_DIR
 }
 trap stop_sim EXIT
-OC_G=$G
+OC_G=1; [[ ${OPT_MGPU:-0} == 1 ]] && OC_G=$G   # optimize single-GPU in plain runs too (user 2026-11-23)
 if [[ -n $TRACE ]]; then
   SPOT_DIR=/dev/shm/spot_sim/build_$$; rm -rf $SPOT_DIR; mkdir -p $SPOT_DIR
   tr=""; [[ $TRACE != none ]] && tr=$TRACE
