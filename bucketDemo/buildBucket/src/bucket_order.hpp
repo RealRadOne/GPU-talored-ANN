@@ -27,6 +27,7 @@
 #include <limits>
 #include <utility>
 #include <vector>
+#include <stdexcept>
 
 namespace bucket_order {
 
@@ -276,10 +277,14 @@ inline Adjacency adjacency_from_nested(
 // bucket being processed, or as a neighbor of the bucket being processed.
 inline std::vector<std::vector<int32_t>> compute_future_access_lists(
     const std::vector<int32_t>& order, const Adjacency& adj) {
-    const int32_t B = static_cast<int32_t>(order.size());
+    // 表按桶 id 下标，大小 = 桶总数 (adj.size()，按全部 centroid 建)，不是 order 的长度：
+    // 多 GPU 时 order 只是处理顺序的一段 (多卡 Step 6 / prune)，用 order.size() 会越界写 (SIFT100M 段错误)
+    const int32_t n_pos = static_cast<int32_t>(order.size());
+    const int32_t B = static_cast<int32_t>(std::max(order.size(), adj.size()));
     std::vector<std::vector<int32_t>> future(B);
-    for (int32_t pos = 0; pos < B; ++pos) {
+    for (int32_t pos = 0; pos < n_pos; ++pos) {
         int32_t b = order[pos];
+        if (b < 0 || b >= B) throw std::runtime_error("compute_future_access_lists: bucket id out of range");
         future[b].push_back(pos);
         for (int32_t nb : adj[b]) {
             if (nb >= 0 && nb < B) future[nb].push_back(pos);

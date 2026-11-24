@@ -1,0 +1,86 @@
+diff --git a/bucketDemo/buildBucket/src/bucket.cu b/bucketDemo/buildBucket/src/bucket.cu
+index 6c89d31..40af53c 100644
+--- a/bucketDemo/buildBucket/src/bucket.cu
++++ b/bucketDemo/buildBucket/src/bucket.cu
+@@ -9387,6 +9387,7 @@ int run_pipeline_impl(
+         // Step 4: Batch assign — GPU centroids + graph reused, no re-upload
+         // ================================================================
+         std::cout << "=== Step 4: Batch assignment ===\n";
++        if (iter > 0) join_reorder_write();   // S6: round 2..t 的 Step 4 读 data_reordered (Step 4.5 可能还在后台写)
+         auto t4 = Clock::now();
+ 
+         // Step 6 需要 centroid 坐标做邻居扩展; 在 Step 4 释放 GPU centroids 前先存 CPU
+@@ -9656,10 +9657,23 @@ int run_pipeline_impl(
+                     if (static_cast<int64_t>(o) >= N) throw std::runtime_error("Inline reorder: inverse_perm out of range");   // bounds check
+                     perm[o] = static_cast<uint32_t>(i);
+                 }
++                // #91: 多轮、整份重排数据放得进 host 预算时单窗: 输入只读一遍 (原来 2 窗各读一遍)，窗缓冲留作
++                // r1_blob (round 2 的重新采样 + round 1 Step 6 直接用，不再从刚写的文件读回)。BUCKET2_R1_BLOB=0 关掉。
++                // 参考 cuVS cagra_ace.cuh::ace_check_use_disk_mode: 放得进内存就走内存模式，放不下才落盘再读
++                const char* win_env = std::getenv("BUCKET2_REORDER_WIN_GB");   // A/B: 窗大小 (GB)，覆盖上面的规则
++                const int64_t row_bytes0 = static_cast<int64_t>(D) * static_cast<int64_t>(sizeof(DataT));
++                const bool keep_blob = iterations > 1 && !win_env &&
++                    static_cast<size_t>(N) * static_cast<size_t>(row_bytes0) <= host_raw_budget &&
++                    !(std::getenv("BUCKET2_R1_BLOB") && std::getenv("BUCKET2_R1_BLOB")[0] == '0');
++                // S6 (scale loop): blob 模式下 data_reordered 后台写 (write_reordered_async，round 2 Step 4 读文件前 join)。
++                // 原来 Step 4.5 同步写完 12.8 GB 才开始 round 1 Step 6；S1 之后 round 1 Step 6 不写盘，正好跟这次写重叠。
++                // 只有 prune (另一个进程，bucket2 退出前 join) 和 round 2..t 的 Step 4 读这个文件。BUCKET2_REORDER_SYNC=1 退回同步写。
++                const bool async_write = keep_blob &&
++                    !(std::getenv("BUCKET2_REORDER_SYNC") && std::getenv("BUCKET2_REORDER_SYNC")[0] == '1');
+                 const int in_fd = ::open(working_input_path.c_str(), O_RDONLY);
+                 if (in_fd < 0) throw std::runtime_error("Inline reorder: cannot open " + working_input_path);
+-                const int out_fd = ::open(data_reordered_path.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0644);
+-                if (out_fd < 0) { ::close(in_fd); throw std::runtime_error("Inline reorder: cannot create " + data_reordered_path); }
++                const int out_fd = async_write ? -1 : ::open(data_reordered_path.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0644);
++                if (!async_write && out_fd < 0) { ::close(in_fd); throw std::runtime_error("Inline reorder: cannot create " + data_reordered_path); }
+                 auto pio = [](bool wr, int fd, char* p, size_t n, off_t off) {
+                     while (n > 0) {
+                         ssize_t r = wr ? ::pwrite(fd, p, n, off) : ::pread(fd, p, n, off);
+@@ -9668,7 +9682,7 @@ int run_pipeline_impl(
+                     }
+                     return true;
+                 };
+-                {
++                if (!async_write) {
+                     int32_t hdr[2] = {static_cast<int32_t>(N), static_cast<int32_t>(D)};
+                     if (!pio(true, out_fd, reinterpret_cast<char*>(hdr), sizeof(hdr), 0))
+                         throw std::runtime_error("Inline reorder: header write failed");
+@@ -9676,15 +9690,8 @@ int run_pipeline_impl(
+                 const off_t hdr_bytes = 2 * sizeof(int32_t);
+                 // #77: 每一窗都要把整份输入读一遍 (随机置换下每个 8 MB 块都有行落进每一窗)，窗按 host
+                 // 预算的一半定 (至少 4 GB): msTuring100M 40 GB 输入 4 GB 窗 = 10 遍 ≈ 400 GB 拷贝 → 23 GB 窗 2 遍
+-                const char* win_env = std::getenv("BUCKET2_REORDER_WIN_GB");   // A/B: 窗大小 (GB)，覆盖上面的规则
+                 const int64_t win_bytes = win_env ? std::max<int64_t>(1, std::atoll(win_env)) << 30
+                                                   : std::max<int64_t>(int64_t(4) << 30, static_cast<int64_t>(host_raw_budget / 2));
+-                // #91: 多轮、整份重排数据放得进 host 预算时单窗: 输入只读一遍 (原来 2 窗各读一遍)，窗缓冲留作
+-                // r1_blob (round 2 的重新采样 + round 1 Step 6 直接用，不再从刚写的文件读回)。BUCKET2_R1_BLOB=0 关掉。
+-                // 参考 cuVS cagra_ace.cuh::ace_check_use_disk_mode: 放得进内存就走内存模式，放不下才落盘再读
+-                const bool keep_blob = iterations > 1 && !win_env &&
+-                    static_cast<size_t>(N) * static_cast<size_t>(row_bytes) <= host_raw_budget &&
+-                    !(std::getenv("BUCKET2_R1_BLOB") && std::getenv("BUCKET2_R1_BLOB")[0] == '0');
+                 const int64_t win_rows = keep_blob ? N : std::max<int64_t>(1, std::min<int64_t>(N, win_bytes / row_bytes));
+                 const int64_t chunk_rows = std::max<int64_t>(1, (int64_t(8) << 20) / row_bytes);
+                 const int64_t n_chunks = (N + chunk_rows - 1) / chunk_rows;
+@@ -9717,6 +9724,7 @@ int run_pipeline_impl(
+                         }
+                     }
+                     if (!io_ok) break;
++                    if (async_write) break;   // 单窗 (keep_blob)，下面整块交给后台写
+                     // 窗内容顺序写出 (按 64 MB 片并行)
+                     const int64_t wn = (w1 - w0) * row_bytes;
+                     const int64_t piece = int64_t(64) << 20;
+@@ -9731,10 +9739,13 @@ int run_pipeline_impl(
+                     if (!io_ok) break;
+                 }
+                 ::close(in_fd);
+-                if (::close(out_fd) != 0) io_ok = false;
++                if (!async_write && ::close(out_fd) != 0) io_ok = false;
+                 if (!io_ok) throw std::runtime_error("Inline reorder: I/O failed writing " + data_reordered_path);
+                 if (keep_blob) {
+                     r1_blob = std::shared_ptr<char[]>(win.release());
++                    if (async_write)   // holder = r1_blob: round 1 之后 r1_blob.reset() 也要等写完才释放
++                        write_reordered_async(data_reordered_path, reinterpret_cast<const DataT*>(r1_blob.get()),
++                                              static_cast<size_t>(N) * static_cast<size_t>(D), r1_blob);
+                     std::cout << "  [Step4.5] reordered dataset kept in host memory for round 1 / resample: "
+                               << static_cast<double>(N) * row_bytes / 1e9 << " GB (#91)\n";
+                 }

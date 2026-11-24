@@ -1,0 +1,600 @@
+diff --git a/bucketDemo/buildBucket/src/bucket.cu b/bucketDemo/buildBucket/src/bucket.cu
+index 6c89d31..eed632f 100644
+--- a/bucketDemo/buildBucket/src/bucket.cu
++++ b/bucketDemo/buildBucket/src/bucket.cu
+@@ -69,6 +69,7 @@
+ #include "bucket_build.cuh"
+ #include "bucket_order.hpp"
+ #include "graph_io.hpp"
++#include "knn_compact.hpp"
+ #include "reordered_dataset_io.hpp"
+ 
+ namespace po = boost::program_options;
+@@ -153,6 +154,8 @@ struct LoadConfig {
+     size_t bucket_mem_mb = 0;
+     // out-of-core Step 6 arrival 记录放内存的预算 (MB, 0 = 全部落盘)，见 ChunkedKnnAccumulator::mem_arrival
+     size_t arrival_mem_mb = 0;
++    // S7: 最终 vector_knn.bin 写成紧凑格式 (knn_compact.hpp；prune / optimize / knn_similarity 两种格式都能读)
++    bool knn_compact = false;
+ 
+     // Output
+     bool save_dists;               // 写 vector_dists.bin (default true)；流水线后续阶段不读它
+@@ -617,6 +620,9 @@ LoadConfig parse_load_config(const po::variables_map& vm) {
+     if (vm.count("bucket-mem-mb")) {
+         config.bucket_mem_mb = vm["bucket-mem-mb"].as<size_t>();
+     }
++    if (vm.count("knn-compact")) {
++        config.knn_compact = vm["knn-compact"].as<bool>();
++    }
+     if (vm.count("arrival-mem-mb")) {
+         config.arrival_mem_mb = vm["arrival-mem-mb"].as<size_t>();
+     }
+@@ -6015,6 +6021,26 @@ struct ChunkedKnnAccumulator {
+     int cur_iter = 0;
+     void set_arrival_mem_budget(size_t bytes) { arrival_mem_budget = bytes; }
+ 
++    // S7: 最终 merge 把 vector_knn.bin 写成紧凑格式 (knn_compact.hpp)。chunk 起点对齐到 kGroupRows (create 的
++    // chunk_align)，每组都在一个 chunk 里。chunk 编码后的偏移按 chunk 顺序分配 (等前一个 chunk 定下长度)，
++    // 文件内容跟线程完成顺序无关 → 逐字节确定 (det_check 照样比 vector_knn.bin)。
++    bool knn_compact = false;
++    std::vector<knn_compact::GroupEnt> cgroups;
++    std::vector<uint64_t> seq_end;
++    std::vector<char> seq_done;
++    std::unique_ptr<std::mutex> seq_mtx = std::make_unique<std::mutex>();
++    std::unique_ptr<std::condition_variable> seq_cv = std::make_unique<std::condition_variable>();
++    uint64_t compact_bytes = 0;
++    uint64_t seq_reserve(int64_t c, uint64_t bytes) {
++        std::unique_lock<std::mutex> lk(*seq_mtx);
++        seq_cv->wait(lk, [&] { return c == 0 || seq_done[static_cast<size_t>(c - 1)]; });
++        const uint64_t off = (c == 0) ? knn_compact::data_start(cgroups.size()) : seq_end[static_cast<size_t>(c - 1)];
++        seq_end[static_cast<size_t>(c)] = off + bytes;
++        seq_done[static_cast<size_t>(c)] = 1;
++        seq_cv->notify_all();
++        return off;
++    }
++
+     static std::string iter_path(const std::string& dir, int64_t c, int iter) {
+         return dir + "/chunk_" + std::to_string(c) + "_iter" + std::to_string(iter) + ".bin";
+     }
+@@ -6061,7 +6087,7 @@ struct ChunkedKnnAccumulator {
+     // dir 必须已存在 (调用方负责创建); cpu_mem_budget_bytes 用来限制 merge
+     // 阶段并行处理多少个 chunk (每个 chunk 需要 chunk_size*M*4B*2 常驻内存)。
+     static ChunkedKnnAccumulator create(const std::string& dir, int64_t N, int M,
+-                                        size_t cpu_mem_budget_bytes) {
++                                        size_t cpu_mem_budget_bytes, int64_t chunk_align = 1) {
+         ChunkedKnnAccumulator acc;
+         acc.dir = dir;
+         acc.N = N;
+@@ -6112,6 +6138,10 @@ struct ChunkedKnnAccumulator {
+             (N + chunk_size_from_mem - 1) / chunk_size_from_mem);
+         acc.num_chunks = std::min(n_by_mem, kMaxOpenChunks);
+         acc.chunk_size = (N + acc.num_chunks - 1) / acc.num_chunks;
++        if (chunk_align > 1) {   // S7: chunk 起点对齐 (紧凑 vector_knn 的组不跨 chunk)；chunk 只会变大 → 数量只会变少
++            acc.chunk_size = (acc.chunk_size + chunk_align - 1) / chunk_align * chunk_align;
++            acc.num_chunks = (N + acc.chunk_size - 1) / acc.chunk_size;
++        }
+ 
+         size_t per_chunk_bytes = static_cast<size_t>(acc.chunk_size) * bytes_per_point;
+         int budget_threads = static_cast<int>(std::max<size_t>(1,
+@@ -6345,7 +6375,17 @@ struct ChunkedKnnAccumulator {
+                 }
+                 return fd;
+             };
+-            fd_knn = open_out(final_knn_path);
++            if (knn_compact) {
++                fd_knn = ::open(final_knn_path.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0644);
++                if (fd_knn < 0) throw std::runtime_error("ChunkedKnnAccumulator: cannot open " + final_knn_path);
++                cgroups.assign(static_cast<size_t>(knn_compact::n_groups_of(N, knn_compact::kGroupRows)), knn_compact::GroupEnt{0, 0, 0});
++                seq_end.assign(static_cast<size_t>(num_chunks), 0);
++                seq_done.assign(static_cast<size_t>(num_chunks), 0);
++                if (chunk_size % knn_compact::kGroupRows != 0)
++                    throw std::runtime_error("ChunkedKnnAccumulator: compact vector_knn needs chunk_size % kGroupRows == 0");
++            } else {
++                fd_knn = open_out(final_knn_path);
++            }
+             if (!final_dist_path.empty()) fd_dist = open_out(final_dist_path);   // 空 = 不写 vector_dists
+         }
+         auto pwrite_all = [](int fd, const void* buf, size_t n, off_t off) {
+@@ -6370,6 +6410,7 @@ struct ChunkedKnnAccumulator {
+             std::vector<int32_t> new_nbrs(static_cast<size_t>(M));
+             std::vector<float>   new_dists(static_cast<size_t>(M));
+             std::vector<char>    arrival_buf;
++            std::vector<char>    enc;   // S7: 紧凑 vector_knn 的 chunk 编码缓冲
+             // 按线程复用的 running 缓冲区，容量按最大 chunk (chunk_size) 一次
+             // 分配到位；后面每个 chunk 只 resize (只有第一次真正触发分配，
+             // 之后 resize 到更小/相等的大小不会重新分配)，避免每个 chunk 都
+@@ -6387,7 +6428,10 @@ struct ChunkedKnnAccumulator {
+                 auto t0 = now();
+                 int64_t chunk_start = c * chunk_size;
+                 int64_t chunk_c_size = std::min(chunk_size, N - chunk_start);
+-                if (chunk_c_size <= 0) continue;
++                if (chunk_c_size <= 0) {
++                    if (is_final && knn_compact) seq_reserve(c, 0);   // 后面的 chunk 在等它的偏移
++                    continue;
++                }
+                 ChunkTiming& tm = timing[static_cast<size_t>(c)];
+                 tm.thread_id = omp_get_thread_num();
+                 tm.start_ms = secs_between(t_merge_start, t0) * 1000.0;
+@@ -6488,8 +6532,30 @@ struct ChunkedKnnAccumulator {
+                 if (is_final) {
+                     // chunk c 在最终文件里是第 [chunk_start, chunk_start+chunk_c_size) 行
+                     const off_t ofs = hdr + static_cast<off_t>(chunk_start) * M * 4;
+-                    if (!pwrite_all(fd_knn, run_nbrs.data(), run_nbrs.size() * sizeof(int32_t), ofs) ||
+-                        (fd_dist >= 0 && !pwrite_all(fd_dist, run_dists.data(), run_dists.size() * sizeof(float), ofs)))
++                    if (knn_compact) {
++                        // S7: 按组编码 (组首行 = chunk_start + k·B)，按 chunk 顺序拿偏移，整块写
++                        enc.clear();
++                        const int64_t B = knn_compact::kGroupRows;
++                        std::vector<uint32_t> gbytes;
++                        for (int64_t r0 = 0; r0 < chunk_c_size; r0 += B) {
++                            const int64_t n = std::min<int64_t>(B, chunk_c_size - r0);
++                            gbytes.push_back(static_cast<uint32_t>(knn_compact::encode_rows(
++                                run_nbrs.data() + static_cast<size_t>(r0) * M, chunk_start + r0, n, M, enc)));
++                        }
++                        const uint64_t off = seq_reserve(c, enc.size());
++                        uint64_t rel = 0;
++                        const int64_t g0 = chunk_start / B;
++                        for (size_t k = 0; k < gbytes.size(); ++k) {
++                            const size_t g = static_cast<size_t>(g0) + k;
++                            if (g >= cgroups.size()) throw std::runtime_error("ChunkedKnnAccumulator: compact group out of range");   // bounds check
++                            cgroups[g] = knn_compact::GroupEnt{off + rel, gbytes[k], 0};
++                            rel += gbytes[k];
++                        }
++                        if (!pwrite_all(fd_knn, enc.data(), enc.size(), static_cast<off_t>(off)))
++                            throw std::runtime_error("ChunkedKnnAccumulator: compact pwrite failed for chunk " + std::to_string(c));
++                    } else if (!pwrite_all(fd_knn, run_nbrs.data(), run_nbrs.size() * sizeof(int32_t), ofs))
++                        throw std::runtime_error("ChunkedKnnAccumulator: final pwrite failed for chunk " + std::to_string(c));
++                    if (fd_dist >= 0 && !pwrite_all(fd_dist, run_dists.data(), run_dists.size() * sizeof(float), ofs))
+                         throw std::runtime_error("ChunkedKnnAccumulator: final pwrite failed for chunk " + std::to_string(c));
+                     if (base_iter >= 0) { std::filesystem::remove(np); std::filesystem::remove(dp); }
+                 } else if (defer) {
+@@ -6517,6 +6583,16 @@ struct ChunkedKnnAccumulator {
+             kth_done.swap(kth_work);
+             kth_valid = true;
+         }
++        if (is_final && knn_compact) {   // S7: 最后写 header + 组表
++            const knn_compact::Header h{knn_compact::kMagic, N, static_cast<int32_t>(M), knn_compact::kGroupRows,
++                                        static_cast<uint64_t>(cgroups.size())};
++            if (!pwrite_all(fd_knn, &h, sizeof(h), 0) ||
++                !pwrite_all(fd_knn, cgroups.data(), cgroups.size() * sizeof(knn_compact::GroupEnt), sizeof(h)))
++                throw std::runtime_error("ChunkedKnnAccumulator: compact header/table write failed");
++            compact_bytes = seq_end.empty() ? 0 : seq_end.back();
++            std::cout << "[ChunkedKNN] compact vector_knn.bin: " << compact_bytes / 1e9 << " GB (fixed-width "
++                      << static_cast<double>(N) * M * 4 / 1e9 << " GB)\n";
++        }
+         if (is_final) {
+             if (::close(fd_knn) != 0 || (fd_dist >= 0 && ::close(fd_dist) != 0))
+                 throw std::runtime_error("ChunkedKnnAccumulator: close failed for final outputs");
+@@ -9137,13 +9213,18 @@ int run_pipeline_impl(
+         // 跑完(两轮的 merge 都会读写同一份 running_chunk 文件，不能同时跑)。
+         std::unique_ptr<ChunkedKnnAccumulator> knn_acc;
+         std::future<void> pending_knn_merge;
++        // S7: 紧凑 vector_knn 只在不写 neighbors.npy 时 (convert_vector_knn_to_npy 只读定长格式)
++        const bool use_knn_compact = config.knn_compact && !config.save_npy;
++        if (config.knn_compact && config.save_npy)
++            std::cout << "[ChunkedKNN] --knn-compact ignored: neighbors.npy output needs the fixed-width vector_knn.bin\n";
+         std::string knn_chunk_tmp_dir = output_dir + "/knn_chunks_tmp";
+         if (neighbors_m > 0 && !gres) {
+             std::filesystem::create_directories(knn_chunk_tmp_dir);
+             knn_acc = std::make_unique<ChunkedKnnAccumulator>(
+                 ChunkedKnnAccumulator::create(
+                     knn_chunk_tmp_dir, N, static_cast<int>(neighbors_m),
+-                    config.cpu_limit_bytes / 4));
++                    config.cpu_limit_bytes / 4, use_knn_compact ? knn_compact::kGroupRows : 1));
++            knn_acc->knn_compact = use_knn_compact;
+             knn_acc->set_arrival_mem_budget(config.arrival_mem_mb << 20);
+             std::cout << "[ChunkedKNN] arrival records in host memory up to " << config.arrival_mem_mb << " MB\n";
+         }
+@@ -10311,6 +10392,9 @@ int main(int argc, char** argv) {
+             ("kmeans-train-fraction", po::value<float>(),
+                 "Step 2 (dataset fits on GPU): train KMeans|| on this random fraction of the points "
+                 "(centroid count stays N*centroid-ratio; default 1.0 = all points)")
++            ("knn-compact", po::bool_switch()->default_value(false),
++                "Out-of-core: write the final vector_knn.bin in the compact varint format (knn_compact.hpp, lossless); "
++                "ignored with neighbors.npy output")
+             ("arrival-mem-mb", po::value<size_t>(),
+                 "Out-of-core Step 6: keep the per-round arrival records in host memory up to this budget in MB "
+                 "(default 0 = all on disk); the rest is written to the chunk files as before")
+diff --git a/bucketDemo/buildBucket/src/graph_io.hpp b/bucketDemo/buildBucket/src/graph_io.hpp
+index 64daeae..bb53170 100644
+--- a/bucketDemo/buildBucket/src/graph_io.hpp
++++ b/bucketDemo/buildBucket/src/graph_io.hpp
+@@ -41,6 +41,7 @@
+ #include <stdexcept>
+ #include <string>
+ #include <vector>
++#include "knn_compact.hpp"
+ 
+ namespace graph_io {
+ 
+@@ -347,37 +348,21 @@ inline void write_vector_knn(const std::string& path,
+ // contiguous row range (seek + sequential read) without loading the whole
+ // file. One instance per (single-threaded) reader; not thread-safe (shares
+ // one seek position / one ifstream).
+-class VectorKnnReader {
++class VectorKnnReader {   // S7: 定长 / 紧凑两种格式 (knn_compact::AnyReader)
+ public:
+-    explicit VectorKnnReader(const std::string& path) : in_(path, std::ios::binary) {
+-        if (!in_.is_open())
+-            throw std::runtime_error("Cannot open vector_knn: " + path);
+-        in_.read(reinterpret_cast<char*>(&N_), sizeof(int64_t));
+-        in_.read(reinterpret_cast<char*>(&M_), sizeof(int32_t));
+-        if (!in_.good() || N_ <= 0 || M_ <= 0)
+-            throw std::runtime_error("Invalid vector_knn header: " + path);
+-        header_bytes_ = static_cast<std::streamoff>(sizeof(int64_t) + sizeof(int32_t));
+-    }
++    explicit VectorKnnReader(const std::string& path) : r_(path) {}
+ 
+-    int64_t N() const { return N_; }
+-    int32_t M() const { return M_; }
++    int64_t N() const { return r_.N(); }
++    int32_t M() const { return r_.M(); }
+ 
+     // Reads rows [row_lo, row_hi) into out (resized to (row_hi-row_lo)*M()).
+     void read_rows(int64_t row_lo, int64_t row_hi, std::vector<int32_t>& out) {
+-        int64_t n_rows = row_hi - row_lo;
+-        out.resize(static_cast<size_t>(n_rows) * M_);
+-        in_.seekg(header_bytes_ + static_cast<std::streamoff>(row_lo) * M_ * sizeof(int32_t));
+-        in_.read(reinterpret_cast<char*>(out.data()),
+-                 static_cast<std::streamsize>(out.size() * sizeof(int32_t)));
+-        if (!in_.good())
+-            throw std::runtime_error("VectorKnnReader: read_rows failed");
++        out.resize(static_cast<size_t>(row_hi - row_lo) * r_.M());
++        r_.read_rows(row_lo, row_hi - row_lo, out.data());
+     }
+ 
+ private:
+-    std::ifstream in_;
+-    int64_t N_ = 0;
+-    int32_t M_ = 0;
+-    std::streamoff header_bytes_ = 0;
++    knn_compact::AnyReader r_;
+ };
+ 
+ // Generic flat binary vector read/write, used for perm.bin / inverse_perm.bin.
+diff --git a/bucketDemo/buildBucket/src/knn_compact.hpp b/bucketDemo/buildBucket/src/knn_compact.hpp
+new file mode 100644
+index 0000000..8216b5f
+--- /dev/null
++++ b/bucketDemo/buildBucket/src/knn_compact.hpp
+@@ -0,0 +1,170 @@
++#pragma once
++// S7 (scale loop): 紧凑 vector_knn 格式 (无损，读回后逐位相同)。
++//
++// SIFT100M 的 vector_knn.bin 是 N·M·4 B = 25.6 GB，bucket2 最终 merge 写它时被 dirty 页阈值限速 (G=2 时整条流水线
++// 卡在写盘字节数上，见 OPTIMIZATION_LOG_SCALE.md S3–S6)。重排后近邻 id 跟本点 id 接近:
++// zigzag(nbr − gid) 的 varint 平均 ~3 B/id (sift10M 实测 3.03)。
++//
++// 格式 (文件名不变，靠 magic 区分; 老格式开头是正的 int64 N，老读者遇到新文件会报 header 无效而不是读错):
++//   Header   { uint64 magic; int64 N; int32 M; int32 B; uint64 n_groups }      (32 B)
++//   GroupEnt { uint64 off; uint32 bytes; uint32 pad } × n_groups               (行 [g·B, min(N,(g+1)·B)) 的数据位置)
++//   数据: 每行 M 个 varint(zigzag(nbr − gid))，一组内按行连续
++// 读任意行区间 [lo, lo+n): 只读覆盖它的组 (相邻组在文件里连续时合成一次 pread)，从组首逐行解码。
++#include <algorithm>
++#include <cstdint>
++#include <cstring>
++#include <stdexcept>
++#include <string>
++#include <vector>
++#include <fcntl.h>
++#include <unistd.h>
++
++namespace knn_compact {
++
++constexpr uint64_t kMagic = 0x80000000314E4B43ull;   // "CKN1" + 最高位 (老读者把它当 N < 0 → header 无效)
++constexpr int32_t kGroupRows = 256;
++
++struct Header { uint64_t magic; int64_t N; int32_t M; int32_t B; uint64_t n_groups; };
++struct GroupEnt { uint64_t off; uint32_t bytes; uint32_t pad; };
++static_assert(sizeof(Header) == 32 && sizeof(GroupEnt) == 16, "knn_compact: layout");
++
++inline uint64_t n_groups_of(int64_t N, int32_t B) { return static_cast<uint64_t>((N + B - 1) / B); }
++inline uint64_t data_start(uint64_t n_groups) { return sizeof(Header) + n_groups * sizeof(GroupEnt); }
++inline size_t max_row_bytes(int M) { return static_cast<size_t>(M) * 10; }
++
++// 行 gid0 .. gid0+n-1 (每行 M 个 int32，-1 = 空位) 编码追加到 out，返回追加的字节数
++inline size_t encode_rows(const int32_t* rows, int64_t gid0, int64_t n, int M, std::vector<char>& out) {
++    const size_t start = out.size();
++    out.resize(start + static_cast<size_t>(n) * max_row_bytes(M));
++    char* p = out.data() + start;
++    for (int64_t r = 0; r < n; ++r) {
++        const int64_t gid = gid0 + r;
++        const int32_t* row = rows + static_cast<size_t>(r) * M;
++        for (int m = 0; m < M; ++m) {
++            const int64_t d = static_cast<int64_t>(row[m]) - gid;
++            uint64_t z = (static_cast<uint64_t>(d) << 1) ^ static_cast<uint64_t>(d >> 63);
++            while (z >= 0x80) { *p++ = static_cast<char>(z | 0x80); z >>= 7; }
++            *p++ = static_cast<char>(z);
++        }
++    }
++    const size_t used = static_cast<size_t>(p - (out.data() + start));
++    out.resize(start + used);
++    return used;
++}
++
++// 从 p 开始解 n 行 (首行 id = gid0) 到 out；越界 / 格式错返回 nullptr
++inline const char* decode_rows(const char* p, const char* end, int64_t gid0, int64_t n, int M, int32_t* out) {
++    for (int64_t r = 0; r < n; ++r) {
++        const int64_t gid = gid0 + r;
++        for (int m = 0; m < M; ++m) {
++            uint64_t z = 0;
++            for (int sh = 0;; sh += 7) {
++                if (p >= end || sh > 63) return nullptr;
++                const uint64_t b = static_cast<uint8_t>(*p++);
++                z |= (b & 0x7f) << sh;
++                if (!(b & 0x80)) break;
++            }
++            const int64_t d = static_cast<int64_t>(z >> 1) ^ -static_cast<int64_t>(z & 1);
++            out[static_cast<size_t>(r) * M + m] = static_cast<int32_t>(gid + d);
++        }
++    }
++    return p;
++}
++
++inline void pread_full(int fd, char* p, size_t n, off_t off, const std::string& what) {
++    while (n > 0) {
++        const ssize_t r = ::pread(fd, p, n, off);
++        if (r <= 0) throw std::runtime_error("knn_compact: short read on " + what);
++        p += r; n -= static_cast<size_t>(r); off += r;
++    }
++}
++
++// 两种格式都能读的行区间读者 (read_rows 线程安全: 只用 pread，不碰共享状态)
++class AnyReader {
++public:
++    explicit AnyReader(const std::string& path) : path_(path) {
++        fd_ = ::open(path.c_str(), O_RDONLY);
++        if (fd_ < 0) throw std::runtime_error("Cannot open vector_knn: " + path);
++        uint64_t first = 0;
++        pread_full(fd_, reinterpret_cast<char*>(&first), sizeof(first), 0, path);
++        if (first == kMagic) {
++            Header h;
++            pread_full(fd_, reinterpret_cast<char*>(&h), sizeof(h), 0, path);
++            if (h.N <= 0 || h.M <= 0 || h.B <= 0 || h.n_groups != n_groups_of(h.N, h.B))
++                throw std::runtime_error("Invalid compact vector_knn header: " + path);
++            compact_ = true; N_ = h.N; M_ = h.M; B_ = h.B;
++            groups_.resize(static_cast<size_t>(h.n_groups));
++            pread_full(fd_, reinterpret_cast<char*>(groups_.data()), groups_.size() * sizeof(GroupEnt),
++                       static_cast<off_t>(sizeof(Header)), path);
++        } else {
++            int32_t M = 0;
++            pread_full(fd_, reinterpret_cast<char*>(&M), sizeof(M), sizeof(int64_t), path);
++            N_ = static_cast<int64_t>(first); M_ = M;
++            if (N_ <= 0 || M_ <= 0) throw std::runtime_error("Invalid vector_knn header: " + path);
++        }
++    }
++    ~AnyReader() { if (fd_ >= 0) ::close(fd_); }
++    AnyReader(const AnyReader&) = delete;
++    AnyReader& operator=(const AnyReader&) = delete;
++
++    int64_t N() const { return N_; }
++    int32_t M() const { return M_; }
++    bool compact() const { return compact_; }
++
++    // 行 [lo, lo+n) → out (n·M 个 int32)
++    void read_rows(int64_t lo, int64_t n, int32_t* out) const {
++        if (n <= 0) return;
++        if (lo < 0 || lo + n > N_) throw std::runtime_error("knn_compact: rows out of range");   // bounds check
++        if (!compact_) {
++            pread_full(fd_, reinterpret_cast<char*>(out), static_cast<size_t>(n) * M_ * sizeof(int32_t),
++                       static_cast<off_t>(sizeof(int64_t) + sizeof(int32_t)) + static_cast<off_t>(lo) * M_ * sizeof(int32_t),
++                       path_);
++            return;
++        }
++        thread_local std::vector<char> buf;
++        thread_local std::vector<int32_t> tmp;
++        const int64_t g0 = lo / B_, g1 = (lo + n - 1) / B_;
++        int64_t g = g0;
++        while (g <= g1) {
++            // 文件里连续的一串组合成一次 pread
++            int64_t ge = g;
++            uint64_t span = groups_[static_cast<size_t>(g)].bytes;
++            while (ge + 1 <= g1 && groups_[static_cast<size_t>(ge + 1)].off ==
++                                   groups_[static_cast<size_t>(ge)].off + groups_[static_cast<size_t>(ge)].bytes) {
++                ++ge; span += groups_[static_cast<size_t>(ge)].bytes;
++            }
++            buf.resize(static_cast<size_t>(span));
++            pread_full(fd_, buf.data(), static_cast<size_t>(span), static_cast<off_t>(groups_[static_cast<size_t>(g)].off), path_);
++            const char* p = buf.data();
++            const char* const end = buf.data() + buf.size();
++            for (int64_t gg = g; gg <= ge; ++gg) {
++                const int64_t r0 = gg * B_, r1 = std::min<int64_t>(N_, r0 + B_);
++                const int64_t want0 = std::max(lo, r0), want1 = std::min(lo + n, r1);
++                const char* gend = p + groups_[static_cast<size_t>(gg)].bytes;
++                if (want0 == r0) {   // 从组首开始要: 直接解进 out，组尾不要的行不解
++                    if (!decode_rows(p, gend, r0, want1 - r0, M_, out + static_cast<size_t>(want0 - lo) * M_))
++                        throw std::runtime_error("knn_compact: corrupt group " + std::to_string(gg) + " in " + path_);
++                } else {             // 组中间开始: 先解到 tmp 再拷要的行
++                    tmp.resize(static_cast<size_t>(want1 - r0) * M_);
++                    if (!decode_rows(p, gend, r0, want1 - r0, M_, tmp.data()))
++                        throw std::runtime_error("knn_compact: corrupt group " + std::to_string(gg) + " in " + path_);
++                    std::memcpy(out + static_cast<size_t>(want0 - lo) * M_, tmp.data() + static_cast<size_t>(want0 - r0) * M_,
++                                static_cast<size_t>(want1 - want0) * M_ * sizeof(int32_t));
++                }
++                p = gend;
++                if (p > end) throw std::runtime_error("knn_compact: group table overruns span in " + path_);
++            }
++            g = ge + 1;
++        }
++    }
++
++private:
++    std::string path_;
++    int fd_ = -1;
++    bool compact_ = false;
++    int64_t N_ = 0;
++    int32_t M_ = 0, B_ = 0;
++    std::vector<GroupEnt> groups_;
++};
++
++}  // namespace knn_compact
+diff --git a/bucketDemo/buildBucket/src/optimize.cu b/bucketDemo/buildBucket/src/optimize.cu
+index 5f3545c..f12b8fb 100644
+--- a/bucketDemo/buildBucket/src/optimize.cu
++++ b/bucketDemo/buildBucket/src/optimize.cu
+@@ -46,6 +46,7 @@
+ #include <cuvs/neighbors/cagra.hpp>
+ 
+ #include "load.hpp"
++#include "knn_compact.hpp"
+ 
+ namespace po = boost::program_options;
+ 
+@@ -69,21 +70,14 @@ static void read_vector_knn_bin(const std::string& path,
+                                 std::vector<int32_t>& neighbors,
+                                 int64_t& N, int32_t& M)
+ {
+-    std::ifstream in(path, std::ios::binary);
+-    if (!in.is_open())
+-        throw std::runtime_error("Cannot open KNN graph file: " + path);
+-
+-    in.read(reinterpret_cast<char*>(&N), sizeof(int64_t));
+-    in.read(reinterpret_cast<char*>(&M), sizeof(int32_t));
+-    if (!in.good() || N <= 0 || M <= 0)
+-        throw std::runtime_error("Invalid vector_knn.bin header");
+-
+-    const size_t cnt = static_cast<size_t>(N) * static_cast<size_t>(M);
+-    neighbors.resize(cnt);
+-    in.read(reinterpret_cast<char*>(neighbors.data()),
+-            static_cast<std::streamsize>(cnt * sizeof(int32_t)));
+-    if (!in.good())
+-        throw std::runtime_error("Failed to read vector_knn.bin payload");
++    // S7: 定长或紧凑格式 (knn_compact::AnyReader)
++    const knn_compact::AnyReader r(path);
++    N = r.N(); M = r.M();
++    neighbors.resize(static_cast<size_t>(N) * static_cast<size_t>(M));
++    const int64_t kRows = int64_t(1) << 16;
++    #pragma omp parallel for schedule(dynamic) num_threads(16)
++    for (int64_t r0 = 0; r0 < N; r0 += kRows)
++        r.read_rows(r0, std::min<int64_t>(kRows, N - r0), neighbors.data() + static_cast<size_t>(r0) * M);
+ }
+ 
+ // 把 int32 邻居（含 -1 padding）转为 uint32，并修复 padding 与越界。
+@@ -138,13 +132,8 @@ static void sanitize_to_uint32_inplace(
+ // *before* paying for a potentially multi-GB dataset/graph load.
+ static void peek_vector_knn_header(const std::string& path, int64_t& N, int32_t& M)
+ {
+-    std::ifstream in(path, std::ios::binary);
+-    if (!in.is_open())
+-        throw std::runtime_error("Cannot open KNN graph file: " + path);
+-    in.read(reinterpret_cast<char*>(&N), sizeof(int64_t));
+-    in.read(reinterpret_cast<char*>(&M), sizeof(int32_t));
+-    if (!in.good() || N <= 0 || M <= 0)
+-        throw std::runtime_error("Invalid vector_knn.bin header: " + path);
++    const knn_compact::AnyReader r(path);   // S7: 两种格式；只读 header (+ 紧凑格式的组表)
++    N = r.N(); M = r.M();
+ }
+ 
+ // Heuristic only, not exact accounting: raft's sort_knn_graph/optimize
+diff --git a/bucketDemo/buildBucket/src/prune_windowed.cpp b/bucketDemo/buildBucket/src/prune_windowed.cpp
+index 4c42355..c1864ee 100644
+--- a/bucketDemo/buildBucket/src/prune_windowed.cpp
++++ b/bucketDemo/buildBucket/src/prune_windowed.cpp
+@@ -245,6 +245,7 @@ int main(int argc, char** argv)
+         // Step 2: open persistent handles for the two windowed data sources
+         // ================================================================
+         graph_io::VectorKnnReader knn_reader(vknn_path);
++        const knn_compact::AnyReader knn_reader_any(vknn_path);   // S7: 并行按行区间读 (pread，线程安全)
+         if (knn_reader.N() != N)
+             throw std::runtime_error("vector_knn_reordered N (" + std::to_string(knn_reader.N()) +
+                                      ") != bucket_offsets N (" + std::to_string(N) + ")");
+@@ -358,9 +359,16 @@ int main(int argc, char** argv)
+             std::unique_ptr<int32_t[]> all_cand_buf(new int32_t[n_cand]);   // 不初始化，pread 直接填
+             std::unique_ptr<float[]>   all_vec_buf(use_gpu && !f32_data ? nullptr : new float[n_vec]);
+             std::unique_ptr<uint8_t[]> raw_u8;   // u8 数据集时保留原始字节给 GPU kernel
+-            // vector_knn.bin: int64 N + int32 M header (12 B)，之后 (N, M) int32
+-            parallel_pread(vknn_path, static_cast<off_t>(sizeof(int64_t) + sizeof(int32_t)),
+-                           n_cand * sizeof(int32_t), all_cand_buf.get());
++            // vector_knn.bin: 定长 (int64 N + int32 M header，之后 (N, M) int32) 或 S7 紧凑格式
++            if (!knn_reader_any.compact()) {
++                parallel_pread(vknn_path, static_cast<off_t>(sizeof(int64_t) + sizeof(int32_t)),
++                               n_cand * sizeof(int32_t), all_cand_buf.get());
++            } else {
++                const int64_t kRows = int64_t(1) << 16;
++                #pragma omp parallel for schedule(dynamic) num_threads(16)
++                for (int64_t r0 = 0; r0 < N; r0 += kRows)
++                    knn_reader_any.read_rows(r0, std::min<int64_t>(kRows, N - r0), all_cand_buf.get() + static_cast<size_t>(r0) * M_in);
++            }
+             if (u8_data) {
+                 // 跟 load::read_u8bin_chunk_to_f32 同样的转换 (按 uint8 读)，并行做
+                 raw_u8.reset(new uint8_t[n_vec]);
+@@ -544,7 +552,7 @@ int main(int argc, char** argv)
+                 len = static_cast<int32_t>(std::unique(wp, wp + len) - wp);
+                 win_len[static_cast<size_t>(pos)] = len;
+             }
+-            const int fd_k = ::open(vknn_path.c_str(), O_RDONLY);
++            const int fd_k = ::open(vknn_path.c_str(), O_RDONLY);   // (S7: 候选行改由 knn_reader_any 读; 这里只做存在性检查)
+             const int fd_d = ::open(dataset_path.c_str(), O_RDONLY);
+             if (fd_k < 0 || fd_d < 0) throw std::runtime_error("prune_windowed: cannot open inputs for chunked GPU prune");
+             auto pread_all = [](int fd, char* p, size_t n, off_t off) {
+@@ -556,8 +564,7 @@ int main(int argc, char** argv)
+             };
+             auto load_rows = [&](int64_t lo, int64_t n, int32_t* cand, void* vec) {
+                 if (lo < 0 || lo + n > N) throw std::runtime_error("prune_windowed: chunk rows out of range");   // bounds check
+-                pread_all(fd_k, reinterpret_cast<char*>(cand), static_cast<size_t>(n) * M_in * sizeof(int32_t),
+-                          static_cast<off_t>(sizeof(int64_t) + sizeof(int32_t)) + static_cast<off_t>(lo) * M_in * sizeof(int32_t));
++                knn_reader_any.read_rows(lo, n, cand);   // S7: 定长 / 紧凑 vector_knn
+                 pread_all(fd_d, static_cast<char*>(vec), static_cast<size_t>(n) * D_all * pw_elem,
+                           static_cast<off_t>(2 * sizeof(int32_t)) + static_cast<off_t>(lo) * D_all * pw_elem);
+             };
+diff --git a/.claude/skills/optimize-bucket2/scripts/knn_similarity.py b/.claude/skills/optimize-bucket2/scripts/knn_similarity.py
+index 30bdf32..8191b80 100755
+--- a/.claude/skills/optimize-bucket2/scripts/knn_similarity.py
++++ b/.claude/skills/optimize-bucket2/scripts/knn_similarity.py
+@@ -3,13 +3,45 @@
+ reordered id space) is to the exact KNN graph, on 10K sampled base points.
+ 
+ usage: knn_similarity.py vector_knn.bin inverse_perm.bin base_knn_sample10K_k64.ibin
++(vector_knn.bin: fixed-width int32 or the scale-S7 compact format, detected by its magic)
+ prints JSON: recall@{1,10,32,64} = |approx top-k ∩ exact top-k| / k, plus padding rate.
+ """
+ import json, sys, numpy as np
+ 
+ knn_p, inv_p, gt_p = sys.argv[1:4]
+-N, M = int(np.fromfile(knn_p, dtype=np.int64, count=1)[0]), int(np.fromfile(knn_p, dtype=np.int32, offset=8, count=1)[0])
+-knn = np.memmap(knn_p, dtype=np.int32, mode="r", offset=12, shape=(N, M))
++KMAGIC = 0x80000000314E4B43  # scale S7 compact vector_knn (bucketDemo/buildBucket/src/knn_compact.hpp)
++
++
++def compact_rows(path, ids):
++    """Rows `ids` (new-id space) of a compact vector_knn.bin: per 256-row group M zigzag varints of (nbr - gid)."""
++    _, n, m, b, ng = np.fromfile(path, dtype=np.dtype("<u8,<i8,<i4,<i4,<u8"), count=1)[0]
++    tab = np.fromfile(path, dtype=np.dtype([("off", "<u8"), ("bytes", "<u4"), ("pad", "<u4")]), offset=32, count=int(ng))
++    raw = np.memmap(path, dtype=np.uint8, mode="r")
++    out = np.empty((len(ids), int(m)), dtype=np.int32)
++    for g in np.unique(np.asarray(ids) // b):
++        o, nb = int(tab["off"][g]), int(tab["bytes"][g])
++        by = np.asarray(raw[o:o + nb])
++        ends = np.flatnonzero((by & 0x80) == 0)            # last byte of each varint
++        starts = np.concatenate(([0], ends[:-1] + 1))
++        k = np.arange(nb) - np.repeat(starts, ends - starts + 1)   # byte index inside its varint
++        vals = np.bitwise_or.reduceat((by & 0x7F).astype(np.uint64) << (7 * k).astype(np.uint64), starts)
++        z = vals.astype(np.int64)
++        d = (z >> 1) ^ -(z & 1)                             # un-zigzag
++        rows_g = d.reshape(-1, int(m))
++        gid = g * b + np.arange(rows_g.shape[0])
++        rows_g = (rows_g + gid[:, None]).astype(np.int32)
++        sel = np.flatnonzero(np.asarray(ids) // b == g)
++        out[sel] = rows_g[np.asarray(ids)[sel] - g * b]
++    return int(n), int(m), out
++
++
++first = int(np.fromfile(knn_p, dtype=np.uint64, count=1)[0])
++compact = first == KMAGIC
++if compact:
++    _, N, M = (int(x) for x in np.fromfile(knn_p, dtype=np.dtype("<u8,<i8,<i4"), count=1)[0])
++else:
++    N, M = int(np.fromfile(knn_p, dtype=np.int64, count=1)[0]), int(np.fromfile(knn_p, dtype=np.int32, offset=8, count=1)[0])
++    knn = np.memmap(knn_p, dtype=np.int32, mode="r", offset=12, shape=(N, M))
+ inv = np.fromfile(inv_p, dtype=np.uint32)  # inverse_perm[new_id] = orig_id (raw, no header)
+ if inv.size != N:  # tolerate an int64 N header
+     inv = np.fromfile(inv_p, dtype=np.uint32, offset=8)
+@@ -20,7 +52,7 @@ S, k = np.fromfile(gt_p, dtype=np.int32, count=2)
+ sid = np.fromfile(gt_p, dtype=np.int32, offset=8, count=S)
+ gt = np.fromfile(gt_p, dtype=np.int32, offset=8 + 4 * S, count=S * k).reshape(S, k)
+ 
+-rows = np.asarray(knn[perm[sid]])                     # new-id neighbor lists of sampled points
++rows = compact_rows(knn_p, perm[sid])[2] if compact else np.asarray(knn[perm[sid]])   # new-id neighbor lists of sampled points
+ pad = rows < 0
+ cand = np.where(pad, -1, inv[np.clip(rows, 0, N - 1)].astype(np.int64))  # -> original ids
+ out = {"n": int(N), "degree": int(M), "samples": int(S), "padding_rate": float(pad.mean())}

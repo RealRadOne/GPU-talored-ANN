@@ -1,0 +1,93 @@
+diff --git a/.claude/skills/optimize-bucket2-scale/scripts/mgpu_run.sh b/.claude/skills/optimize-bucket2-scale/scripts/mgpu_run.sh
+index 2323fb3..93b66ed 100755
+--- a/.claude/skills/optimize-bucket2-scale/scripts/mgpu_run.sh
++++ b/.claude/skills/optimize-bucket2-scale/scripts/mgpu_run.sh
+@@ -16,6 +16,7 @@ source $S/gpu_select.sh
+ BUCKET2_EXTRA="$BUCKET2_EXTRA --kmeans-train-fraction $KMEANS_TRAIN_FRACTION --cache-mb $CACHE_MB --bucket-mem-mb $BUCKET_MEM_MB --gpu-bucket-cache-mb $GPU_BUCKET_CACHE_MB"
+ (( ${ARRIVAL_MEM_MB:-0} > 0 )) && BUCKET2_EXTRA="$BUCKET2_EXTRA --arrival-mem-mb $ARRIVAL_MEM_MB"   # scale S1 (0 = all on disk / pre-S1 binaries)
+ (( ${BUCKET2_HOST_BUDGET_MB:-0} > 0 )) && BUCKET2_EXTRA="$BUCKET2_EXTRA --host-budget-mb $BUCKET2_HOST_BUDGET_MB"   # scale S21
++(( ${BUCKET2_HOST_BUDGET_MB:-0} > 0 )) && PRUNE_EXTRA="$PRUNE_EXTRA --host-budget-mb $BUCKET2_HOST_BUDGET_MB"   # scale S30 (prune input prefetch gate)
+ CHUNKED_EXTRA="$CHUNKED_EXTRA --host-budget-mb $CHUNKED_HOST_BUDGET_MB"
+ export BUCKET2_A1_PASSES=$A1_PASSES BUCKET2_A7_UNWIN=$A7_UNWIN
+ TAG="k${KNN_K}p${NPROBE}m${NEIGHBORS_M}t${ITERATIONS}"
+diff --git a/.claude/skills/optimize-bucket2/scripts/run_pipeline.sh b/.claude/skills/optimize-bucket2/scripts/run_pipeline.sh
+index 1efc9e5..61cca2b 100755
+--- a/.claude/skills/optimize-bucket2/scripts/run_pipeline.sh
++++ b/.claude/skills/optimize-bucket2/scripts/run_pipeline.sh
+@@ -44,6 +44,7 @@ DSDIR=$DS_DIR
+ BUCKET2_EXTRA="$BUCKET2_EXTRA --kmeans-train-fraction $KMEANS_TRAIN_FRACTION --cache-mb $CACHE_MB --bucket-mem-mb $BUCKET_MEM_MB --gpu-bucket-cache-mb $GPU_BUCKET_CACHE_MB"
+ (( ${ARRIVAL_MEM_MB:-0} > 0 )) && BUCKET2_EXTRA="$BUCKET2_EXTRA --arrival-mem-mb $ARRIVAL_MEM_MB"   # scale S1 (0 = all on disk / pre-S1 binaries)
+ (( ${BUCKET2_HOST_BUDGET_MB:-0} > 0 )) && BUCKET2_EXTRA="$BUCKET2_EXTRA --host-budget-mb $BUCKET2_HOST_BUDGET_MB"   # scale S21 (0 = no shared cap / pre-S21 binaries)
++(( ${BUCKET2_HOST_BUDGET_MB:-0} > 0 )) && PRUNE_EXTRA="$PRUNE_EXTRA --host-budget-mb $BUCKET2_HOST_BUDGET_MB"   # scale S30 (prune input prefetch gate)
+ CHUNKED_EXTRA="$CHUNKED_EXTRA --host-budget-mb $CHUNKED_HOST_BUDGET_MB"
+ # MGPU=G (G > 1): multi-GPU build on G free devices (bucket2 Step 4 / Step 6, prune, optimize_chunked
+ # get --num-gpus G); select_gpu still guards GPU 0. Single-GPU runs (unset / 1) are unchanged.
+diff --git a/bucketDemo/buildBucket/src/prune_windowed.cpp b/bucketDemo/buildBucket/src/prune_windowed.cpp
+index 4c42355..f736dd4 100644
+--- a/bucketDemo/buildBucket/src/prune_windowed.cpp
++++ b/bucketDemo/buildBucket/src/prune_windowed.cpp
+@@ -57,6 +57,7 @@
+ #include <exception>
+ 
+ #include <fcntl.h>
++#include <sys/mman.h>
+ #include <unistd.h>
+ 
+ #include <boost/program_options.hpp>
+@@ -154,6 +155,10 @@ int main(int argc, char** argv)
+                 "or leave both at their auto default)")
+             ("num-gpus", po::value<int>()->default_value(1),
+                 "chunked GPU prune: split the processing positions over visible CUDA devices 0..G-1 (rows written in place)")
++            ("host-budget-mb", po::value<size_t>()->default_value(0),
++                "scale S30: user host-memory budget (MB). When vector_knn + dataset fit in half of it, ask the kernel to read "
++                "them into the page cache at startup (posix_fadvise WILLNEED, sequential) instead of random re-reads later; "
++                "0 = off")
+             ("cache-mb", po::value<size_t>()->default_value(4000),
+                 "Host memory budget (MB) for the Belady bucket cache (candidate rows + vectors)")
+             ("pool-graph", po::value<std::string>()->default_value(""),
+@@ -180,6 +185,45 @@ int main(int argc, char** argv)
+         const int32_t order_window_arg= vm["order-window"].as<int32_t>();
+         const size_t cache_mb         = vm["cache-mb"].as<size_t>();
+         const int num_gpus            = std::max(1, vm["num-gpus"].as<int>());
++        // scale S30: bucket2 的峰值内存 (float32 r1_blob 40 GB 留到 round 2 等) 会把 data_reordered 挤出 page cache，
++        // msTuring100M 上 prune 的 load 从 44–51 s 变成 114–119 s (同样 8.25×N 行，改成读盘)。两份输入合起来不超过
++        // 用户给的 host 预算的一半时，开头对整个文件发 WILLNEED: 内核顺序预读 (~1.8 GB/s)，跟后面的 plan / 窗口构建重叠，
++        // 之后的 load 从 page cache 读。只是 I/O 提示 (内存紧时内核照样回收)，结果不变；1B 规模文件比预算大 → 不发。
++        // PRUNE_PREFETCH=0 关掉。
++        if (vm["host-budget-mb"].as<size_t>() > 0 && !(std::getenv("PRUNE_PREFETCH") && std::getenv("PRUNE_PREFETCH")[0] == '0')) {
++            std::error_code ec1, ec2;
++            const uintmax_t bk = std::filesystem::file_size(vknn_path, ec1), bd = std::filesystem::file_size(dataset_path, ec2);
++            const uintmax_t half = (static_cast<uintmax_t>(vm["host-budget-mb"].as<size_t>()) << 20) / 2;
++            if (!ec1 && !ec2 && bk + bd <= half) {
++                // S30b: 只预读大部分已被挤出 page cache 的文件 (mincore 查驻留 < 50 %)。SIFT100M 输入基本还在 cache 里，
++                // 无条件预读反而跟 prune 的写盘抢盘 (prune G = 2 / 4 +2.4 / +4.6 s)；msTuring100M 的 data_reordered 被挤出。
++                for (const auto& pth : {dataset_path, vknn_path}) {
++                    const int pf = ::open(pth.c_str(), O_RDONLY);
++                    if (pf < 0) continue;
++                    std::error_code ec;
++                    const size_t fsz = static_cast<size_t>(std::filesystem::file_size(pth, ec));
++                    double resident = 1.0;
++                    if (!ec && fsz > 0) {
++                        void* m = ::mmap(nullptr, fsz, PROT_READ, MAP_SHARED, pf, 0);
++                        if (m != MAP_FAILED) {
++                            const size_t pg = static_cast<size_t>(::sysconf(_SC_PAGESIZE));
++                            std::vector<unsigned char> vec((fsz + pg - 1) / pg);
++                            if (::mincore(m, fsz, vec.data()) == 0) {
++                                size_t in = 0;
++                                for (unsigned char v : vec) in += (v & 1);
++                                resident = static_cast<double>(in) / static_cast<double>(vec.size());
++                            }
++                            ::munmap(m, fsz);
++                        }
++                    }
++                    const bool pf_do = resident < 0.5;
++                    if (pf_do) ::posix_fadvise(pf, 0, 0, POSIX_FADV_WILLNEED);
++                    ::close(pf);
++                    std::cout << "  [prune] " << pth.substr(pth.find_last_of('/') + 1) << ": " << fsz / 1e9 << " GB, "
++                              << static_cast<int>(resident * 100) << "% in page cache" << (pf_do ? " -> prefetch (WILLNEED)" : "") << "\n";
++                }
++            }
++        }
+         const bool save_npy           = vm["save-npy"].as<bool>();
+ 
+         using Clock = std::chrono::steady_clock;

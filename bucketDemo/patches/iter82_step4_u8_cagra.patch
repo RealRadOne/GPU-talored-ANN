@@ -1,0 +1,152 @@
+diff --git a/bucketDemo/buildBucket/src/bucket.cu b/bucketDemo/buildBucket/src/bucket.cu
+index d47bfe9..9bec2f1 100644
+--- a/bucketDemo/buildBucket/src/bucket.cu
++++ b/bucketDemo/buildBucket/src/bucket.cu
+@@ -1497,6 +1497,25 @@ template <typename DataT>
+ __global__ void gather_rows_int32(const DataT* __restrict__ src, const int32_t* __restrict__ idx,
+                                   float* __restrict__ dst, int64_t n_dst_rows, int64_t D);
+ 
++// #82: uint8 行 gather (不转 float)，给 Step 4 的 uint8 CAGRA 搜索
++__global__ void gather_rows_u8(const uint8_t* __restrict__ src, const int32_t* __restrict__ idx,
++                               uint8_t* __restrict__ dst, int64_t n_dst_rows, int64_t D)
++{
++    const int64_t tid = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
++    if (tid >= n_dst_rows * D) return;
++    const int64_t row = tid / D, col = tid % D;
++    dst[tid] = src[static_cast<int64_t>(idx[row]) * D + col];
++}
++// float centroid (取自 8-bit 数据点) → uint8；不是 [0,255] 内的整数就记 bad (调用方退回 float 路径)
++__global__ void f32_to_u8_checked(const float* __restrict__ src, uint8_t* __restrict__ dst, int64_t n, int* bad)
++{
++    const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
++    if (i >= n) return;
++    const float v = src[i];
++    if (!(v >= 0.f && v <= 255.f) || v != floorf(v)) { atomicExch(bad, 1); dst[i] = 0; return; }
++    dst[i] = static_cast<uint8_t>(v);
++}
++
+ /**
+  * 分批处理原始数据集，在 GPU 上基于 centroid KNN 图做 ANNS 检索，
+  * 为每个非 centroid 数据点找到最近的 2 个 centroid，在 CPU 上做均衡分配。
+@@ -1657,6 +1676,21 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
+     sp.algo           = cuvs::neighbors::cagra::search_algo::SINGLE_CTA;
+     (void)search_max_iters;  // CAGRA 自己决定 iter, 参数保留为接口兼容
+ 
++    // #82: uint8 数据走 CAGRA (centroid > 32K) 时，索引和 queries 都用 uint8 而不是 float 副本:
++    // 每跳读的字节少 4 倍 (cuVS 26.10 sift1M 同一张图 itopk 32: uint8 1.95M QPS vs float 1.39M，recall 相同)。
++    // centroid 就是数据点 (整数值)，整数平方 L2 在 float 里精确 (128 × 255² < 2^24)，距离与 float 路径
++    // 逐位相同。centroid 不全是 [0,255] 内整数时退回 float。BUCKET2_ASSIGN_U8=0 关掉；
++    // BUCKET2_ASSIGN_U8_CHECK=1 每批再跑一遍 float 搜索并统计 top-2 不一致 (验证用)。
++    // 参考 cuVS cagra_build.cuh / CAGRA 本身按原数据类型 (uint8/int8) 建索引、搜索。
++    constexpr bool kU8Data = !is_pq && std::is_same<T, uint8_t>::value && std::is_same<CentroidT, float>::value;
++    bool u8_cagra = false;
++    uint8_t* d_cent_u8 = nullptr;
++    std::unique_ptr<cuvs::neighbors::device_padded_dataset<uint8_t, int64_t>> padded_u8_owner;
++    std::optional<cuvs::neighbors::cagra::device_padded_index<uint8_t, uint32_t>> cagra_idx_u8;
++    uint8_t* d_queries_u8 = nullptr;
++    const bool u8_check = std::getenv("BUCKET2_ASSIGN_U8_CHECK") && std::getenv("BUCKET2_ASSIGN_U8_CHECK")[0] == '1';
++    int64_t u8_mismatch = 0;
++
+     // ================================================================
+     // Step 5: 分批处理
+     // ================================================================
+@@ -1788,6 +1822,36 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
+             reinterpret_cast<const float*>(d_centroids), d_cnorm, n_centroids, static_cast<int>(D));
+         CUDA_CHECK(cudaGetLastError());
+     }
++    if constexpr (kU8Data) {
++        if (!exact_f16 && !gpu_query_loader &&
++            !(std::getenv("BUCKET2_ASSIGN_U8") && std::getenv("BUCKET2_ASSIGN_U8")[0] == '0')) {
++            const int64_t n_el = n_centroids * static_cast<int64_t>(D);
++            int* d_bad = nullptr;
++            CUDA_CHECK(cudaMalloc(&d_cent_u8, static_cast<size_t>(n_el)));
++            CUDA_CHECK(cudaMalloc(&d_bad, sizeof(int)));
++            CUDA_CHECK(cudaMemset(d_bad, 0, sizeof(int)));
++            f32_to_u8_checked<<<static_cast<unsigned>((n_el + 255) / 256), 256>>>(
++                reinterpret_cast<const float*>(d_centroids), d_cent_u8, n_el, d_bad);
++            CUDA_CHECK(cudaGetLastError());
++            int h_bad = 0;
++            CUDA_CHECK(cudaMemcpy(&h_bad, d_bad, sizeof(int), cudaMemcpyDeviceToHost));
++            CUDA_CHECK(cudaFree(d_bad));
++            if (h_bad) {
++                std::cout << "[BatchAssign] centroids are not 8-bit integers -> float CAGRA search\n";
++                CUDA_CHECK(cudaFree(d_cent_u8)); d_cent_u8 = nullptr;
++            } else {
++                cagra_idx_u8.emplace(make_padded_cagra_index<uint8_t>(res,
++                    raft::make_device_matrix_view<const uint8_t, int64_t>(d_cent_u8, n_centroids, static_cast<int64_t>(D)),
++                    graph_view, padded_u8_owner));
++                // uint8 queries 放进 d_queries 的缓冲 (float 大小，够用)；验证模式另开一份
++                d_queries_u8 = reinterpret_cast<uint8_t*>(d_queries);
++                if (u8_check) CUDA_CHECK(cudaMalloc(&d_queries_u8, static_cast<size_t>(Nv) * D));
++                u8_cagra = true;
++                std::cout << "[BatchAssign] uint8 CAGRA index over " << n_centroids << " centroids (#82)"
++                          << (u8_check ? " + float cross-check" : "") << "\n";
++            }
++        }
++    }
+     std::optional<cuvs::neighbors::brute_force::index<float, float>> bf_idx;
+     int64_t* d_top2_i64 = nullptr;
+     std::vector<int64_t> h_top2_i64;
+@@ -1912,9 +1976,18 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
+                                   cudaMemcpyHostToDevice));
+             const int threads = 256;
+             const int64_t total = batch_size * D;
+-            gather_rows_int32<T><<<static_cast<unsigned>((total + threads - 1) / threads), threads>>>(
+-                d_raw_range, d_local_rows, reinterpret_cast<float*>(d_queries), batch_size, D);
+-            CUDA_CHECK(cudaGetLastError());
++            if constexpr (kU8Data) {
++                if (u8_cagra) {
++                    gather_rows_u8<<<static_cast<unsigned>((total + threads - 1) / threads), threads>>>(
++                        d_raw_range, d_local_rows, d_queries_u8, batch_size, D);
++                    CUDA_CHECK(cudaGetLastError());
++                }
++            }
++            if (!u8_cagra || u8_check) {
++                gather_rows_int32<T><<<static_cast<unsigned>((total + threads - 1) / threads), threads>>>(
++                    d_raw_range, d_local_rows, reinterpret_cast<float*>(d_queries), batch_size, D);
++                CUDA_CHECK(cudaGetLastError());
++            }
+             // 只等默认 stream (gather 写完 d_queries、读完 d_raw_range)；cudaDeviceSynchronize
+             // 会连后台 copy_stream 上下一批的 H2D 一起等
+             CUDA_CHECK(cudaStreamSynchronize(cudaStreamLegacy));
+@@ -2121,7 +2194,26 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
+                 searched_bf = true;
+             }
+         }
+-        if (!searched_bf && !searched_f16) {
++        if (!searched_bf && !searched_f16 && u8_cagra) {
++            cuvs::neighbors::cagra::search(res, sp, *cagra_idx_u8,
++                raft::make_device_matrix_view<const uint8_t, int64_t>(d_queries_u8, batch_size, static_cast<int64_t>(D)),
++                neighbors_view, distances_view);
++            if (u8_check) {   // 验证: float 搜索同一批，逐个比 top-2 id
++                uint32_t* d_ref = nullptr;
++                CUDA_CHECK(cudaMalloc(&d_ref, static_cast<size_t>(batch_size) * TOP_K * sizeof(uint32_t)));
++                float* d_refd = nullptr;
++                CUDA_CHECK(cudaMalloc(&d_refd, static_cast<size_t>(batch_size) * TOP_K * sizeof(float)));
++                cuvs::neighbors::cagra::search(res, sp, cagra_idx, queries_view,
++                    raft::make_device_matrix_view<uint32_t, int64_t>(d_ref, batch_size, static_cast<int64_t>(TOP_K)),
++                    raft::make_device_matrix_view<float, int64_t>(d_refd, batch_size, static_cast<int64_t>(TOP_K)));
++                CUDA_CHECK(cudaDeviceSynchronize());
++                std::vector<uint32_t> a(static_cast<size_t>(batch_size) * TOP_K), b(a.size());
++                CUDA_CHECK(cudaMemcpy(a.data(), d_top2, a.size() * sizeof(uint32_t), cudaMemcpyDeviceToHost));
++                CUDA_CHECK(cudaMemcpy(b.data(), d_ref, b.size() * sizeof(uint32_t), cudaMemcpyDeviceToHost));
++                for (size_t i = 0; i < a.size(); ++i) u8_mismatch += (a[i] != b[i]);
++                CUDA_CHECK(cudaFree(d_ref)); CUDA_CHECK(cudaFree(d_refd));
++            }
++        } else if (!searched_bf && !searched_f16) {
+             cuvs::neighbors::cagra::search(res, sp, cagra_idx,
+                 queries_view, neighbors_view, distances_view);
+         }
+@@ -2208,6 +2300,12 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
+     // ================================================================
+     // Step 6: 释放 per-batch GPU buffer（centroid 和 graph 保留）
+     // ================================================================
++    if (u8_check && u8_cagra) {
++        std::cout << "[BatchAssign] #82 uint8 vs float CAGRA top-2 mismatches: " << u8_mismatch << "\n";
++        if (d_queries_u8) CUDA_CHECK(cudaFree(d_queries_u8));
++    }
++    cagra_idx_u8.reset(); padded_u8_owner.reset();
++    if (d_cent_u8)    CUDA_CHECK(cudaFree(d_cent_u8));
+     if (d_queries)    CUDA_CHECK(cudaFree(d_queries));
+     if (d_top2)       CUDA_CHECK(cudaFree(d_top2));
+     if (d_distances)  CUDA_CHECK(cudaFree(d_distances));

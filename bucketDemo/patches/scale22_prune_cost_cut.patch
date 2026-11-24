@@ -1,0 +1,26 @@
+diff --git a/bucketDemo/buildBucket/src/prune_windowed.cpp b/bucketDemo/buildBucket/src/prune_windowed.cpp
+index 4c42355..03b39c7 100644
+--- a/bucketDemo/buildBucket/src/prune_windowed.cpp
++++ b/bucketDemo/buildBucket/src/prune_windowed.cpp
+@@ -586,11 +586,19 @@ int main(int argc, char** argv)
+                                                        sink, &cst);
+                     return;
+                 }
++                // S22: 按代价切位置段，不再只按行数。每卡的 plan + load (CPU) ∝ 位置数 (SIFT100M ~250 µs / 位置: G=4 时
++                // 卡 0..3 位置 26 K / 40 K / 54 K / 75 K → plan+load 6.5 / 8.6 / 12.8 / 18.9 s)，kernel + d2h + 写出 ∝ 行数；
++                // 按行数平分时最后一张卡 (小桶多) 最慢。代价 = 行数 + R·位置数，R = BUCKET2_PRUNE_CUT_ROWS_PER_POS (默认 390
++                // ≈ 250 µs / 0.64 µs·行)。只改各卡分到哪些位置；每个点的剪枝只看自己的窗口，结果不变。参考 S3/S4 (Step 6 代价切分)。
++                const double rpp = std::getenv("BUCKET2_PRUNE_CUT_ROWS_PER_POS")
++                                       ? std::max(0.0, std::atof(std::getenv("BUCKET2_PRUNE_CUT_ROWS_PER_POS"))) : 390.0;
++                auto cost_at = [&](int p) { return static_cast<double>(offsets_new[static_cast<size_t>(p)]) + rpp * p; };
++                const double total_cost = static_cast<double>(N) + rpp * n_buckets;
+                 std::vector<int> cut(static_cast<size_t>(G) + 1, n_buckets);
+                 cut[0] = 0;
+                 for (int g = 1, p = 0; g < G; ++g) {
+-                    const uint64_t target = static_cast<uint64_t>(N) * g / G;
+-                    while (p < n_buckets && offsets_new[static_cast<size_t>(p)] < target) ++p;
++                    const double target = total_cost * g / G;
++                    while (p < n_buckets && cost_at(p) < target) ++p;
+                     cut[static_cast<size_t>(g)] = p;
+                 }
+                 std::vector<prune_windowed_gpu::ChunkStats> st(static_cast<size_t>(G));

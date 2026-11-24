@@ -1,0 +1,52 @@
+diff --git a/bucketDemo/buildBucket/src/bucket.cu b/bucketDemo/buildBucket/src/bucket.cu
+index 6c89d31..a5b1562 100644
+--- a/bucketDemo/buildBucket/src/bucket.cu
++++ b/bucketDemo/buildBucket/src/bucket.cu
+@@ -9998,16 +9998,42 @@ int run_pipeline_impl(
+                 }
+                 const auto& ord = *order_in;
+                 const int32_t npos = static_cast<int32_t>(ord.size());
+-                int64_t tot = 0;
+-                for (int32_t p = 0; p < npos; ++p) tot += reader.count(ord[static_cast<size_t>(p)]);
+                 knn_acc->set_lanes(G6);   // S2: 每张卡一条写入 lane
++                // S3 (scale loop): 按估计代价切，不按点数切。桶 c 的代价 ≈ s_c × pool_c (pool = 自己 + K 个邻居桶，
++                // 跟 max_pool_size_ub 同一个上界) + 每桶固定开销 κ × 平均 s·pool。按点数切时大桶区段的卡慢得多
++                // (SIFT100M G=2 round 1: 51.4 vs 36.9 s，0.76 vs 0.28 ms/桶；S2 之后 50.2 vs 34.5 s)。κ 扫描 (G=2, round 1 / 2 的
++                // GPU0 vs GPU1 loop): κ=0.5 45.4/39.5、39.3/30.8 s；κ=0 36.1/48.6、31.8/38.8 s → 插值平衡点 0.34 / 0.23，取 0.3。
++                // 只改分工 → vector_knn 不变。BUCKET2_S6_CUT=points 退回按点数切；BUCKET2_S6_CUT_FIXED 改 κ。
++                const char* cut_env = std::getenv("BUCKET2_S6_CUT");
++                const bool cut_by_points = cut_env && std::string(cut_env) == "points";
++                double kappa = 0.3;
++                if (const char* e = std::getenv("BUCKET2_S6_CUT_FIXED")) kappa = std::max(0.0, std::atof(e));
++                std::vector<double> wcost(static_cast<size_t>(npos));
++                double tot = 0;
++                for (int32_t p = 0; p < npos; ++p) {
++                    const int32_t c = ord[static_cast<size_t>(p)];
++                    const double s = static_cast<double>(reader.count(c));
++                    double pool = s;
++                    if (!cut_by_points)
++                        for (uint32_t k = 0; k < graph_K; ++k) {   // nprobe 展开后的图 (pool 的真实成员)
++                            const uint32_t nb = graph_ptr[static_cast<size_t>(c) * graph_K + k];
++                            if (nb < static_cast<uint32_t>(n_centroids)) pool += static_cast<double>(reader.count(static_cast<int32_t>(nb)));
++                        }
++                    wcost[static_cast<size_t>(p)] = cut_by_points ? s : s * pool;
++                    tot += wcost[static_cast<size_t>(p)];
++                }
++                if (!cut_by_points && npos > 0) {   // 每桶固定开销
++                    const double fixed = kappa * tot / npos;
++                    for (auto& w : wcost) w += fixed;
++                    tot += fixed * npos;
++                }
+                 std::vector<int32_t> cut(static_cast<size_t>(G6) + 1, npos);
+                 cut[0] = 0;
+                 {
+-                    int64_t acc_pts = 0; int g = 1;
++                    double acc_w = 0; int g = 1;
+                     for (int32_t p = 0; p < npos && g < G6; ++p) {
+-                        acc_pts += reader.count(ord[static_cast<size_t>(p)]);
+-                        if (acc_pts * G6 >= tot * g) cut[static_cast<size_t>(g++)] = p + 1;
++                        acc_w += wcost[static_cast<size_t>(p)];
++                        if (acc_w * G6 >= tot * g) cut[static_cast<size_t>(g++)] = p + 1;
+                     }
+                 }
+                 int dev0 = 0;

@@ -1,0 +1,50 @@
+diff --git a/bucketDemo/buildBucket/src/bucket.cu b/bucketDemo/buildBucket/src/bucket.cu
+index f662d12..44d0a92 100644
+--- a/bucketDemo/buildBucket/src/bucket.cu
++++ b/bucketDemo/buildBucket/src/bucket.cu
+@@ -5176,6 +5176,11 @@ struct GpuResidentKnn {
+         compute_norms();
+     }
+ 
++    // #87: 常驻数据集整份下载 (GemmT == DataT 时就是当前坐标系下的原始数据)
++    void download_data(GemmT* h) const {
++        CUDA_CHECK(cudaMemcpy(h, d_data, static_cast<size_t>(N) * D * sizeof(GemmT), cudaMemcpyDeviceToHost));
++    }
++
+     // Step 4 的 query 直接从常驻数据集 gather 成 fp32，不再读盘/CPU 转型/H2D
+     void gather_queries_f32(const int64_t* h_idx, int64_t n, float* d_out) {
+         int64_t* d_idx = nullptr;
+@@ -8556,9 +8561,12 @@ int run_pipeline_impl(
+ 
+                 if (ext == ".fbin" || ext == ".bin") {
+                     load::read_fbin_f32(path, X_sampled, N, D);
+-                } else if (ext == ".u8bin" && std::is_same<DataT, uint8_t>::value && raw_host.empty()) {
+-                    // 原始 u8 只读一次进 raw_host (后面 GPU-resident / out-of-core 都要用)，
+-                    // 再并行转 float——原来先 read_u8bin_to_f32 (单线程转换) 再整份重读一遍
++                } else if (((ext == ".u8bin" && std::is_same<DataT, uint8_t>::value) ||
++                            (ext == ".fbin" && std::is_same<DataT, float>::value)) && raw_host.empty()) {
++                    // 原始数据只读一次进 raw_host (后面 GPU-resident / out-of-core 都要用)，
++                    // 再并行转 float——原来先 read_u8bin_to_f32 (单线程转换) 再整份重读一遍。
++                    // #87: float (.fbin) 同样处理 (原来 read_fbin_f32 读一遍 0.42 s + resident 再读一遍 0.32 s，
++                    // msTuring1M Step 1 0.9 s)；值不变 (float → float 拷贝)
+                     int32_t n_tmp = 0, d_tmp = 0;
+                     load::read_bigann_raw_range<DataT>(path, 0, N, raw_host, n_tmp, d_tmp);
+                     if (static_cast<int64_t>(raw_host.size()) != static_cast<int64_t>(N) * D)
+@@ -9138,7 +9146,16 @@ int run_pipeline_impl(
+             // data_reordered.<ext>（见 reordered_dataset_io.hpp 的设计说明：
+             // Pass2 已经知道每个桶的精确最终大小，不需要事后合并）。
+             std::string data_reordered_path = output_dir + "/data_reordered" + ext;
+-            if (gres) {
++            if (gres && std::is_same<DataT, typename GpuResidentKnn<DataT>::GemmT>::value) {
++                // #87 (float): 显存里的常驻数据集先换到新坐标系，文件内容直接 D2H 回来 (同一批 float 值，
++                // 跟 CPU 按 inverse_perm 重排逐位相同)，不再在 CPU 上再做一遍 400 MB 的随机行重排
++                gres->permute(reorder_info.inverse_perm);
++                raw_host = std::vector<DataT>();
++                auto holder = std::make_shared<std::vector<DataT>>(static_cast<size_t>(N) * D);
++                if constexpr (std::is_same<DataT, typename GpuResidentKnn<DataT>::GemmT>::value)
++                    gres->download_data(holder->data());
++                write_reordered_async(data_reordered_path, holder->data(), holder->size(), holder);
++            } else if (gres) {
+                 // 原始数据已经在内存里: 按 inverse_perm 原地重排后一次顺序写出，
+                 // 显存里的常驻数据集同步换到新坐标系。
+                 std::vector<DataT> reordered(raw_host.size());

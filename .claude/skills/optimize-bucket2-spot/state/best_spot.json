@@ -1,0 +1,4289 @@
+{
+ "runs": {
+  "sift100M_auto_g2": {
+   "dataset": "sift100M",
+   "mode": "auto",
+   "path": "large",
+   "reps": 3,
+   "gpus": [
+    2,
+    3
+   ],
+   "num_gpus": 2,
+   "build_total_s": 239.5,
+   "build_total_all_s": [
+    238.89,
+    249.39,
+    239.5
+   ],
+   "stages_s": {
+    "bucket2": 188.19,
+    "prune": 29.72,
+    "optimize_chunked": 22.33
+   },
+   "bucket2_steps_s": {
+    "Step 1 (Load sampled data)": 7.942,
+    "Step 2 (Select centroids)": 5.331,
+    "Step 3 (Centroid KNN graph)": 2.528,
+    "Step 3.5 (Load full dataset)": 0.0,
+    "Step 4 (Batch assignment)": 53.421,
+    "Step 4.5 (Inline reorder, round 1 only)": 4.65,
+    "Step 5 (Write buckets)": 3.013,
+    "Step 6 (Per-vector KNN, merge included)": 82.804,
+    "Wait (final iteration's background merge)": 18.712,
+    "Write (close + .npy convert)": 0.001
+   },
+   "peak_rss_gb": {
+    "bucket2": 92.716,
+    "prune": 4.978,
+    "optimize_chunked": 25.498
+   },
+   "gpu_peak_mib": 14546,
+   "knn_similarity": {
+    "n": 100000000,
+    "degree": 64,
+    "samples": 10000,
+    "padding_rate": 0.0,
+    "recall@1": 0.6537,
+    "recall@10": 0.61496,
+    "recall@32": 0.59039,
+    "recall@64": 0.57374
+   },
+   "search": {
+    "searcher": "diskann_memory",
+    "degree": 32,
+    "bad_ids": 0,
+    "self_loops": 0,
+    "dup_edges": 0,
+    "entry": 42894669,
+    "points": [
+     {
+      "itopk": 32,
+      "recall": 0.7265,
+      "qps": 78864.48
+     },
+     {
+      "itopk": 64,
+      "recall": 0.8331000000000001,
+      "qps": 56449.08
+     },
+     {
+      "itopk": 128,
+      "recall": 0.9107,
+      "qps": 32565.69
+     },
+     {
+      "itopk": 256,
+      "recall": 0.9589,
+      "qps": 17759.21
+     },
+     {
+      "itopk": 512,
+      "recall": 0.9833,
+      "qps": 9796.41
+     }
+    ]
+   }
+  },
+  "sift100M_auto_g4": {
+   "dataset": "sift100M",
+   "mode": "auto",
+   "path": "large",
+   "reps": 3,
+   "gpus": [
+    0,
+    1,
+    2,
+    3
+   ],
+   "num_gpus": 4,
+   "build_total_s": 193.08,
+   "build_total_all_s": [
+    187.73,
+    193.08,
+    193.49
+   ],
+   "stages_s": {
+    "bucket2": 140.94,
+    "prune": 26.59,
+    "optimize_chunked": 22.63
+   },
+   "bucket2_steps_s": {
+    "Step 1 (Load sampled data)": 7.956,
+    "Step 2 (Select centroids)": 5.474,
+    "Step 3 (Centroid KNN graph)": 2.746,
+    "Step 3.5 (Load full dataset)": 0.0,
+    "Step 4 (Batch assignment)": 33.639,
+    "Step 4.5 (Inline reorder, round 1 only)": 6.7,
+    "Step 5 (Write buckets)": 3.064,
+    "Step 6 (Per-vector KNN, merge included)": 53.55,
+    "Wait (final iteration's background merge)": 19.837,
+    "Write (close + .npy convert)": 0.001
+   },
+   "peak_rss_gb": {
+    "bucket2": 94.876,
+    "prune": 5.723,
+    "optimize_chunked": 25.498
+   },
+   "gpu_peak_mib": 14546,
+   "knn_similarity": {
+    "n": 100000000,
+    "degree": 64,
+    "samples": 10000,
+    "padding_rate": 0.0,
+    "recall@1": 0.6547,
+    "recall@10": 0.61264,
+    "recall@32": 0.58867,
+    "recall@64": 0.57146
+   },
+   "search": {
+    "searcher": "diskann_memory",
+    "degree": 32,
+    "bad_ids": 0,
+    "self_loops": 0,
+    "dup_edges": 0,
+    "entry": 42894669,
+    "points": [
+     {
+      "itopk": 32,
+      "recall": 0.7267,
+      "qps": 96487.71
+     },
+     {
+      "itopk": 64,
+      "recall": 0.8334,
+      "qps": 69697.77
+     },
+     {
+      "itopk": 128,
+      "recall": 0.9109,
+      "qps": 40448.39
+     },
+     {
+      "itopk": 256,
+      "recall": 0.9594,
+      "qps": 22401.25
+     },
+     {
+      "itopk": 512,
+      "recall": 0.9834999999999999,
+      "qps": 11854.74
+     }
+    ]
+   }
+  },
+  "sift100M_auto": {
+   "dataset": "sift100M",
+   "mode": "auto",
+   "path": "large",
+   "reps": 3,
+   "gpus": [
+    0
+   ],
+   "num_gpus": 1,
+   "build_total_s": 364.56,
+   "build_total_all_s": [
+    363.45,
+    373.95,
+    364.56
+   ],
+   "stages_s": {
+    "bucket2": 304.22,
+    "prune": 38.63,
+    "optimize_chunked": 21.87
+   },
+   "bucket2_steps_s": {
+    "Step 1 (Load sampled data)": 7.987,
+    "Step 2 (Select centroids)": 5.136,
+    "Step 3 (Centroid KNN graph)": 2.554,
+    "Step 3.5 (Load full dataset)": 0.0,
+    "Step 4 (Batch assignment)": 92.811,
+    "Step 4.5 (Inline reorder, round 1 only)": 4.668,
+    "Step 5 (Write buckets)": 3.066,
+    "Step 6 (Per-vector KNN, merge included)": 158.235,
+    "Wait (final iteration's background merge)": 22.862,
+    "Write (close + .npy convert)": 0.001
+   },
+   "peak_rss_gb": {
+    "bucket2": 93.355,
+    "prune": 4.598,
+    "optimize_chunked": 25.498
+   },
+   "gpu_peak_mib": 14548,
+   "knn_similarity": {
+    "n": 100000000,
+    "degree": 64,
+    "samples": 10000,
+    "padding_rate": 0.0,
+    "recall@1": 0.6517,
+    "recall@10": 0.61325,
+    "recall@32": 0.58838,
+    "recall@64": 0.57113
+   },
+   "search": {
+    "searcher": "diskann_memory",
+    "degree": 32,
+    "bad_ids": 0,
+    "self_loops": 0,
+    "dup_edges": 0,
+    "entry": 42894669,
+    "points": [
+     {
+      "itopk": 32,
+      "recall": 0.7236,
+      "qps": 25593.47
+     },
+     {
+      "itopk": 64,
+      "recall": 0.8323999999999999,
+      "qps": 64939.52
+     },
+     {
+      "itopk": 128,
+      "recall": 0.9114,
+      "qps": 40552.57
+     },
+     {
+      "itopk": 256,
+      "recall": 0.9594,
+      "qps": 23245.76
+     },
+     {
+      "itopk": 512,
+      "recall": 0.9837,
+      "qps": 13142.02
+     }
+    ]
+   }
+  },
+  "sift100M_auto_g2_spotnone": {
+   "dataset": "sift100M",
+   "mode": "auto",
+   "path": "large",
+   "reps": 3,
+   "gpus": [
+    2,
+    3
+   ],
+   "num_gpus": 2,
+   "build_total_s": 240.78,
+   "build_total_all_s": [
+    240.78,
+    239.79,
+    242.27
+   ],
+   "stages_s": {
+    "bucket2": 189.14,
+    "prune": 29.19,
+    "optimize_chunked": 22.36
+   },
+   "bucket2_steps_s": {
+    "Step 1 (Load sampled data)": 7.908,
+    "Step 2 (Select centroids)": 5.267,
+    "Step 3 (Centroid KNN graph)": 2.43,
+    "Step 3.5 (Load full dataset)": 0.0,
+    "Step 4 (Batch assignment)": 54.079,
+    "Step 4.5 (Inline reorder, round 1 only)": 4.703,
+    "Step 5 (Write buckets)": 3.063,
+    "Step 6 (Per-vector KNN, merge included)": 82.514,
+    "Wait (final iteration's background merge)": 20.151,
+    "Write (close + .npy convert)": 0.001
+   },
+   "peak_rss_gb": {
+    "bucket2": 92.717,
+    "prune": 4.983,
+    "optimize_chunked": 25.498
+   },
+   "gpu_peak_mib": 14546,
+   "spot": "none",
+   "spot_reps": [
+    {
+     "stages": [
+      {
+       "units": "99804688",
+       "segments": "2",
+       "steals": "0",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "2",
+       "wall": "22.463s",
+       "stage": "step4"
+      },
+      {
+       "units": "195312",
+       "segments": "2",
+       "steals": "0",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "2",
+       "wall": "43.934s",
+       "stage": "step6"
+      },
+      {
+       "units": "99804688",
+       "segments": "2",
+       "steals": "0",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "2",
+       "wall": "22.275s",
+       "stage": "step4"
+      },
+      {
+       "units": "195312",
+       "segments": "2",
+       "steals": "0",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "2",
+       "wall": "37.665s",
+       "stage": "step6"
+      },
+      {
+       "units": "195312",
+       "segments": "3",
+       "steals": "1",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "2",
+       "wall": "29.573s",
+       "stage": "prune"
+      }
+     ],
+     "events": {
+      "notice": 0,
+      "preempt": 0,
+      "join": 0
+     },
+     "rejected_units": 0,
+     "preempts": 0,
+     "steals": 1,
+     "setups": 10,
+     "reaped": 0,
+     "drains": 0
+    },
+    {
+     "stages": [
+      {
+       "units": "99804688",
+       "segments": "2",
+       "steals": "0",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "2",
+       "wall": "22.703s",
+       "stage": "step4"
+      },
+      {
+       "units": "195312",
+       "segments": "2",
+       "steals": "0",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "2",
+       "wall": "44.145s",
+       "stage": "step6"
+      },
+      {
+       "units": "99804688",
+       "segments": "2",
+       "steals": "0",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "2",
+       "wall": "22.425s",
+       "stage": "step4"
+      },
+      {
+       "units": "195312",
+       "segments": "2",
+       "steals": "0",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "2",
+       "wall": "36.969s",
+       "stage": "step6"
+      },
+      {
+       "units": "195312",
+       "segments": "3",
+       "steals": "1",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "2",
+       "wall": "26.926s",
+       "stage": "prune"
+      }
+     ],
+     "events": {
+      "notice": 0,
+      "preempt": 0,
+      "join": 0
+     },
+     "rejected_units": 0,
+     "preempts": 0,
+     "steals": 1,
+     "setups": 10,
+     "reaped": 0,
+     "drains": 0
+    },
+    {
+     "stages": [
+      {
+       "units": "99804688",
+       "segments": "2",
+       "steals": "0",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "2",
+       "wall": "22.569s",
+       "stage": "step4"
+      },
+      {
+       "units": "195312",
+       "segments": "2",
+       "steals": "0",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "2",
+       "wall": "44.153s",
+       "stage": "step6"
+      },
+      {
+       "units": "99804688",
+       "segments": "2",
+       "steals": "0",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "2",
+       "wall": "22.429s",
+       "stage": "step4"
+      },
+      {
+       "units": "195312",
+       "segments": "2",
+       "steals": "0",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "2",
+       "wall": "38.719s",
+       "stage": "step6"
+      },
+      {
+       "units": "195312",
+       "segments": "3",
+       "steals": "1",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "2",
+       "wall": "27.846s",
+       "stage": "prune"
+      }
+     ],
+     "events": {
+      "notice": 0,
+      "preempt": 0,
+      "join": 0
+     },
+     "rejected_units": 0,
+     "preempts": 0,
+     "steals": 1,
+     "setups": 10,
+     "reaped": 0,
+     "drains": 0
+    }
+   ],
+   "knn_similarity": {
+    "n": 100000000,
+    "degree": 64,
+    "samples": 10000,
+    "padding_rate": 0.0,
+    "recall@1": 0.6537,
+    "recall@10": 0.61715,
+    "recall@32": 0.59122,
+    "recall@64": 0.57334
+   },
+   "search": {
+    "searcher": "diskann_memory",
+    "degree": 32,
+    "bad_ids": 0,
+    "self_loops": 0,
+    "dup_edges": 0,
+    "entry": 42894669,
+    "points": [
+     {
+      "itopk": 32,
+      "recall": 0.7271,
+      "qps": 59824.15
+     },
+     {
+      "itopk": 64,
+      "recall": 0.8334,
+      "qps": 50707.86
+     },
+     {
+      "itopk": 128,
+      "recall": 0.9106000000000001,
+      "qps": 31492.83
+     },
+     {
+      "itopk": 256,
+      "recall": 0.9594,
+      "qps": 17973.06
+     },
+     {
+      "itopk": 512,
+      "recall": 0.9839,
+      "qps": 9529.56
+     }
+    ]
+   }
+  },
+  "sift100M_auto_g4_spotnone": {
+   "dataset": "sift100M",
+   "mode": "auto",
+   "path": "large",
+   "reps": 3,
+   "gpus": [
+    0,
+    1,
+    2,
+    3
+   ],
+   "num_gpus": 4,
+   "build_total_s": 191.36,
+   "build_total_all_s": [
+    191.36,
+    196.55,
+    186.69
+   ],
+   "stages_s": {
+    "bucket2": 141.28,
+    "prune": 30.44,
+    "optimize_chunked": 22.04
+   },
+   "bucket2_steps_s": {
+    "Step 1 (Load sampled data)": 7.982,
+    "Step 2 (Select centroids)": 5.036,
+    "Step 3 (Centroid KNN graph)": 2.442,
+    "Step 3.5 (Load full dataset)": 0.0,
+    "Step 4 (Batch assignment)": 34.418,
+    "Step 4.5 (Inline reorder, round 1 only)": 6.262,
+    "Step 5 (Write buckets)": 3.146,
+    "Step 6 (Per-vector KNN, merge included)": 52.143,
+    "Wait (final iteration's background merge)": 19.707,
+    "Write (close + .npy convert)": 0.001
+   },
+   "peak_rss_gb": {
+    "bucket2": 96.551,
+    "prune": 5.741,
+    "optimize_chunked": 25.498
+   },
+   "gpu_peak_mib": 14544,
+   "spot": "none",
+   "spot_reps": [
+    {
+     "stages": [
+      {
+       "units": "99804688",
+       "segments": "4",
+       "steals": "0",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "4",
+       "wall": "13.341s",
+       "stage": "step4"
+      },
+      {
+       "units": "195312",
+       "segments": "5",
+       "steals": "1",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "4",
+       "wall": "26.889s",
+       "stage": "step6"
+      },
+      {
+       "units": "99804688",
+       "segments": "4",
+       "steals": "0",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "4",
+       "wall": "12.695s",
+       "stage": "step4"
+      },
+      {
+       "units": "195312",
+       "segments": "4",
+       "steals": "0",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "4",
+       "wall": "23.799s",
+       "stage": "step6"
+      },
+      {
+       "units": "195312",
+       "segments": "6",
+       "steals": "2",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "4",
+       "wall": "28.957s",
+       "stage": "prune"
+      }
+     ],
+     "events": {
+      "notice": 0,
+      "preempt": 0,
+      "join": 0
+     },
+     "rejected_units": 0,
+     "preempts": 0,
+     "steals": 3,
+     "setups": 20,
+     "reaped": 0,
+     "drains": 0
+    },
+    {
+     "stages": [
+      {
+       "units": "99804688",
+       "segments": "4",
+       "steals": "0",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "4",
+       "wall": "13.307s",
+       "stage": "step4"
+      },
+      {
+       "units": "195312",
+       "segments": "4",
+       "steals": "0",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "4",
+       "wall": "25.481s",
+       "stage": "step6"
+      },
+      {
+       "units": "99804688",
+       "segments": "4",
+       "steals": "0",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "4",
+       "wall": "13.031s",
+       "stage": "step4"
+      },
+      {
+       "units": "195312",
+       "segments": "4",
+       "steals": "0",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "4",
+       "wall": "25.399s",
+       "stage": "step6"
+      },
+      {
+       "units": "195312",
+       "segments": "6",
+       "steals": "2",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "4",
+       "wall": "30.114s",
+       "stage": "prune"
+      }
+     ],
+     "events": {
+      "notice": 0,
+      "preempt": 0,
+      "join": 0
+     },
+     "rejected_units": 0,
+     "preempts": 0,
+     "steals": 2,
+     "setups": 20,
+     "reaped": 0,
+     "drains": 0
+    },
+    {
+     "stages": [
+      {
+       "units": "99804688",
+       "segments": "4",
+       "steals": "0",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "4",
+       "wall": "13.431s",
+       "stage": "step4"
+      },
+      {
+       "units": "195312",
+       "segments": "4",
+       "steals": "0",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "4",
+       "wall": "26.234s",
+       "stage": "step6"
+      },
+      {
+       "units": "99804688",
+       "segments": "4",
+       "steals": "0",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "4",
+       "wall": "13.105s",
+       "stage": "step4"
+      },
+      {
+       "units": "195312",
+       "segments": "5",
+       "steals": "1",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "4",
+       "wall": "26.566s",
+       "stage": "step6"
+      },
+      {
+       "units": "195312",
+       "segments": "6",
+       "steals": "2",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "4",
+       "wall": "21.880s",
+       "stage": "prune"
+      }
+     ],
+     "events": {
+      "notice": 0,
+      "preempt": 0,
+      "join": 0
+     },
+     "rejected_units": 0,
+     "preempts": 0,
+     "steals": 3,
+     "setups": 20,
+     "reaped": 0,
+     "drains": 0
+    }
+   ],
+   "knn_similarity": {
+    "n": 100000000,
+    "degree": 64,
+    "samples": 10000,
+    "padding_rate": 0.0,
+    "recall@1": 0.6577,
+    "recall@10": 0.61625,
+    "recall@32": 0.59161,
+    "recall@64": 0.574
+   },
+   "search": {
+    "searcher": "diskann_memory",
+    "degree": 32,
+    "bad_ids": 0,
+    "self_loops": 0,
+    "dup_edges": 0,
+    "entry": 42894669,
+    "points": [
+     {
+      "itopk": 32,
+      "recall": 0.7281,
+      "qps": 60948.61
+     },
+     {
+      "itopk": 64,
+      "recall": 0.8334999999999999,
+      "qps": 55196.06
+     },
+     {
+      "itopk": 128,
+      "recall": 0.9113,
+      "qps": 33502.62
+     },
+     {
+      "itopk": 256,
+      "recall": 0.9597,
+      "qps": 18974.49
+     },
+     {
+      "itopk": 512,
+      "recall": 0.9838,
+      "qps": 10787.44
+     }
+    ]
+   }
+  },
+  "sift100M_auto_g1_spotnone": {
+   "dataset": "sift100M",
+   "mode": "auto",
+   "path": "large",
+   "reps": 3,
+   "gpus": [
+    0
+   ],
+   "num_gpus": 1,
+   "build_total_s": 365.26,
+   "build_total_all_s": [
+    371.31,
+    365.26,
+    364.24
+   ],
+   "stages_s": {
+    "bucket2": 303.85,
+    "prune": 38.58,
+    "optimize_chunked": 22.43
+   },
+   "bucket2_steps_s": {
+    "Step 1 (Load sampled data)": 7.971,
+    "Step 2 (Select centroids)": 5.067,
+    "Step 3 (Centroid KNN graph)": 2.395,
+    "Step 3.5 (Load full dataset)": 0.0,
+    "Step 4 (Batch assignment)": 93.734,
+    "Step 4.5 (Inline reorder, round 1 only)": 4.879,
+    "Step 5 (Write buckets)": 3.09,
+    "Step 6 (Per-vector KNN, merge included)": 157.599,
+    "Wait (final iteration's background merge)": 20.995,
+    "Write (close + .npy convert)": 0.001
+   },
+   "peak_rss_gb": {
+    "bucket2": 93.468,
+    "prune": 4.602,
+    "optimize_chunked": 25.498
+   },
+   "gpu_peak_mib": 14548,
+   "spot": "none",
+   "spot_reps": [
+    {
+     "stages": [
+      {
+       "units": "99804688",
+       "segments": "1",
+       "steals": "0",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "1",
+       "wall": "42.477s",
+       "stage": "step4"
+      },
+      {
+       "units": "195312",
+       "segments": "1",
+       "steals": "0",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "1",
+       "wall": "85.542s",
+       "stage": "step6"
+      },
+      {
+       "units": "99804688",
+       "segments": "1",
+       "steals": "0",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "1",
+       "wall": "41.681s",
+       "stage": "step4"
+      },
+      {
+       "units": "195312",
+       "segments": "1",
+       "steals": "0",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "1",
+       "wall": "71.862s",
+       "stage": "step6"
+      },
+      {
+       "units": "195312",
+       "segments": "1",
+       "steals": "0",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "1",
+       "wall": "43.790s",
+       "stage": "prune"
+      }
+     ],
+     "events": {
+      "notice": 0,
+      "preempt": 0,
+      "join": 0
+     },
+     "rejected_units": 0,
+     "preempts": 0,
+     "steals": 0,
+     "setups": 5,
+     "reaped": 0,
+     "drains": 0
+    },
+    {
+     "stages": [
+      {
+       "units": "99804688",
+       "segments": "1",
+       "steals": "0",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "1",
+       "wall": "42.459s",
+       "stage": "step4"
+      },
+      {
+       "units": "195312",
+       "segments": "1",
+       "steals": "0",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "1",
+       "wall": "84.870s",
+       "stage": "step6"
+      },
+      {
+       "units": "99804688",
+       "segments": "1",
+       "steals": "0",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "1",
+       "wall": "41.807s",
+       "stage": "step4"
+      },
+      {
+       "units": "195312",
+       "segments": "1",
+       "steals": "0",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "1",
+       "wall": "71.573s",
+       "stage": "step6"
+      },
+      {
+       "units": "195312",
+       "segments": "1",
+       "steals": "0",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "1",
+       "wall": "36.518s",
+       "stage": "prune"
+      }
+     ],
+     "events": {
+      "notice": 0,
+      "preempt": 0,
+      "join": 0
+     },
+     "rejected_units": 0,
+     "preempts": 0,
+     "steals": 0,
+     "setups": 5,
+     "reaped": 0,
+     "drains": 0
+    },
+    {
+     "stages": [
+      {
+       "units": "99804688",
+       "segments": "1",
+       "steals": "0",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "1",
+       "wall": "42.380s",
+       "stage": "step4"
+      },
+      {
+       "units": "195312",
+       "segments": "1",
+       "steals": "0",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "1",
+       "wall": "85.175s",
+       "stage": "step6"
+      },
+      {
+       "units": "99804688",
+       "segments": "1",
+       "steals": "0",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "1",
+       "wall": "41.852s",
+       "stage": "step4"
+      },
+      {
+       "units": "195312",
+       "segments": "1",
+       "steals": "0",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "1",
+       "wall": "71.304s",
+       "stage": "step6"
+      },
+      {
+       "units": "195312",
+       "segments": "1",
+       "steals": "0",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "1",
+       "wall": "37.350s",
+       "stage": "prune"
+      }
+     ],
+     "events": {
+      "notice": 0,
+      "preempt": 0,
+      "join": 0
+     },
+     "rejected_units": 0,
+     "preempts": 0,
+     "steals": 0,
+     "setups": 5,
+     "reaped": 0,
+     "drains": 0
+    }
+   ],
+   "knn_similarity": {
+    "n": 100000000,
+    "degree": 64,
+    "samples": 10000,
+    "padding_rate": 0.0,
+    "recall@1": 0.6561,
+    "recall@10": 0.61529,
+    "recall@32": 0.59096,
+    "recall@64": 0.57364
+   },
+   "search": {
+    "searcher": "diskann_memory",
+    "degree": 32,
+    "bad_ids": 0,
+    "self_loops": 0,
+    "dup_edges": 0,
+    "entry": 42894669,
+    "points": [
+     {
+      "itopk": 32,
+      "recall": 0.7245,
+      "qps": 68925.46
+     },
+     {
+      "itopk": 64,
+      "recall": 0.8332999999999999,
+      "qps": 64868.5
+     },
+     {
+      "itopk": 128,
+      "recall": 0.9112,
+      "qps": 39227.96
+     },
+     {
+      "itopk": 256,
+      "recall": 0.9588,
+      "qps": 22774.86
+     },
+     {
+      "itopk": 512,
+      "recall": 0.9838,
+      "qps": 11956.24
+     }
+    ]
+   }
+  },
+  "sift100M_auto_g2_spott1": {
+   "dataset": "sift100M",
+   "mode": "auto",
+   "path": "large",
+   "reps": 3,
+   "gpus": [
+    2,
+    3
+   ],
+   "num_gpus": 2,
+   "build_total_s": 259.79,
+   "build_total_all_s": [
+    262.29,
+    259.79,
+    258.27
+   ],
+   "stages_s": {
+    "bucket2": 207.76,
+    "prune": 30.24,
+    "optimize_chunked": 22.0
+   },
+   "bucket2_steps_s": {
+    "Step 1 (Load sampled data)": 7.942,
+    "Step 2 (Select centroids)": 5.277,
+    "Step 3 (Centroid KNN graph)": 2.519,
+    "Step 3.5 (Load full dataset)": 0.0,
+    "Step 4 (Batch assignment)": 53.305,
+    "Step 4.5 (Inline reorder, round 1 only)": 4.851,
+    "Step 5 (Write buckets)": 3.039,
+    "Step 6 (Per-vector KNN, merge included)": 102.651,
+    "Wait (final iteration's background merge)": 18.966,
+    "Write (close + .npy convert)": 0.001
+   },
+   "peak_rss_gb": {
+    "bucket2": 93.033,
+    "prune": 4.983,
+    "optimize_chunked": 25.498
+   },
+   "gpu_peak_mib": 14546,
+   "spot": "t1",
+   "spot_reps": [
+    {
+     "stages": [
+      {
+       "units": "99804688",
+       "segments": "2",
+       "steals": "0",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "2",
+       "wall": "22.697s",
+       "stage": "step4"
+      },
+      {
+       "units": "195312",
+       "segments": "3",
+       "steals": "1",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "2",
+       "wall": "53.787s",
+       "stage": "step6"
+      },
+      {
+       "units": "99804688",
+       "segments": "2",
+       "steals": "0",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "2",
+       "wall": "22.912s",
+       "stage": "step4"
+      },
+      {
+       "units": "195312",
+       "segments": "3",
+       "steals": "1",
+       "drains": "2",
+       "reaped": "0",
+       "preempts": "2",
+       "rejected_units": "0",
+       "setups": "3",
+       "wall": "48.028s",
+       "stage": "step6"
+      },
+      {
+       "units": "195312",
+       "segments": "3",
+       "steals": "1",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "1",
+       "rejected_units": "0",
+       "setups": "2",
+       "wall": "28.909s",
+       "stage": "prune"
+      }
+     ],
+     "events": {
+      "notice": 4,
+      "preempt": 4,
+      "join": 3
+     },
+     "rejected_units": 0,
+     "preempts": 3,
+     "steals": 3,
+     "setups": 11,
+     "reaped": 0,
+     "drains": 2
+    },
+    {
+     "stages": [
+      {
+       "units": "99804688",
+       "segments": "2",
+       "steals": "0",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "2",
+       "wall": "22.464s",
+       "stage": "step4"
+      },
+      {
+       "units": "195312",
+       "segments": "3",
+       "steals": "1",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "2",
+       "wall": "53.707s",
+       "stage": "step6"
+      },
+      {
+       "units": "99804688",
+       "segments": "2",
+       "steals": "0",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "2",
+       "wall": "23.078s",
+       "stage": "step4"
+      },
+      {
+       "units": "195312",
+       "segments": "3",
+       "steals": "1",
+       "drains": "1",
+       "reaped": "0",
+       "preempts": "2",
+       "rejected_units": "0",
+       "setups": "3",
+       "wall": "47.371s",
+       "stage": "step6"
+      },
+      {
+       "units": "195312",
+       "segments": "3",
+       "steals": "1",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "2",
+       "wall": "28.065s",
+       "stage": "prune"
+      }
+     ],
+     "events": {
+      "notice": 4,
+      "preempt": 3,
+      "join": 3
+     },
+     "rejected_units": 0,
+     "preempts": 2,
+     "steals": 3,
+     "setups": 11,
+     "reaped": 0,
+     "drains": 1
+    },
+    {
+     "stages": [
+      {
+       "units": "99804688",
+       "segments": "2",
+       "steals": "0",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "2",
+       "wall": "22.559s",
+       "stage": "step4"
+      },
+      {
+       "units": "195312",
+       "segments": "3",
+       "steals": "1",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "2",
+       "wall": "54.004s",
+       "stage": "step6"
+      },
+      {
+       "units": "99804688",
+       "segments": "2",
+       "steals": "0",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "2",
+       "wall": "22.252s",
+       "stage": "step4"
+      },
+      {
+       "units": "195312",
+       "segments": "3",
+       "steals": "1",
+       "drains": "2",
+       "reaped": "0",
+       "preempts": "2",
+       "rejected_units": "0",
+       "setups": "3",
+       "wall": "47.683s",
+       "stage": "step6"
+      },
+      {
+       "units": "195312",
+       "segments": "3",
+       "steals": "1",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "2",
+       "wall": "29.122s",
+       "stage": "prune"
+      }
+     ],
+     "events": {
+      "notice": 3,
+      "preempt": 3,
+      "join": 3
+     },
+     "rejected_units": 0,
+     "preempts": 2,
+     "steals": 3,
+     "setups": 11,
+     "reaped": 0,
+     "drains": 2
+    }
+   ],
+   "knn_similarity": {
+    "n": 100000000,
+    "degree": 64,
+    "samples": 10000,
+    "padding_rate": 0.0,
+    "recall@1": 0.6487,
+    "recall@10": 0.61501,
+    "recall@32": 0.59008,
+    "recall@64": 0.57339
+   },
+   "search": {
+    "searcher": "diskann_memory",
+    "degree": 32,
+    "bad_ids": 0,
+    "self_loops": 0,
+    "dup_edges": 0,
+    "entry": 42894669,
+    "points": [
+     {
+      "itopk": 32,
+      "recall": 0.7277,
+      "qps": 57607.13
+     },
+     {
+      "itopk": 64,
+      "recall": 0.8340000000000001,
+      "qps": 49611.22
+     },
+     {
+      "itopk": 128,
+      "recall": 0.9114,
+      "qps": 29754.98
+     },
+     {
+      "itopk": 256,
+      "recall": 0.9591,
+      "qps": 17130.06
+     },
+     {
+      "itopk": 512,
+      "recall": 0.9838,
+      "qps": 9413.82
+     }
+    ]
+   }
+  },
+  "sift100M_auto_g4_spott1": {
+   "dataset": "sift100M",
+   "mode": "auto",
+   "path": "large",
+   "reps": 3,
+   "gpus": [
+    0,
+    1,
+    2,
+    3
+   ],
+   "num_gpus": 4,
+   "build_total_s": 230.8,
+   "build_total_all_s": [
+    227.22,
+    234.68,
+    230.8
+   ],
+   "stages_s": {
+    "bucket2": 174.38,
+    "prune": 31.02,
+    "optimize_chunked": 22.67
+   },
+   "bucket2_steps_s": {
+    "Step 1 (Load sampled data)": 7.958,
+    "Step 2 (Select centroids)": 5.104,
+    "Step 3 (Centroid KNN graph)": 2.432,
+    "Step 3.5 (Load full dataset)": 0.0,
+    "Step 4 (Batch assignment)": 64.712,
+    "Step 4.5 (Inline reorder, round 1 only)": 4.706,
+    "Step 5 (Write buckets)": 3.089,
+    "Step 6 (Per-vector KNN, merge included)": 58.209,
+    "Wait (final iteration's background merge)": 20.275,
+    "Write (close + .npy convert)": 0.001
+   },
+   "peak_rss_gb": {
+    "bucket2": 94.025,
+    "prune": 5.734,
+    "optimize_chunked": 25.498
+   },
+   "gpu_peak_mib": 14544,
+   "spot": "t1",
+   "spot_reps": [
+    {
+     "stages": [
+      {
+       "units": "99804688",
+       "segments": "8",
+       "steals": "1",
+       "drains": "1",
+       "reaped": "0",
+       "preempts": "3",
+       "rejected_units": "22940610",
+       "setups": "7",
+       "wall": "26.208s",
+       "stage": "step4"
+      },
+      {
+       "units": "195312",
+       "segments": "5",
+       "steals": "0",
+       "drains": "1",
+       "reaped": "0",
+       "preempts": "1",
+       "rejected_units": "0",
+       "setups": "4",
+       "wall": "27.677s",
+       "stage": "step6"
+      },
+      {
+       "units": "99804688",
+       "segments": "9",
+       "steals": "2",
+       "drains": "0",
+       "reaped": "1",
+       "preempts": "3",
+       "rejected_units": "52117696",
+       "setups": "6",
+       "wall": "30.768s",
+       "stage": "step4"
+      },
+      {
+       "units": "195312",
+       "segments": "4",
+       "steals": "0",
+       "drains": "2",
+       "reaped": "1",
+       "preempts": "3",
+       "rejected_units": "7",
+       "setups": "5",
+       "wall": "28.982s",
+       "stage": "step6"
+      },
+      {
+       "units": "195312",
+       "segments": "7",
+       "steals": "1",
+       "drains": "2",
+       "reaped": "1",
+       "preempts": "4",
+       "rejected_units": "0",
+       "setups": "7",
+       "wall": "29.407s",
+       "stage": "prune"
+      }
+     ],
+     "events": {
+      "notice": 15,
+      "preempt": 16,
+      "join": 16
+     },
+     "rejected_units": 75058313,
+     "preempts": 14,
+     "steals": 4,
+     "setups": 29,
+     "reaped": 3,
+     "drains": 6
+    },
+    {
+     "stages": [
+      {
+       "units": "99804688",
+       "segments": "8",
+       "steals": "1",
+       "drains": "1",
+       "reaped": "0",
+       "preempts": "3",
+       "rejected_units": "22940610",
+       "setups": "7",
+       "wall": "26.173s",
+       "stage": "step4"
+      },
+      {
+       "units": "195312",
+       "segments": "5",
+       "steals": "0",
+       "drains": "1",
+       "reaped": "0",
+       "preempts": "1",
+       "rejected_units": "0",
+       "setups": "4",
+       "wall": "27.354s",
+       "stage": "step6"
+      },
+      {
+       "units": "99804688",
+       "segments": "9",
+       "steals": "2",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "3",
+       "rejected_units": "52117696",
+       "setups": "6",
+       "wall": "30.390s",
+       "stage": "step4"
+      },
+      {
+       "units": "195312",
+       "segments": "4",
+       "steals": "0",
+       "drains": "2",
+       "reaped": "0",
+       "preempts": "3",
+       "rejected_units": "11",
+       "setups": "5",
+       "wall": "27.764s",
+       "stage": "step6"
+      },
+      {
+       "units": "195312",
+       "segments": "7",
+       "steals": "1",
+       "drains": "3",
+       "reaped": "2",
+       "preempts": "4",
+       "rejected_units": "0",
+       "setups": "7",
+       "wall": "37.738s",
+       "stage": "prune"
+      }
+     ],
+     "events": {
+      "notice": 15,
+      "preempt": 17,
+      "join": 17
+     },
+     "rejected_units": 75058317,
+     "preempts": 14,
+     "steals": 4,
+     "setups": 29,
+     "reaped": 2,
+     "drains": 7
+    },
+    {
+     "stages": [
+      {
+       "units": "99804688",
+       "segments": "9",
+       "steals": "2",
+       "drains": "1",
+       "reaped": "0",
+       "preempts": "3",
+       "rejected_units": "22940610",
+       "setups": "7",
+       "wall": "26.562s",
+       "stage": "step4"
+      },
+      {
+       "units": "195312",
+       "segments": "5",
+       "steals": "0",
+       "drains": "1",
+       "reaped": "0",
+       "preempts": "1",
+       "rejected_units": "0",
+       "setups": "4",
+       "wall": "27.984s",
+       "stage": "step6"
+      },
+      {
+       "units": "99804688",
+       "segments": "9",
+       "steals": "2",
+       "drains": "0",
+       "reaped": "1",
+       "preempts": "3",
+       "rejected_units": "52117696",
+       "setups": "6",
+       "wall": "29.606s",
+       "stage": "step4"
+      },
+      {
+       "units": "195312",
+       "segments": "4",
+       "steals": "0",
+       "drains": "2",
+       "reaped": "1",
+       "preempts": "3",
+       "rejected_units": "260",
+       "setups": "5",
+       "wall": "29.626s",
+       "stage": "step6"
+      },
+      {
+       "units": "195312",
+       "segments": "6",
+       "steals": "1",
+       "drains": "1",
+       "reaped": "0",
+       "preempts": "3",
+       "rejected_units": "0",
+       "setups": "6",
+       "wall": "27.530s",
+       "stage": "prune"
+      }
+     ],
+     "events": {
+      "notice": 15,
+      "preempt": 17,
+      "join": 16
+     },
+     "rejected_units": 75058566,
+     "preempts": 13,
+     "steals": 5,
+     "setups": 28,
+     "reaped": 2,
+     "drains": 5
+    }
+   ],
+   "knn_similarity": {
+    "n": 100000000,
+    "degree": 64,
+    "samples": 10000,
+    "padding_rate": 0.0,
+    "recall@1": 0.6529,
+    "recall@10": 0.61246,
+    "recall@32": 0.58905,
+    "recall@64": 0.57207
+   },
+   "search": {
+    "searcher": "diskann_memory",
+    "degree": 32,
+    "bad_ids": 0,
+    "self_loops": 0,
+    "dup_edges": 0,
+    "entry": 42894669,
+    "points": [
+     {
+      "itopk": 32,
+      "recall": 0.7258,
+      "qps": 66255.0
+     },
+     {
+      "itopk": 64,
+      "recall": 0.8338,
+      "qps": 57644.52
+     },
+     {
+      "itopk": 128,
+      "recall": 0.9112,
+      "qps": 34821.75
+     },
+     {
+      "itopk": 256,
+      "recall": 0.9594,
+      "qps": 19866.24
+     },
+     {
+      "itopk": 512,
+      "recall": 0.9838,
+      "qps": 11284.64
+     }
+    ]
+   }
+  },
+  "sift100M_auto_g1_spott1": {
+   "dataset": "sift100M",
+   "mode": "auto",
+   "path": "large",
+   "reps": 3,
+   "gpus": [
+    0
+   ],
+   "num_gpus": 1,
+   "build_total_s": 386.77,
+   "build_total_all_s": [
+    386.77,
+    395.76,
+    386.04
+   ],
+   "stages_s": {
+    "bucket2": 316.26,
+    "prune": 48.59,
+    "optimize_chunked": 22.72
+   },
+   "bucket2_steps_s": {
+    "Step 1 (Load sampled data)": 8.007,
+    "Step 2 (Select centroids)": 5.11,
+    "Step 3 (Centroid KNN graph)": 2.438,
+    "Step 3.5 (Load full dataset)": 0.0,
+    "Step 4 (Batch assignment)": 100.937,
+    "Step 4.5 (Inline reorder, round 1 only)": 4.515,
+    "Step 5 (Write buckets)": 3.076,
+    "Step 6 (Per-vector KNN, merge included)": 162.282,
+    "Wait (final iteration's background merge)": 20.547,
+    "Write (close + .npy convert)": 0.001
+   },
+   "peak_rss_gb": {
+    "bucket2": 92.649,
+    "prune": 4.604,
+    "optimize_chunked": 25.498
+   },
+   "gpu_peak_mib": 14548,
+   "spot": "t1",
+   "spot_reps": [
+    {
+     "stages": [
+      {
+       "units": "99804688",
+       "segments": "2",
+       "steals": "0",
+       "drains": "1",
+       "reaped": "1",
+       "preempts": "1",
+       "rejected_units": "4588122",
+       "setups": "2",
+       "wall": "46.039s",
+       "stage": "step4"
+      },
+      {
+       "units": "195312",
+       "segments": "1",
+       "steals": "0",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "1",
+       "rejected_units": "0",
+       "setups": "1",
+       "wall": "85.641s",
+       "stage": "step6"
+      },
+      {
+       "units": "99804688",
+       "segments": "4",
+       "steals": "0",
+       "drains": "1",
+       "reaped": "0",
+       "preempts": "1",
+       "rejected_units": "0",
+       "setups": "4",
+       "wall": "46.264s",
+       "stage": "step4"
+      },
+      {
+       "units": "195312",
+       "segments": "2",
+       "steals": "0",
+       "drains": "1",
+       "reaped": "1",
+       "preempts": "1",
+       "rejected_units": "0",
+       "setups": "3",
+       "wall": "74.564s",
+       "stage": "step6"
+      },
+      {
+       "units": "195312",
+       "segments": "1",
+       "steals": "0",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "1",
+       "wall": "49.599s",
+       "stage": "prune"
+      }
+     ],
+     "events": {
+      "notice": 5,
+      "preempt": 5,
+      "join": 5
+     },
+     "rejected_units": 4588122,
+     "preempts": 4,
+     "steals": 0,
+     "setups": 11,
+     "reaped": 2,
+     "drains": 3
+    },
+    {
+     "stages": [
+      {
+       "units": "99804688",
+       "segments": "2",
+       "steals": "1",
+       "drains": "1",
+       "reaped": "0",
+       "preempts": "1",
+       "rejected_units": "4588122",
+       "setups": "2",
+       "wall": "46.692s",
+       "stage": "step4"
+      },
+      {
+       "units": "195312",
+       "segments": "1",
+       "steals": "0",
+       "drains": "1",
+       "reaped": "1",
+       "preempts": "1",
+       "rejected_units": "0",
+       "setups": "2",
+       "wall": "86.421s",
+       "stage": "step6"
+      },
+      {
+       "units": "99804688",
+       "segments": "4",
+       "steals": "0",
+       "drains": "0",
+       "reaped": "1",
+       "preempts": "1",
+       "rejected_units": "21908898",
+       "setups": "4",
+       "wall": "55.987s",
+       "stage": "step4"
+      },
+      {
+       "units": "195312",
+       "segments": "2",
+       "steals": "0",
+       "drains": "2",
+       "reaped": "2",
+       "preempts": "2",
+       "rejected_units": "0",
+       "setups": "3",
+       "wall": "77.729s",
+       "stage": "step6"
+      },
+      {
+       "units": "195312",
+       "segments": "1",
+       "steals": "0",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "1",
+       "wall": "40.472s",
+       "stage": "prune"
+      }
+     ],
+     "events": {
+      "notice": 5,
+      "preempt": 5,
+      "join": 5
+     },
+     "rejected_units": 26497020,
+     "preempts": 5,
+     "steals": 1,
+     "setups": 12,
+     "reaped": 4,
+     "drains": 4
+    },
+    {
+     "stages": [
+      {
+       "units": "99804688",
+       "segments": "2",
+       "steals": "0",
+       "drains": "1",
+       "reaped": "1",
+       "preempts": "1",
+       "rejected_units": "4588122",
+       "setups": "2",
+       "wall": "46.430s",
+       "stage": "step4"
+      },
+      {
+       "units": "195312",
+       "segments": "1",
+       "steals": "0",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "1",
+       "rejected_units": "0",
+       "setups": "1",
+       "wall": "85.513s",
+       "stage": "step6"
+      },
+      {
+       "units": "99804688",
+       "segments": "4",
+       "steals": "0",
+       "drains": "1",
+       "reaped": "0",
+       "preempts": "1",
+       "rejected_units": "0",
+       "setups": "4",
+       "wall": "46.431s",
+       "stage": "step4"
+      },
+      {
+       "units": "195312",
+       "segments": "3",
+       "steals": "1",
+       "drains": "1",
+       "reaped": "0",
+       "preempts": "1",
+       "rejected_units": "0",
+       "setups": "3",
+       "wall": "75.607s",
+       "stage": "step6"
+      },
+      {
+       "units": "195312",
+       "segments": "1",
+       "steals": "0",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "1",
+       "wall": "47.490s",
+       "stage": "prune"
+      }
+     ],
+     "events": {
+      "notice": 5,
+      "preempt": 5,
+      "join": 5
+     },
+     "rejected_units": 4588122,
+     "preempts": 4,
+     "steals": 1,
+     "setups": 11,
+     "reaped": 1,
+     "drains": 3
+    }
+   ],
+   "knn_similarity": {
+    "n": 100000000,
+    "degree": 64,
+    "samples": 10000,
+    "padding_rate": 0.0,
+    "recall@1": 0.652,
+    "recall@10": 0.61379,
+    "recall@32": 0.58974,
+    "recall@64": 0.57264
+   },
+   "search": {
+    "searcher": "diskann_memory",
+    "degree": 32,
+    "bad_ids": 0,
+    "self_loops": 0,
+    "dup_edges": 0,
+    "entry": 42894669,
+    "points": [
+     {
+      "itopk": 32,
+      "recall": 0.7242000000000001,
+      "qps": 101826.08
+     },
+     {
+      "itopk": 64,
+      "recall": 0.8319,
+      "qps": 73348.23
+     },
+     {
+      "itopk": 128,
+      "recall": 0.9097,
+      "qps": 42516.24
+     },
+     {
+      "itopk": 256,
+      "recall": 0.9589,
+      "qps": 23568.2
+     },
+     {
+      "itopk": 512,
+      "recall": 0.9832,
+      "qps": 12478.96
+     }
+    ]
+   }
+  }
+ },
+ "dirs": {
+  "sift100M_auto_g2": "/home/lanlu/microBenchmark_spot/bucketDemo/buildBucket/runs/merge1/sift100M_auto_g2_plain",
+  "sift100M_auto_g4": "/home/lanlu/microBenchmark_spot/bucketDemo/buildBucket/runs/merge1/sift100M_auto_g4_plain",
+  "sift100M_auto": "/home/lanlu/microBenchmark_spot/bucketDemo/buildBucket/runs/merge1/sift100M_auto_plain",
+  "sift100M_auto_g2_spotnone": "/home/lanlu/microBenchmark_spot/bucketDemo/buildBucket/runs/merge1/sift100M_auto_g2_spotnone",
+  "sift100M_auto_g4_spotnone": "/home/lanlu/microBenchmark_spot/bucketDemo/buildBucket/runs/merge1/sift100M_auto_g4_spotnone",
+  "sift100M_auto_g1_spotnone": "/home/lanlu/microBenchmark_spot/bucketDemo/buildBucket/runs/merge1/sift100M_auto_g1_spotnone",
+  "sift100M_auto_g2_spott1": "/home/lanlu/microBenchmark_spot/bucketDemo/buildBucket/runs/merge1/sift100M_auto_g2_spott1",
+  "sift100M_auto_g4_spott1": "/home/lanlu/microBenchmark_spot/bucketDemo/buildBucket/runs/merge1/sift100M_auto_g4_spott1",
+  "sift100M_auto_g1_spott1": "/home/lanlu/microBenchmark_spot/bucketDemo/buildBucket/runs/spot5/sift100M_auto_g1_spott1"
+ },
+ "baseline_runs": {
+  "sift100M_auto_g2": {
+   "dataset": "sift100M",
+   "mode": "auto",
+   "path": "large",
+   "reps": 3,
+   "gpus": [
+    2,
+    3
+   ],
+   "num_gpus": 2,
+   "build_total_s": 252.23,
+   "build_total_all_s": [
+    250.16,
+    252.23,
+    252.59
+   ],
+   "stages_s": {
+    "bucket2": 191.88,
+    "prune": 42.7,
+    "optimize_chunked": 17.59
+   },
+   "bucket2_steps_s": {
+    "Step 1 (Load sampled data)": 7.919,
+    "Step 2 (Select centroids)": 5.179,
+    "Step 3 (Centroid KNN graph)": 2.525,
+    "Step 3.5 (Load full dataset)": 0.0,
+    "Step 4 (Batch assignment)": 53.925,
+    "Step 4.5 (Inline reorder, round 1 only)": 4.461,
+    "Step 5 (Write buckets)": 2.995,
+    "Step 6 (Per-vector KNN, merge included)": 83.719,
+    "Wait (final iteration's background merge)": 21.602,
+    "Write (close + .npy convert)": 0.001
+   },
+   "peak_rss_gb": {
+    "bucket2": 92.634,
+    "prune": 4.981,
+    "optimize_chunked": 25.649
+   },
+   "gpu_peak_mib": 14546,
+   "knn_similarity": {
+    "n": 100000000,
+    "degree": 64,
+    "samples": 10000,
+    "padding_rate": 0.0,
+    "recall@1": 0.6564,
+    "recall@10": 0.61353,
+    "recall@32": 0.58887,
+    "recall@64": 0.57266
+   },
+   "search": {
+    "searcher": "diskann_memory",
+    "degree": 32,
+    "bad_ids": 0,
+    "self_loops": 0,
+    "dup_edges": 0,
+    "entry": 42894669,
+    "points": [
+     {
+      "itopk": 32,
+      "recall": 0.7265,
+      "qps": 99363.09
+     },
+     {
+      "itopk": 64,
+      "recall": 0.8336,
+      "qps": 73682.17
+     },
+     {
+      "itopk": 128,
+      "recall": 0.9109999999999999,
+      "qps": 42928.96
+     },
+     {
+      "itopk": 256,
+      "recall": 0.9597,
+      "qps": 23679.72
+     },
+     {
+      "itopk": 512,
+      "recall": 0.9839,
+      "qps": 12469.24
+     }
+    ]
+   }
+  },
+  "sift100M_auto_g4": {
+   "dataset": "sift100M",
+   "mode": "auto",
+   "path": "large",
+   "reps": 3,
+   "gpus": [
+    0,
+    1,
+    2,
+    3
+   ],
+   "num_gpus": 4,
+   "build_total_s": 205.56,
+   "build_total_all_s": [
+    203.35,
+    206.25,
+    205.56
+   ],
+   "stages_s": {
+    "bucket2": 141.6,
+    "prune": 47.72,
+    "optimize_chunked": 16.13
+   },
+   "bucket2_steps_s": {
+    "Step 1 (Load sampled data)": 8.017,
+    "Step 2 (Select centroids)": 5.521,
+    "Step 3 (Centroid KNN graph)": 2.539,
+    "Step 3.5 (Load full dataset)": 0.0,
+    "Step 4 (Batch assignment)": 33.7,
+    "Step 4.5 (Inline reorder, round 1 only)": 6.252,
+    "Step 5 (Write buckets)": 3.166,
+    "Step 6 (Per-vector KNN, merge included)": 52.593,
+    "Wait (final iteration's background merge)": 21.558,
+    "Write (close + .npy convert)": 0.001
+   },
+   "peak_rss_gb": {
+    "bucket2": 95.496,
+    "prune": 5.73,
+    "optimize_chunked": 26.098
+   },
+   "gpu_peak_mib": 14544,
+   "knn_similarity": {
+    "n": 100000000,
+    "degree": 64,
+    "samples": 10000,
+    "padding_rate": 0.0,
+    "recall@1": 0.6556,
+    "recall@10": 0.61725,
+    "recall@32": 0.59164,
+    "recall@64": 0.57385
+   },
+   "search": {
+    "searcher": "diskann_memory",
+    "degree": 32,
+    "bad_ids": 0,
+    "self_loops": 0,
+    "dup_edges": 0,
+    "entry": 42894669,
+    "points": [
+     {
+      "itopk": 32,
+      "recall": 0.7278,
+      "qps": 99125.82
+     },
+     {
+      "itopk": 64,
+      "recall": 0.8334999999999999,
+      "qps": 71598.74
+     },
+     {
+      "itopk": 128,
+      "recall": 0.9116,
+      "qps": 41722.33
+     },
+     {
+      "itopk": 256,
+      "recall": 0.9597,
+      "qps": 23124.17
+     },
+     {
+      "itopk": 512,
+      "recall": 0.9839,
+      "qps": 12267.19
+     }
+    ]
+   }
+  },
+  "sift100M_auto": {
+   "dataset": "sift100M",
+   "mode": "auto",
+   "path": "large",
+   "reps": 3,
+   "gpus": [
+    0
+   ],
+   "num_gpus": 1,
+   "build_total_s": 370.03,
+   "build_total_all_s": [
+    370.03,
+    371.09,
+    368.27
+   ],
+   "stages_s": {
+    "bucket2": 305.35,
+    "prune": 42.02,
+    "optimize_chunked": 23.72
+   },
+   "bucket2_steps_s": {
+    "Step 1 (Load sampled data)": 7.911,
+    "Step 2 (Select centroids)": 5.174,
+    "Step 3 (Centroid KNN graph)": 2.538,
+    "Step 3.5 (Load full dataset)": 0.0,
+    "Step 4 (Batch assignment)": 93.239,
+    "Step 4.5 (Inline reorder, round 1 only)": 4.47,
+    "Step 5 (Write buckets)": 3.065,
+    "Step 6 (Per-vector KNN, merge included)": 158.692,
+    "Wait (final iteration's background merge)": 22.701,
+    "Write (close + .npy convert)": 0.001
+   },
+   "peak_rss_gb": {
+    "bucket2": 92.879,
+    "prune": 4.6,
+    "optimize_chunked": 25.498
+   },
+   "gpu_peak_mib": 14546,
+   "knn_similarity": {
+    "n": 100000000,
+    "degree": 64,
+    "samples": 10000,
+    "padding_rate": 0.0,
+    "recall@1": 0.6542,
+    "recall@10": 0.61465,
+    "recall@32": 0.58992,
+    "recall@64": 0.57322
+   },
+   "search": {
+    "searcher": "diskann_memory",
+    "degree": 32,
+    "bad_ids": 0,
+    "self_loops": 0,
+    "dup_edges": 0,
+    "entry": 42894669,
+    "points": [
+     {
+      "itopk": 32,
+      "recall": 0.7248,
+      "qps": 101028.41
+     },
+     {
+      "itopk": 64,
+      "recall": 0.8319,
+      "qps": 71629.4
+     },
+     {
+      "itopk": 128,
+      "recall": 0.9105,
+      "qps": 42691.35
+     },
+     {
+      "itopk": 256,
+      "recall": 0.9587,
+      "qps": 23620.87
+     },
+     {
+      "itopk": 512,
+      "recall": 0.9834999999999999,
+      "qps": 12369.68
+     }
+    ]
+   }
+  },
+  "sift100M_auto_g2_spotnone": {
+   "dataset": "sift100M",
+   "mode": "auto",
+   "path": "large",
+   "reps": 3,
+   "gpus": [
+    2,
+    3
+   ],
+   "num_gpus": 2,
+   "build_total_s": 264.24,
+   "build_total_all_s": [
+    262.36,
+    264.24,
+    270.69
+   ],
+   "stages_s": {
+    "bucket2": 192.81,
+    "prune": 49.08,
+    "optimize_chunked": 22.91
+   },
+   "bucket2_steps_s": {
+    "Step 1 (Load sampled data)": 7.919,
+    "Step 2 (Select centroids)": 5.376,
+    "Step 3 (Centroid KNN graph)": 2.492,
+    "Step 3.5 (Load full dataset)": 0.0,
+    "Step 4 (Batch assignment)": 53.615,
+    "Step 4.5 (Inline reorder, round 1 only)": 4.518,
+    "Step 5 (Write buckets)": 3.027,
+    "Step 6 (Per-vector KNN, merge included)": 85.803,
+    "Wait (final iteration's background merge)": 20.716,
+    "Write (close + .npy convert)": 0.001
+   },
+   "peak_rss_gb": {
+    "bucket2": 93.064,
+    "prune": 4.988,
+    "optimize_chunked": 25.498
+   },
+   "gpu_peak_mib": 14546,
+   "spot": "none",
+   "spot_reps": [
+    {
+     "stages": [
+      {
+       "units": "99804688",
+       "segments": "2",
+       "steals": "0",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "2",
+       "wall": "22.657s",
+       "stage": "step4"
+      },
+      {
+       "units": "195312",
+       "segments": "2",
+       "steals": "0",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "2",
+       "wall": "43.515s",
+       "stage": "step6"
+      },
+      {
+       "units": "99804688",
+       "segments": "2",
+       "steals": "0",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "2",
+       "wall": "22.760s",
+       "stage": "step4"
+      },
+      {
+       "units": "195312",
+       "segments": "9",
+       "steals": "7",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "2",
+       "wall": "41.079s",
+       "stage": "step6"
+      },
+      {
+       "units": "195312",
+       "segments": "3",
+       "steals": "1",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "2",
+       "wall": "44.782s",
+       "stage": "prune"
+      }
+     ],
+     "events": {
+      "notice": 0,
+      "preempt": 0,
+      "join": 0
+     },
+     "rejected_units": 0,
+     "preempts": 0,
+     "steals": 8,
+     "setups": 10,
+     "reaped": 0,
+     "drains": 0
+    },
+    {
+     "stages": [
+      {
+       "units": "99804688",
+       "segments": "2",
+       "steals": "0",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "2",
+       "wall": "22.550s",
+       "stage": "step4"
+      },
+      {
+       "units": "195312",
+       "segments": "2",
+       "steals": "0",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "2",
+       "wall": "43.960s",
+       "stage": "step6"
+      },
+      {
+       "units": "99804688",
+       "segments": "2",
+       "steals": "0",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "2",
+       "wall": "22.718s",
+       "stage": "step4"
+      },
+      {
+       "units": "195312",
+       "segments": "10",
+       "steals": "8",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "2",
+       "wall": "40.992s",
+       "stage": "step6"
+      },
+      {
+       "units": "195312",
+       "segments": "4",
+       "steals": "2",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "2",
+       "wall": "47.890s",
+       "stage": "prune"
+      }
+     ],
+     "events": {
+      "notice": 0,
+      "preempt": 0,
+      "join": 0
+     },
+     "rejected_units": 0,
+     "preempts": 0,
+     "steals": 10,
+     "setups": 10,
+     "reaped": 0,
+     "drains": 0
+    },
+    {
+     "stages": [
+      {
+       "units": "99804688",
+       "segments": "2",
+       "steals": "0",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "2",
+       "wall": "22.616s",
+       "stage": "step4"
+      },
+      {
+       "units": "195312",
+       "segments": "3",
+       "steals": "1",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "2",
+       "wall": "45.184s",
+       "stage": "step6"
+      },
+      {
+       "units": "99804688",
+       "segments": "2",
+       "steals": "0",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "2",
+       "wall": "22.494s",
+       "stage": "step4"
+      },
+      {
+       "units": "195312",
+       "segments": "7",
+       "steals": "5",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "2",
+       "wall": "39.508s",
+       "stage": "step6"
+      },
+      {
+       "units": "195312",
+       "segments": "4",
+       "steals": "2",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "2",
+       "wall": "53.252s",
+       "stage": "prune"
+      }
+     ],
+     "events": {
+      "notice": 0,
+      "preempt": 0,
+      "join": 0
+     },
+     "rejected_units": 0,
+     "preempts": 0,
+     "steals": 8,
+     "setups": 10,
+     "reaped": 0,
+     "drains": 0
+    }
+   ],
+   "knn_similarity": {
+    "n": 100000000,
+    "degree": 64,
+    "samples": 10000,
+    "padding_rate": 0.0,
+    "recall@1": 0.6495,
+    "recall@10": 0.61298,
+    "recall@32": 0.58849,
+    "recall@64": 0.57174
+   },
+   "search": {
+    "searcher": "diskann_memory",
+    "degree": 32,
+    "bad_ids": 0,
+    "self_loops": 0,
+    "dup_edges": 0,
+    "entry": 42894669,
+    "points": [
+     {
+      "itopk": 32,
+      "recall": 0.7275,
+      "qps": 75184.21
+     },
+     {
+      "itopk": 64,
+      "recall": 0.8355,
+      "qps": 51552.95
+     },
+     {
+      "itopk": 128,
+      "recall": 0.9112,
+      "qps": 29971.65
+     },
+     {
+      "itopk": 256,
+      "recall": 0.9592,
+      "qps": 16324.46
+     },
+     {
+      "itopk": 512,
+      "recall": 0.9838,
+      "qps": 8788.88
+     }
+    ]
+   }
+  },
+  "sift100M_auto_g4_spotnone": {
+   "dataset": "sift100M",
+   "mode": "auto",
+   "path": "large",
+   "reps": 3,
+   "gpus": [
+    0,
+    1,
+    2,
+    3
+   ],
+   "num_gpus": 4,
+   "build_total_s": 250.15,
+   "build_total_all_s": [
+    218.92,
+    250.15,
+    252.69
+   ],
+   "stages_s": {
+    "bucket2": 151.7,
+    "prune": 75.08,
+    "optimize_chunked": 22.61
+   },
+   "bucket2_steps_s": {
+    "Step 1 (Load sampled data)": 7.991,
+    "Step 2 (Select centroids)": 5.341,
+    "Step 3 (Centroid KNN graph)": 2.583,
+    "Step 3.5 (Load full dataset)": 0.0,
+    "Step 4 (Batch assignment)": 34.176,
+    "Step 4.5 (Inline reorder, round 1 only)": 6.23,
+    "Step 5 (Write buckets)": 3.093,
+    "Step 6 (Per-vector KNN, merge included)": 61.507,
+    "Wait (final iteration's background merge)": 22.043,
+    "Write (close + .npy convert)": 0.001
+   },
+   "peak_rss_gb": {
+    "bucket2": 94.85,
+    "prune": 5.749,
+    "optimize_chunked": 25.498
+   },
+   "gpu_peak_mib": 14546,
+   "spot": "none",
+   "spot_reps": [
+    {
+     "stages": [
+      {
+       "units": "99804688",
+       "segments": "4",
+       "steals": "0",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "4",
+       "wall": "13.116s",
+       "stage": "step4"
+      },
+      {
+       "units": "195312",
+       "segments": "8",
+       "steals": "4",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "4",
+       "wall": "27.503s",
+       "stage": "step6"
+      },
+      {
+       "units": "99804688",
+       "segments": "4",
+       "steals": "0",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "4",
+       "wall": "12.805s",
+       "stage": "step4"
+      },
+      {
+       "units": "195312",
+       "segments": "7",
+       "steals": "3",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "4",
+       "wall": "27.731s",
+       "stage": "step6"
+      },
+      {
+       "units": "195312",
+       "segments": "6",
+       "steals": "2",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "4",
+       "wall": "50.376s",
+       "stage": "prune"
+      }
+     ],
+     "events": {
+      "notice": 0,
+      "preempt": 0,
+      "join": 0
+     },
+     "rejected_units": 0,
+     "preempts": 0,
+     "steals": 9,
+     "setups": 20,
+     "reaped": 0,
+     "drains": 0
+    },
+    {
+     "stages": [
+      {
+       "units": "99804688",
+       "segments": "4",
+       "steals": "0",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "4",
+       "wall": "13.413s",
+       "stage": "step4"
+      },
+      {
+       "units": "195312",
+       "segments": "8",
+       "steals": "4",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "4",
+       "wall": "27.840s",
+       "stage": "step6"
+      },
+      {
+       "units": "99804688",
+       "segments": "4",
+       "steals": "0",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "4",
+       "wall": "13.151s",
+       "stage": "step4"
+      },
+      {
+       "units": "195312",
+       "segments": "16",
+       "steals": "12",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "4",
+       "wall": "32.495s",
+       "stage": "step6"
+      },
+      {
+       "units": "195312",
+       "segments": "19",
+       "steals": "15",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "4",
+       "wall": "73.692s",
+       "stage": "prune"
+      }
+     ],
+     "events": {
+      "notice": 0,
+      "preempt": 0,
+      "join": 0
+     },
+     "rejected_units": 0,
+     "preempts": 0,
+     "steals": 31,
+     "setups": 20,
+     "reaped": 0,
+     "drains": 0
+    },
+    {
+     "stages": [
+      {
+       "units": "99804688",
+       "segments": "4",
+       "steals": "0",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "4",
+       "wall": "13.056s",
+       "stage": "step4"
+      },
+      {
+       "units": "195312",
+       "segments": "8",
+       "steals": "4",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "4",
+       "wall": "27.368s",
+       "stage": "step6"
+      },
+      {
+       "units": "99804688",
+       "segments": "4",
+       "steals": "0",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "4",
+       "wall": "12.864s",
+       "stage": "step4"
+      },
+      {
+       "units": "195312",
+       "segments": "17",
+       "steals": "13",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "4",
+       "wall": "32.976s",
+       "stage": "step6"
+      },
+      {
+       "units": "195312",
+       "segments": "19",
+       "steals": "15",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "4",
+       "wall": "77.027s",
+       "stage": "prune"
+      }
+     ],
+     "events": {
+      "notice": 0,
+      "preempt": 0,
+      "join": 0
+     },
+     "rejected_units": 0,
+     "preempts": 0,
+     "steals": 32,
+     "setups": 20,
+     "reaped": 0,
+     "drains": 0
+    }
+   ],
+   "knn_similarity": {
+    "n": 100000000,
+    "degree": 64,
+    "samples": 10000,
+    "padding_rate": 0.0,
+    "recall@1": 0.6543,
+    "recall@10": 0.61514,
+    "recall@32": 0.5894,
+    "recall@64": 0.57224
+   },
+   "search": {
+    "searcher": "diskann_memory",
+    "degree": 32,
+    "bad_ids": 0,
+    "self_loops": 0,
+    "dup_edges": 0,
+    "entry": 42894669,
+    "points": [
+     {
+      "itopk": 32,
+      "recall": 0.7256,
+      "qps": 103231.16
+     },
+     {
+      "itopk": 64,
+      "recall": 0.833,
+      "qps": 73229.44
+     },
+     {
+      "itopk": 128,
+      "recall": 0.9109999999999999,
+      "qps": 42717.51
+     },
+     {
+      "itopk": 256,
+      "recall": 0.9590000000000001,
+      "qps": 23624.7
+     },
+     {
+      "itopk": 512,
+      "recall": 0.9837,
+      "qps": 12550.01
+     }
+    ]
+   }
+  },
+  "sift100M_auto_g1_spotnone": {
+   "dataset": "sift100M",
+   "mode": "auto",
+   "path": "large",
+   "reps": 3,
+   "gpus": [
+    0
+   ],
+   "num_gpus": 1,
+   "build_total_s": 374.43,
+   "build_total_all_s": [
+    374.43,
+    377.4,
+    371.01
+   ],
+   "stages_s": {
+    "bucket2": 304.07,
+    "prune": 47.03,
+    "optimize_chunked": 22.33
+   },
+   "bucket2_steps_s": {
+    "Step 1 (Load sampled data)": 7.95,
+    "Step 2 (Select centroids)": 5.097,
+    "Step 3 (Centroid KNN graph)": 2.66,
+    "Step 3.5 (Load full dataset)": 0.0,
+    "Step 4 (Batch assignment)": 93.953,
+    "Step 4.5 (Inline reorder, round 1 only)": 4.529,
+    "Step 5 (Write buckets)": 3.05,
+    "Step 6 (Per-vector KNN, merge included)": 158.333,
+    "Wait (final iteration's background merge)": 21.075,
+    "Write (close + .npy convert)": 0.001
+   },
+   "peak_rss_gb": {
+    "bucket2": 92.808,
+    "prune": 4.605,
+    "optimize_chunked": 25.498
+   },
+   "gpu_peak_mib": 14548,
+   "spot": "none",
+   "spot_reps": [
+    {
+     "stages": [
+      {
+       "units": "99804688",
+       "segments": "1",
+       "steals": "0",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "1",
+       "wall": "43.183s",
+       "stage": "step4"
+      },
+      {
+       "units": "195312",
+       "segments": "1",
+       "steals": "0",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "1",
+       "wall": "85.581s",
+       "stage": "step6"
+      },
+      {
+       "units": "99804688",
+       "segments": "1",
+       "steals": "0",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "1",
+       "wall": "41.950s",
+       "stage": "step4"
+      },
+      {
+       "units": "195312",
+       "segments": "1",
+       "steals": "0",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "1",
+       "wall": "71.424s",
+       "stage": "step6"
+      },
+      {
+       "units": "195312",
+       "segments": "1",
+       "steals": "0",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "1",
+       "wall": "45.943s",
+       "stage": "prune"
+      }
+     ],
+     "events": {
+      "notice": 0,
+      "preempt": 0,
+      "join": 0
+     },
+     "rejected_units": 0,
+     "preempts": 0,
+     "steals": 0,
+     "setups": 5,
+     "reaped": 0,
+     "drains": 0
+    },
+    {
+     "stages": [
+      {
+       "units": "99804688",
+       "segments": "1",
+       "steals": "0",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "1",
+       "wall": "42.413s",
+       "stage": "step4"
+      },
+      {
+       "units": "195312",
+       "segments": "1",
+       "steals": "0",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "1",
+       "wall": "85.574s",
+       "stage": "step6"
+      },
+      {
+       "units": "99804688",
+       "segments": "1",
+       "steals": "0",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "1",
+       "wall": "41.914s",
+       "stage": "step4"
+      },
+      {
+       "units": "195312",
+       "segments": "1",
+       "steals": "0",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "1",
+       "wall": "72.005s",
+       "stage": "step6"
+      },
+      {
+       "units": "195312",
+       "segments": "1",
+       "steals": "0",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "1",
+       "wall": "50.966s",
+       "stage": "prune"
+      }
+     ],
+     "events": {
+      "notice": 0,
+      "preempt": 0,
+      "join": 0
+     },
+     "rejected_units": 0,
+     "preempts": 0,
+     "steals": 0,
+     "setups": 5,
+     "reaped": 0,
+     "drains": 0
+    },
+    {
+     "stages": [
+      {
+       "units": "99804688",
+       "segments": "1",
+       "steals": "0",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "1",
+       "wall": "42.336s",
+       "stage": "step4"
+      },
+      {
+       "units": "195312",
+       "segments": "1",
+       "steals": "0",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "1",
+       "wall": "85.291s",
+       "stage": "step6"
+      },
+      {
+       "units": "99804688",
+       "segments": "1",
+       "steals": "0",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "1",
+       "wall": "41.862s",
+       "stage": "step4"
+      },
+      {
+       "units": "195312",
+       "segments": "1",
+       "steals": "0",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "1",
+       "wall": "72.049s",
+       "stage": "step6"
+      },
+      {
+       "units": "195312",
+       "segments": "1",
+       "steals": "0",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "1",
+       "wall": "43.339s",
+       "stage": "prune"
+      }
+     ],
+     "events": {
+      "notice": 0,
+      "preempt": 0,
+      "join": 0
+     },
+     "rejected_units": 0,
+     "preempts": 0,
+     "steals": 0,
+     "setups": 5,
+     "reaped": 0,
+     "drains": 0
+    }
+   ],
+   "knn_similarity": {
+    "n": 100000000,
+    "degree": 64,
+    "samples": 10000,
+    "padding_rate": 0.0,
+    "recall@1": 0.6534,
+    "recall@10": 0.61848,
+    "recall@32": 0.59234,
+    "recall@64": 0.57451
+   },
+   "search": {
+    "searcher": "diskann_memory",
+    "degree": 32,
+    "bad_ids": 0,
+    "self_loops": 0,
+    "dup_edges": 0,
+    "entry": 42894669,
+    "points": [
+     {
+      "itopk": 32,
+      "recall": 0.7273999999999999,
+      "qps": 102637.25
+     },
+     {
+      "itopk": 64,
+      "recall": 0.8344,
+      "qps": 74380.42
+     },
+     {
+      "itopk": 128,
+      "recall": 0.9106000000000001,
+      "qps": 43175.17
+     },
+     {
+      "itopk": 256,
+      "recall": 0.9590000000000001,
+      "qps": 23807.18
+     },
+     {
+      "itopk": 512,
+      "recall": 0.9837,
+      "qps": 12594.57
+     }
+    ]
+   }
+  },
+  "sift100M_auto_g2_spott1": {
+   "dataset": "sift100M",
+   "mode": "auto",
+   "path": "large",
+   "reps": 3,
+   "gpus": [
+    2,
+    3
+   ],
+   "num_gpus": 2,
+   "build_total_s": 280.84,
+   "build_total_all_s": [
+    282.65,
+    280.84,
+    279.38
+   ],
+   "stages_s": {
+    "bucket2": 209.28,
+    "prune": 48.6,
+    "optimize_chunked": 22.93
+   },
+   "bucket2_steps_s": {
+    "Step 1 (Load sampled data)": 7.942,
+    "Step 2 (Select centroids)": 5.168,
+    "Step 3 (Centroid KNN graph)": 2.594,
+    "Step 3.5 (Load full dataset)": 0.0,
+    "Step 4 (Batch assignment)": 53.828,
+    "Step 4.5 (Inline reorder, round 1 only)": 4.476,
+    "Step 5 (Write buckets)": 3.08,
+    "Step 6 (Per-vector KNN, merge included)": 102.13,
+    "Wait (final iteration's background merge)": 20.786,
+    "Write (close + .npy convert)": 0.001
+   },
+   "peak_rss_gb": {
+    "bucket2": 92.75,
+    "prune": 4.986,
+    "optimize_chunked": 25.498
+   },
+   "gpu_peak_mib": 14546,
+   "spot": "t1",
+   "spot_reps": [
+    {
+     "stages": [
+      {
+       "units": "99804688",
+       "segments": "2",
+       "steals": "0",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "2",
+       "wall": "22.643s",
+       "stage": "step4"
+      },
+      {
+       "units": "195312",
+       "segments": "4",
+       "steals": "2",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "2",
+       "wall": "53.483s",
+       "stage": "step6"
+      },
+      {
+       "units": "99804688",
+       "segments": "2",
+       "steals": "0",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "2",
+       "wall": "22.996s",
+       "stage": "step4"
+      },
+      {
+       "units": "195312",
+       "segments": "3",
+       "steals": "1",
+       "drains": "2",
+       "reaped": "1",
+       "preempts": "2",
+       "rejected_units": "0",
+       "setups": "3",
+       "wall": "48.718s",
+       "stage": "step6"
+      },
+      {
+       "units": "195312",
+       "segments": "3",
+       "steals": "0",
+       "drains": "1",
+       "reaped": "0",
+       "preempts": "1",
+       "rejected_units": "0",
+       "setups": "3",
+       "wall": "48.486s",
+       "stage": "prune"
+      }
+     ],
+     "events": {
+      "notice": 4,
+      "preempt": 4,
+      "join": 4
+     },
+     "rejected_units": 0,
+     "preempts": 3,
+     "steals": 3,
+     "setups": 12,
+     "reaped": 1,
+     "drains": 3
+    },
+    {
+     "stages": [
+      {
+       "units": "99804688",
+       "segments": "2",
+       "steals": "0",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "2",
+       "wall": "22.814s",
+       "stage": "step4"
+      },
+      {
+       "units": "195312",
+       "segments": "4",
+       "steals": "2",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "2",
+       "wall": "53.919s",
+       "stage": "step6"
+      },
+      {
+       "units": "99804688",
+       "segments": "2",
+       "steals": "0",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "2",
+       "wall": "22.940s",
+       "stage": "step4"
+      },
+      {
+       "units": "195312",
+       "segments": "4",
+       "steals": "2",
+       "drains": "1",
+       "reaped": "1",
+       "preempts": "2",
+       "rejected_units": "0",
+       "setups": "3",
+       "wall": "47.102s",
+       "stage": "step6"
+      },
+      {
+       "units": "195312",
+       "segments": "4",
+       "steals": "2",
+       "drains": "1",
+       "reaped": "0",
+       "preempts": "1",
+       "rejected_units": "0",
+       "setups": "3",
+       "wall": "47.405s",
+       "stage": "prune"
+      }
+     ],
+     "events": {
+      "notice": 4,
+      "preempt": 4,
+      "join": 4
+     },
+     "rejected_units": 0,
+     "preempts": 3,
+     "steals": 6,
+     "setups": 12,
+     "reaped": 1,
+     "drains": 2
+    },
+    {
+     "stages": [
+      {
+       "units": "99804688",
+       "segments": "2",
+       "steals": "0",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "2",
+       "wall": "22.483s",
+       "stage": "step4"
+      },
+      {
+       "units": "195312",
+       "segments": "4",
+       "steals": "2",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "2",
+       "wall": "53.826s",
+       "stage": "step6"
+      },
+      {
+       "units": "99804688",
+       "segments": "2",
+       "steals": "0",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "2",
+       "wall": "22.578s",
+       "stage": "step4"
+      },
+      {
+       "units": "195312",
+       "segments": "3",
+       "steals": "1",
+       "drains": "1",
+       "reaped": "0",
+       "preempts": "1",
+       "rejected_units": "0",
+       "setups": "3",
+       "wall": "47.284s",
+       "stage": "step6"
+      },
+      {
+       "units": "195312",
+       "segments": "3",
+       "steals": "0",
+       "drains": "1",
+       "reaped": "0",
+       "preempts": "1",
+       "rejected_units": "0",
+       "setups": "3",
+       "wall": "46.210s",
+       "stage": "prune"
+      }
+     ],
+     "events": {
+      "notice": 4,
+      "preempt": 4,
+      "join": 4
+     },
+     "rejected_units": 0,
+     "preempts": 2,
+     "steals": 3,
+     "setups": 12,
+     "reaped": 0,
+     "drains": 2
+    }
+   ],
+   "knn_similarity": {
+    "n": 100000000,
+    "degree": 64,
+    "samples": 10000,
+    "padding_rate": 0.0,
+    "recall@1": 0.6456,
+    "recall@10": 0.6146,
+    "recall@32": 0.58978,
+    "recall@64": 0.57287
+   },
+   "search": {
+    "searcher": "diskann_memory",
+    "degree": 32,
+    "bad_ids": 0,
+    "self_loops": 0,
+    "dup_edges": 0,
+    "entry": 42894669,
+    "points": [
+     {
+      "itopk": 32,
+      "recall": 0.7275,
+      "qps": 86491.13
+     },
+     {
+      "itopk": 64,
+      "recall": 0.8340000000000001,
+      "qps": 60244.87
+     },
+     {
+      "itopk": 128,
+      "recall": 0.9109999999999999,
+      "qps": 35103.18
+     },
+     {
+      "itopk": 256,
+      "recall": 0.9588,
+      "qps": 19507.7
+     },
+     {
+      "itopk": 512,
+      "recall": 0.9833,
+      "qps": 10509.63
+     }
+    ]
+   }
+  },
+  "sift100M_auto_g4_spott1": {
+   "dataset": "sift100M",
+   "mode": "auto",
+   "path": "large",
+   "reps": 3,
+   "gpus": [
+    0,
+    1,
+    2,
+    3
+   ],
+   "num_gpus": 4,
+   "build_total_s": 274.0,
+   "build_total_all_s": [
+    274.55,
+    258.12,
+    274.0
+   ],
+   "stages_s": {
+    "bucket2": 175.17,
+    "prune": 75.43,
+    "optimize_chunked": 23.22
+   },
+   "bucket2_steps_s": {
+    "Step 1 (Load sampled data)": 7.938,
+    "Step 2 (Select centroids)": 5.154,
+    "Step 3 (Centroid KNN graph)": 2.49,
+    "Step 3.5 (Load full dataset)": 0.0,
+    "Step 4 (Batch assignment)": 63.89,
+    "Step 4.5 (Inline reorder, round 1 only)": 4.421,
+    "Step 5 (Write buckets)": 3.074,
+    "Step 6 (Per-vector KNN, merge included)": 58.786,
+    "Wait (final iteration's background merge)": 20.879,
+    "Write (close + .npy convert)": 0.001
+   },
+   "peak_rss_gb": {
+    "bucket2": 92.973,
+    "prune": 5.74,
+    "optimize_chunked": 25.498
+   },
+   "gpu_peak_mib": 14546,
+   "spot": "t1",
+   "spot_reps": [
+    {
+     "stages": [
+      {
+       "units": "99804688",
+       "segments": "8",
+       "steals": "1",
+       "drains": "1",
+       "reaped": "0",
+       "preempts": "3",
+       "rejected_units": "32116854",
+       "setups": "7",
+       "wall": "26.284s",
+       "stage": "step4"
+      },
+      {
+       "units": "195312",
+       "segments": "11",
+       "steals": "6",
+       "drains": "1",
+       "reaped": "0",
+       "preempts": "1",
+       "rejected_units": "0",
+       "setups": "4",
+       "wall": "30.194s",
+       "stage": "step6"
+      },
+      {
+       "units": "99804688",
+       "segments": "6",
+       "steals": "0",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "3",
+       "rejected_units": "21900319",
+       "setups": "5",
+       "wall": "25.348s",
+       "stage": "step4"
+      },
+      {
+       "units": "195312",
+       "segments": "11",
+       "steals": "7",
+       "drains": "2",
+       "reaped": "0",
+       "preempts": "4",
+       "rejected_units": "62129",
+       "setups": "6",
+       "wall": "31.432s",
+       "stage": "step6"
+      },
+      {
+       "units": "195312",
+       "segments": "17",
+       "steals": "13",
+       "drains": "3",
+       "reaped": "0",
+       "preempts": "5",
+       "rejected_units": "922",
+       "setups": "7",
+       "wall": "74.062s",
+       "stage": "prune"
+      }
+     ],
+     "events": {
+      "notice": 17,
+      "preempt": 19,
+      "join": 17
+     },
+     "rejected_units": 54080224,
+     "preempts": 16,
+     "steals": 27,
+     "setups": 29,
+     "reaped": 0,
+     "drains": 7
+    },
+    {
+     "stages": [
+      {
+       "units": "99804688",
+       "segments": "9",
+       "steals": "2",
+       "drains": "1",
+       "reaped": "0",
+       "preempts": "3",
+       "rejected_units": "32116854",
+       "setups": "7",
+       "wall": "26.594s",
+       "stage": "step4"
+      },
+      {
+       "units": "195312",
+       "segments": "6",
+       "steals": "2",
+       "drains": "1",
+       "reaped": "0",
+       "preempts": "1",
+       "rejected_units": "0",
+       "setups": "4",
+       "wall": "26.827s",
+       "stage": "step6"
+      },
+      {
+       "units": "99804688",
+       "segments": "28",
+       "steals": "21",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "3",
+       "rejected_units": "52123416",
+       "setups": "6",
+       "wall": "31.222s",
+       "stage": "step4"
+      },
+      {
+       "units": "195312",
+       "segments": "5",
+       "steals": "1",
+       "drains": "2",
+       "reaped": "1",
+       "preempts": "3",
+       "rejected_units": "80",
+       "setups": "5",
+       "wall": "30.466s",
+       "stage": "step6"
+      },
+      {
+       "units": "195312",
+       "segments": "7",
+       "steals": "3",
+       "drains": "3",
+       "reaped": "0",
+       "preempts": "4",
+       "rejected_units": "261",
+       "setups": "7",
+       "wall": "57.981s",
+       "stage": "prune"
+      }
+     ],
+     "events": {
+      "notice": 16,
+      "preempt": 18,
+      "join": 17
+     },
+     "rejected_units": 84240611,
+     "preempts": 14,
+     "steals": 29,
+     "setups": 29,
+     "reaped": 1,
+     "drains": 7
+    },
+    {
+     "stages": [
+      {
+       "units": "99804688",
+       "segments": "8",
+       "steals": "1",
+       "drains": "1",
+       "reaped": "0",
+       "preempts": "3",
+       "rejected_units": "32116854",
+       "setups": "7",
+       "wall": "25.934s",
+       "stage": "step4"
+      },
+      {
+       "units": "195312",
+       "segments": "6",
+       "steals": "1",
+       "drains": "1",
+       "reaped": "0",
+       "preempts": "1",
+       "rejected_units": "0",
+       "setups": "4",
+       "wall": "27.810s",
+       "stage": "step6"
+      },
+      {
+       "units": "99804688",
+       "segments": "28",
+       "steals": "21",
+       "drains": "0",
+       "reaped": "1",
+       "preempts": "3",
+       "rejected_units": "52117696",
+       "setups": "6",
+       "wall": "30.080s",
+       "stage": "step4"
+      },
+      {
+       "units": "195312",
+       "segments": "6",
+       "steals": "2",
+       "drains": "2",
+       "reaped": "0",
+       "preempts": "3",
+       "rejected_units": "1178",
+       "setups": "5",
+       "wall": "28.695s",
+       "stage": "step6"
+      },
+      {
+       "units": "195312",
+       "segments": "16",
+       "steals": "10",
+       "drains": "4",
+       "reaped": "0",
+       "preempts": "5",
+       "rejected_units": "282",
+       "setups": "7",
+       "wall": "74.200s",
+       "stage": "prune"
+      }
+     ],
+     "events": {
+      "notice": 17,
+      "preempt": 19,
+      "join": 17
+     },
+     "rejected_units": 84236010,
+     "preempts": 15,
+     "steals": 35,
+     "setups": 29,
+     "reaped": 1,
+     "drains": 8
+    }
+   ],
+   "knn_similarity": {
+    "n": 100000000,
+    "degree": 64,
+    "samples": 10000,
+    "padding_rate": 0.0,
+    "recall@1": 0.6506,
+    "recall@10": 0.61429,
+    "recall@32": 0.58903,
+    "recall@64": 0.5718
+   },
+   "search": {
+    "searcher": "diskann_memory",
+    "degree": 32,
+    "bad_ids": 0,
+    "self_loops": 0,
+    "dup_edges": 0,
+    "entry": 42894669,
+    "points": [
+     {
+      "itopk": 32,
+      "recall": 0.7248,
+      "qps": 77330.61
+     },
+     {
+      "itopk": 64,
+      "recall": 0.8315,
+      "qps": 54972.8
+     },
+     {
+      "itopk": 128,
+      "recall": 0.9106000000000001,
+      "qps": 31996.19
+     },
+     {
+      "itopk": 256,
+      "recall": 0.9591,
+      "qps": 17510.12
+     },
+     {
+      "itopk": 512,
+      "recall": 0.9838,
+      "qps": 9472.94
+     }
+    ]
+   }
+  },
+  "sift100M_auto_g1_spott1": {
+   "dataset": "sift100M",
+   "mode": "auto",
+   "path": "large",
+   "reps": 3,
+   "gpus": [
+    0
+   ],
+   "num_gpus": 1,
+   "build_total_s": 386.77,
+   "build_total_all_s": [
+    386.77,
+    395.76,
+    386.04
+   ],
+   "stages_s": {
+    "bucket2": 316.26,
+    "prune": 48.59,
+    "optimize_chunked": 22.72
+   },
+   "bucket2_steps_s": {
+    "Step 1 (Load sampled data)": 8.007,
+    "Step 2 (Select centroids)": 5.11,
+    "Step 3 (Centroid KNN graph)": 2.438,
+    "Step 3.5 (Load full dataset)": 0.0,
+    "Step 4 (Batch assignment)": 100.937,
+    "Step 4.5 (Inline reorder, round 1 only)": 4.515,
+    "Step 5 (Write buckets)": 3.076,
+    "Step 6 (Per-vector KNN, merge included)": 162.282,
+    "Wait (final iteration's background merge)": 20.547,
+    "Write (close + .npy convert)": 0.001
+   },
+   "peak_rss_gb": {
+    "bucket2": 92.649,
+    "prune": 4.604,
+    "optimize_chunked": 25.498
+   },
+   "gpu_peak_mib": 14548,
+   "spot": "t1",
+   "spot_reps": [
+    {
+     "stages": [
+      {
+       "units": "99804688",
+       "segments": "2",
+       "steals": "0",
+       "drains": "1",
+       "reaped": "1",
+       "preempts": "1",
+       "rejected_units": "4588122",
+       "setups": "2",
+       "wall": "46.039s",
+       "stage": "step4"
+      },
+      {
+       "units": "195312",
+       "segments": "1",
+       "steals": "0",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "1",
+       "rejected_units": "0",
+       "setups": "1",
+       "wall": "85.641s",
+       "stage": "step6"
+      },
+      {
+       "units": "99804688",
+       "segments": "4",
+       "steals": "0",
+       "drains": "1",
+       "reaped": "0",
+       "preempts": "1",
+       "rejected_units": "0",
+       "setups": "4",
+       "wall": "46.264s",
+       "stage": "step4"
+      },
+      {
+       "units": "195312",
+       "segments": "2",
+       "steals": "0",
+       "drains": "1",
+       "reaped": "1",
+       "preempts": "1",
+       "rejected_units": "0",
+       "setups": "3",
+       "wall": "74.564s",
+       "stage": "step6"
+      },
+      {
+       "units": "195312",
+       "segments": "1",
+       "steals": "0",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "1",
+       "wall": "49.599s",
+       "stage": "prune"
+      }
+     ],
+     "events": {
+      "notice": 5,
+      "preempt": 5,
+      "join": 5
+     },
+     "rejected_units": 4588122,
+     "preempts": 4,
+     "steals": 0,
+     "setups": 11,
+     "reaped": 2,
+     "drains": 3
+    },
+    {
+     "stages": [
+      {
+       "units": "99804688",
+       "segments": "2",
+       "steals": "1",
+       "drains": "1",
+       "reaped": "0",
+       "preempts": "1",
+       "rejected_units": "4588122",
+       "setups": "2",
+       "wall": "46.692s",
+       "stage": "step4"
+      },
+      {
+       "units": "195312",
+       "segments": "1",
+       "steals": "0",
+       "drains": "1",
+       "reaped": "1",
+       "preempts": "1",
+       "rejected_units": "0",
+       "setups": "2",
+       "wall": "86.421s",
+       "stage": "step6"
+      },
+      {
+       "units": "99804688",
+       "segments": "4",
+       "steals": "0",
+       "drains": "0",
+       "reaped": "1",
+       "preempts": "1",
+       "rejected_units": "21908898",
+       "setups": "4",
+       "wall": "55.987s",
+       "stage": "step4"
+      },
+      {
+       "units": "195312",
+       "segments": "2",
+       "steals": "0",
+       "drains": "2",
+       "reaped": "2",
+       "preempts": "2",
+       "rejected_units": "0",
+       "setups": "3",
+       "wall": "77.729s",
+       "stage": "step6"
+      },
+      {
+       "units": "195312",
+       "segments": "1",
+       "steals": "0",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "1",
+       "wall": "40.472s",
+       "stage": "prune"
+      }
+     ],
+     "events": {
+      "notice": 5,
+      "preempt": 5,
+      "join": 5
+     },
+     "rejected_units": 26497020,
+     "preempts": 5,
+     "steals": 1,
+     "setups": 12,
+     "reaped": 4,
+     "drains": 4
+    },
+    {
+     "stages": [
+      {
+       "units": "99804688",
+       "segments": "2",
+       "steals": "0",
+       "drains": "1",
+       "reaped": "1",
+       "preempts": "1",
+       "rejected_units": "4588122",
+       "setups": "2",
+       "wall": "46.430s",
+       "stage": "step4"
+      },
+      {
+       "units": "195312",
+       "segments": "1",
+       "steals": "0",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "1",
+       "rejected_units": "0",
+       "setups": "1",
+       "wall": "85.513s",
+       "stage": "step6"
+      },
+      {
+       "units": "99804688",
+       "segments": "4",
+       "steals": "0",
+       "drains": "1",
+       "reaped": "0",
+       "preempts": "1",
+       "rejected_units": "0",
+       "setups": "4",
+       "wall": "46.431s",
+       "stage": "step4"
+      },
+      {
+       "units": "195312",
+       "segments": "3",
+       "steals": "1",
+       "drains": "1",
+       "reaped": "0",
+       "preempts": "1",
+       "rejected_units": "0",
+       "setups": "3",
+       "wall": "75.607s",
+       "stage": "step6"
+      },
+      {
+       "units": "195312",
+       "segments": "1",
+       "steals": "0",
+       "drains": "0",
+       "reaped": "0",
+       "preempts": "0",
+       "rejected_units": "0",
+       "setups": "1",
+       "wall": "47.490s",
+       "stage": "prune"
+      }
+     ],
+     "events": {
+      "notice": 5,
+      "preempt": 5,
+      "join": 5
+     },
+     "rejected_units": 4588122,
+     "preempts": 4,
+     "steals": 1,
+     "setups": 11,
+     "reaped": 1,
+     "drains": 3
+    }
+   ],
+   "knn_similarity": {
+    "n": 100000000,
+    "degree": 64,
+    "samples": 10000,
+    "padding_rate": 0.0,
+    "recall@1": 0.652,
+    "recall@10": 0.61379,
+    "recall@32": 0.58974,
+    "recall@64": 0.57264
+   },
+   "search": {
+    "searcher": "diskann_memory",
+    "degree": 32,
+    "bad_ids": 0,
+    "self_loops": 0,
+    "dup_edges": 0,
+    "entry": 42894669,
+    "points": [
+     {
+      "itopk": 32,
+      "recall": 0.7242000000000001,
+      "qps": 101826.08
+     },
+     {
+      "itopk": 64,
+      "recall": 0.8319,
+      "qps": 73348.23
+     },
+     {
+      "itopk": 128,
+      "recall": 0.9097,
+      "qps": 42516.24
+     },
+     {
+      "itopk": 256,
+      "recall": 0.9589,
+      "qps": 23568.2
+     },
+     {
+      "itopk": 512,
+      "recall": 0.9832,
+      "qps": 12478.96
+     }
+    ]
+   }
+  }
+ }
+}

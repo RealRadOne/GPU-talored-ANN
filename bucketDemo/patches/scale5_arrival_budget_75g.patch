@@ -1,0 +1,23 @@
+diff --git a/.claude/skills/optimize-bucket2/scripts/dataset_env.py b/.claude/skills/optimize-bucket2/scripts/dataset_env.py
+index 91f114e..7702a20 100644
+--- a/.claude/skills/optimize-bucket2/scripts/dataset_env.py
++++ b/.claude/skills/optimize-bucket2/scripts/dataset_env.py
+@@ -16,7 +16,8 @@ Adaptive rules (user decisions 2026-10-22/23; they reproduce the hand-tuned SIFT
+   --bucket-mem-mb = cache-mb + 1000      (floors = the values every dataset used before 2026-10-23, so the
+                     SIFT configs run with exactly the same flags; only larger round records scale up)
+   --gpu-bucket-cache-mb = GPU_MB / 2
+-  --arrival-mem-mb = HOST_BUDGET_MB / 4  (scale S1: out-of-core Step 6 arrival records in RAM up to this, rest on disk;
++  --arrival-mem-mb = 3/8 x HOST_BUDGET_MB  (scale S1 / S5: out-of-core Step 6 arrival records in RAM up to this, rest on
++                    disk; 75 GB holds both SIFT100M / msTuring100M rounds (~71 / 66 GB) so round 2 does not spill;
+                     ARRIVAL_MEM_MB=0 = all on disk, also needed for binaries older than S1)
+   all host-side sizes capped by HOST_BUDGET_MB / 4 each (machine: 251 GB RAM; optimize_chunked
+   --host-budget-mb = HOST_BUDGET_MB is a ceiling, not a target)
+@@ -60,7 +61,7 @@ adaptive = {
+     "CACHE_MB": str(cache_mb),
+     "BUCKET_MEM_MB": str(min(cap, cache_mb + 1000)),
+     "GPU_BUCKET_CACHE_MB": str(GPU_MB // 2),
+-    "ARRIVAL_MEM_MB": str(cap),
++    "ARRIVAL_MEM_MB": str(HOST_BUDGET_MB * 3 // 8),
+     "CHUNKED_HOST_BUDGET_MB": str(HOST_BUDGET_MB),
+     "A1_PASSES": "0",   # A1-R local join passes (resident path; #40, user-approved A1)
+     "A7_UNWIN": "0",    # A7: batched GPU prune without the window restriction (#55, user-approved for 10M)

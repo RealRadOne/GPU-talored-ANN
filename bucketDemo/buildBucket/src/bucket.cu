@@ -22,6 +22,7 @@
 #include <map>
 #include <fcntl.h>
 #include <unistd.h>
+#include <sys/mman.h>
 #include <exception>
 #include <condition_variable>
 #include <mutex>
@@ -67,6 +68,7 @@
 #include "utils.hpp"
 #include "load.hpp"
 #include "bucket_build.cuh"
+#include "spot_sched.hpp"
 #include "bucket_order.hpp"
 #include "graph_io.hpp"
 #include "reordered_dataset_io.hpp"
@@ -114,6 +116,44 @@ cuvs::neighbors::cagra::device_padded_index<T, uint32_t> make_padded_cagra_index
  * Configuration for flexible data loading and GPU KMeans++ centroid generation
  * Based on user requirements and DiskANN design patterns
  */
+// S21 (scale loop, user 2026-11-20): 所有 host 内存快路径 (arrival 记录放内存、BucketVectorAccumulator 内存模式、
+// Step 4.5 r1_blob、out-of-core raw_host、Step 6 host bucket 缓存) 共用一个用户给的预算 (--host-budget-mb)。
+// 每个快路径先 try_reserve，拿不到就走原来的磁盘 / out-of-core 路径；用完 release。cap = 0 = 不限 (原来各自的上限照旧)。
+// 各组件原有的上限 (--cache-mb / --bucket-mem-mb / --arrival-mem-mb) 仍然是各自的上界。
+struct HostBudget {
+    std::atomic<size_t> used{0}, peak{0};
+    size_t cap = 0;
+    std::atomic<size_t> denied{0};
+    bool try_reserve(size_t b) {
+        if (b == 0) return true;
+        size_t cur = used.load(std::memory_order_relaxed);
+        for (;;) {
+            if (cap > 0 && cur + b > cap) { denied.fetch_add(1, std::memory_order_relaxed); return false; }
+            if (used.compare_exchange_weak(cur, cur + b, std::memory_order_relaxed)) break;
+        }
+        size_t nu = cur + b, pk = peak.load(std::memory_order_relaxed);
+        while (nu > pk && !peak.compare_exchange_weak(pk, nu, std::memory_order_relaxed)) {}
+        return true;
+    }
+    void release(size_t b) { if (b) used.fetch_sub(b, std::memory_order_relaxed); }
+    // 最多拿 b (cap = 0 时全给)，返回拿到的字节数 (缓存类: 小一点只影响 I/O，不影响结果)
+    size_t reserve_up_to(size_t b) {
+        if (cap == 0) { try_reserve(b); return b; }
+        size_t cur = used.load(std::memory_order_relaxed);
+        for (;;) {
+            const size_t g = (cur >= cap) ? 0 : std::min(b, cap - cur);
+            if (g == 0) { if (b) denied.fetch_add(1, std::memory_order_relaxed); return 0; }
+            if (used.compare_exchange_weak(cur, cur + g, std::memory_order_relaxed)) {
+                size_t nu = cur + g, pk = peak.load(std::memory_order_relaxed);
+                while (nu > pk && !peak.compare_exchange_weak(pk, nu, std::memory_order_relaxed)) {}
+                if (g < b) denied.fetch_add(1, std::memory_order_relaxed);
+                return g;
+            }
+        }
+    }
+};
+static HostBudget g_host_budget;
+
 struct LoadConfig {
     // Memory limits
     size_t cpu_limit_bytes;        // CPU memory limit, default 16GB
@@ -151,6 +191,10 @@ struct LoadConfig {
     size_t gpu_bucket_cache_mb;
     // round 2..t 的 bucket 记录 (BucketVectorAccumulator) 放内存的预算 (MB, 0 = cpu_limit/4)
     size_t bucket_mem_mb = 0;
+    // out-of-core Step 6 arrival 记录放内存的预算 (MB, 0 = 全部落盘)，见 ChunkedKnnAccumulator::mem_arrival
+    size_t arrival_mem_mb = 0;
+    // S21: 所有 host 内存快路径共用的预算 (MB, 0 = 不限)，见 HostBudget
+    size_t host_budget_mb = 0;
 
     // Output
     bool save_dists;               // 写 vector_dists.bin (default true)；流水线后续阶段不读它
@@ -615,6 +659,13 @@ LoadConfig parse_load_config(const po::variables_map& vm) {
     if (vm.count("bucket-mem-mb")) {
         config.bucket_mem_mb = vm["bucket-mem-mb"].as<size_t>();
     }
+    if (vm.count("arrival-mem-mb")) {
+        config.arrival_mem_mb = vm["arrival-mem-mb"].as<size_t>();
+    }
+    if (vm.count("host-budget-mb")) {
+        config.host_budget_mb = vm["host-budget-mb"].as<size_t>();
+        g_host_budget.cap = config.host_budget_mb << 20;   // S21
+    }
     if (vm.count("skip-dists")) {
         config.save_dists = !vm["skip-dists"].as<bool>();
     }
@@ -897,6 +948,7 @@ struct BucketVectorAccumulator {
     std::vector<int64_t> merged_offset;  // 每个 bucket 在合并文件里的起始字节偏移
     std::fstream merged_out;             // 本轮写句柄 (随机位置 seekp+write)
     std::ifstream merged_in;             // Step 6/7 共用的持久读句柄
+    std::unique_ptr<std::mutex> read_mtx = std::make_unique<std::mutex>();   // merged_in 的读; unique_ptr: 保持可移动 (多 GPU Step 6 的 producer 并发)
 
     // 内存模式: 本轮合并后的总字节数 (N*(8+D*sizeof)) 不超过 mem_budget 时，
     // 每条记录直接写到它在合并缓冲区里的最终位置 (histogram 已经给出每个桶
@@ -960,13 +1012,21 @@ struct BucketVectorAccumulator {
         }
 
         in_memory = static_cast<size_t>(pos) <= mem_budget;
-        if (in_memory) {
-            if (static_cast<size_t>(pos) > mem_cap) {
+        // S21: 内存模式的缓冲区 (mem_cap 字节) 记在共用 host 预算上；扩容拿不到预算 → 这一轮走文件模式
+        if (in_memory && static_cast<size_t>(pos) > mem_cap) {
+            const size_t old_cap = mem_cap;
+            mem.reset(); mem_cap = 0; g_host_budget.release(old_cap);
+            if (g_host_budget.try_reserve(static_cast<size_t>(pos))) {
                 mem.reset(new char[static_cast<size_t>(std::max<int64_t>(pos, 1))]);   // 不初始化: 每个字节都会被 add 写一次
                 mem_cap = static_cast<size_t>(pos);
+            } else {
+                in_memory = false;
+                std::cout << "[HostBudget] bucket records " << pos / 1e9 << " GB denied (used " << g_host_budget.used.load() / 1e9
+                          << " / " << g_host_budget.cap / 1e9 << " GB) -> file mode\n";
             }
-            return;
         }
+        if (in_memory) return;
+        if (mem_cap > 0) { mem.reset(); g_host_budget.release(mem_cap); mem_cap = 0; }   // S21: 文件模式不再占着内存缓冲
         if (merged_out.is_open()) merged_out.close();
         merged_out.clear();
         merged_out.open(merged_path, std::ios::binary | std::ios::out | std::ios::trunc);
@@ -1132,6 +1192,7 @@ struct BucketVectorAccumulator {
             return mem.get() + off;
         }
         raw.resize(nbytes);
+        std::lock_guard<std::mutex> lk(*read_mtx);   // 多 GPU Step 6: 多个 producer 共用一个读句柄
         merged_in.seekg(static_cast<std::streamoff>(off));
         merged_in.read(raw.data(), static_cast<std::streamsize>(nbytes));
         if (!merged_in.good())
@@ -1497,6 +1558,25 @@ template <typename DataT>
 __global__ void gather_rows_int32(const DataT* __restrict__ src, const int32_t* __restrict__ idx,
                                   float* __restrict__ dst, int64_t n_dst_rows, int64_t D);
 
+// #82: uint8 行 gather (不转 float)，给 Step 4 的 uint8 CAGRA 搜索
+__global__ void gather_rows_u8(const uint8_t* __restrict__ src, const int32_t* __restrict__ idx,
+                               uint8_t* __restrict__ dst, int64_t n_dst_rows, int64_t D)
+{
+    const int64_t tid = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (tid >= n_dst_rows * D) return;
+    const int64_t row = tid / D, col = tid % D;
+    dst[tid] = src[static_cast<int64_t>(idx[row]) * D + col];
+}
+// float centroid (取自 8-bit 数据点) → uint8；不是 [0,255] 内的整数就记 bad (调用方退回 float 路径)
+__global__ void f32_to_u8_checked(const float* __restrict__ src, uint8_t* __restrict__ dst, int64_t n, int* bad)
+{
+    const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const float v = src[i];
+    if (!(v >= 0.f && v <= 255.f) || v != floorf(v)) { atomicExch(bad, 1); dst[i] = 0; return; }
+    dst[i] = static_cast<uint8_t>(v);
+}
+
 /**
  * 分批处理原始数据集，在 GPU 上基于 centroid KNN 图做 ANNS 检索，
  * 为每个非 centroid 数据点找到最近的 2 个 centroid，在 CPU 上做均衡分配。
@@ -1528,6 +1608,12 @@ __global__ void gather_rows_int32(const DataT* __restrict__ src, const int32_t* 
  *
  * @return  (N,) 每个点分配到的 local centroid index [0, n_centroids)
  */
+static void h2d_staged(void* d, const void* h, size_t bytes);   // #93 (定义在 build_vector_knn 前)
+
+// ---- 多 GPU (2026-11-16, 用户架构: 一个 host CPU 管 1..N 张 GPU；Step 4 / Step 6 / prune / optimize 多卡) ----
+// --num-gpus G: 用可见设备 0..G-1 (run_pipeline 用 CUDA_VISIBLE_DEVICES 选卡)。G = 1 时所有路径跟原来完全一样。
+static int g_num_gpus = 1;
+
 template <typename T, typename CentroidT>
 std::vector<int64_t> batch_assign_with_cagra_anns(
     const std::string& input_path,
@@ -1560,17 +1646,42 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
     // ================================================================
     // Step 0: 建立 centroid 集合，收集非 centroid 点索引
     // ================================================================
-    std::unordered_set<int64_t> centroid_set(
-        centroid_global_indices.begin(), centroid_global_indices.end());
-
+    // #96: 原来是 unordered_set 逐点查找 (SIFT100M: 1 亿次哈希查找，单线程)。
+    // 现在 N 字节的 flag 数组 + 两遍并行压缩 (每线程一段连续区间：先计数，前缀和定
+    // 写入起点，再按原顺序写)，non_centroid_indices 内容和顺序跟原来完全相同。
     std::vector<int64_t> non_centroid_indices;
-    non_centroid_indices.reserve(N - n_centroids);
-    for (int64_t i = 0; i < N; ++i) {
-        if (centroid_set.find(i) == centroid_set.end()) {
-            non_centroid_indices.push_back(i);
+    {
+        std::unique_ptr<uint8_t[]> is_cent(new uint8_t[static_cast<size_t>(N)]);
+        #pragma omp parallel for schedule(static)
+        for (int64_t i = 0; i < N; ++i) is_cent[static_cast<size_t>(i)] = 0;
+        for (int64_t c : centroid_global_indices)
+            if (c >= 0 && c < N) is_cent[static_cast<size_t>(c)] = 1;
+        const int nt = std::max(1, omp_get_max_threads());
+        std::vector<int64_t> cnt(static_cast<size_t>(nt) + 1, 0);
+        auto range_of = [&](int t, int64_t& lo, int64_t& hi) {
+            lo = N * t / nt; hi = N * (t + 1) / nt;
+        };
+        #pragma omp parallel num_threads(nt)
+        {
+            const int t = omp_get_thread_num();
+            int64_t lo, hi; range_of(t, lo, hi);
+            int64_t c = 0;
+            for (int64_t i = lo; i < hi; ++i) c += !is_cent[static_cast<size_t>(i)];
+            cnt[static_cast<size_t>(t) + 1] = c;
+        }
+        for (int t = 0; t < nt; ++t) cnt[static_cast<size_t>(t) + 1] += cnt[static_cast<size_t>(t)];
+        non_centroid_indices.resize(static_cast<size_t>(cnt[static_cast<size_t>(nt)]));
+        #pragma omp parallel num_threads(nt)
+        {
+            const int t = omp_get_thread_num();
+            int64_t lo, hi; range_of(t, lo, hi);
+            int64_t* out = non_centroid_indices.data() + cnt[static_cast<size_t>(t)];
+            for (int64_t i = lo; i < hi; ++i)
+                if (!is_cent[static_cast<size_t>(i)]) *out++ = i;
         }
     }
     int64_t N_nc = static_cast<int64_t>(non_centroid_indices.size());
+    const double t_step0 = std::chrono::duration<double>(Clock::now() - ba_t0).count();
 
     std::cout << "[BatchAssign] N=" << N
               << ", centroids=" << n_centroids
@@ -1637,7 +1748,45 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
     // 聚类大小：每个 centroid 初始大小为 1
     std::vector<std::atomic<int64_t>> cluster_sizes(n_centroids);
     for (auto& s : cluster_sizes) s.store(1, std::memory_order_relaxed);
+    const double t_init = std::chrono::duration<double>(Clock::now() - ba_t0).count() - t_step0;
 
+    // ================================================================
+    // 多 GPU (Step 4): 非 centroid 点切成 G 段连续区间，每张卡一个线程算这一段的 top-2
+    // (下面的 worker = 原来的建索引 + 分批 读 / 传 / 搜 / 下载，只是区间换成 [nc_begin, nc_end))，
+    // 结果写进 h_top2_all；4d 均衡分配之后在 CPU 上按单卡时同样的 Nv 批次、同样的顺序做。
+    // 每个 query 的 top-2 跟它在哪张卡、批里第几个无关 (CAGRA 随机起点的种子不含 query 下标：
+    // cuVS device_common_jit.cuh compute_distance_to_random_nodes；精确路径逐行独立)，所以
+    // h_top2_all 跟单卡逐位相同；4d 的语义 (批次边界 + 批内并行) 也不变。
+    // GPU-resident 路径 (数据在 GPU0 显存) 和 PQ 路径保持单卡。
+    // ================================================================
+    const int G4 = (!is_pq && !gpu_query_loader) ? std::max(1, g_num_gpus) : 1;
+    const int64_t Nv_assign = Nv;   // 4d 的批次 = 单卡时的 Nv (跟卡数无关)
+    std::vector<uint32_t> h_top2_all(static_cast<size_t>(N_nc) * TOP_K);
+    std::vector<float> h_top2_d_all;
+    {
+        const bool rule_dj0 = std::getenv("BUCKET2_ASSIGN_RULE") && std::string(std::getenv("BUCKET2_ASSIGN_RULE")) == "diskjoin";
+        if (rule_dj0) h_top2_d_all.resize(static_cast<size_t>(N_nc) * TOP_K);
+    }
+    struct S4Stat { double setup = 0, read = 0, cu = 0, search = 0, dl = 0, wall = 0; int64_t Nv = 0, n = 0; };
+    std::vector<S4Stat> s4st(static_cast<size_t>(G4));
+    // spot (SPOT_DESIGN §4.1): S != nullptr → 这次调用 = 一个实例代 (epoch)。[nc_begin, nc_end) 是第一个租约
+    // (*L0) 的范围上界 (nc_begin = L0->begin)，批循环每批前 may_start、批完成后 commit；租约做完 / 停下后 (*next)(L)
+    // 换下一个租约，false → teardown 返回。S == nullptr: 原来的静态区间 [nc_begin, nc_end)。
+    auto top2_worker = [&](const int wi, int64_t nc_begin, int64_t nc_end,
+                           CentroidT* d_centroids, uint32_t* d_graph, const size_t Mbatch_bytes,
+                           spot::SegmentScheduler* S = nullptr, spot::Lease* L0 = nullptr,
+                           const std::function<bool(spot::Lease&)>* next = nullptr) {
+    const auto w_t0 = Clock::now();
+    double t_setup = 0, t_read = 0, t_convert_upload = 0, t_search = 0, t_download = 0;
+    // 这张卡的批大小 (显存按本卡算；只影响搜索分批，不影响 4d 的批次)
+    int64_t Nv = 1;
+    {
+        const size_t rem = (Mbatch_bytes > constant_gpu) ? (Mbatch_bytes - constant_gpu) : 0;
+        // spot: 租约会变 (偷 / 换段)，批大小按整个 stage 的行数封顶 (G=1 时跟原来相同)
+        const int64_t span = S ? N_nc : nc_end - nc_begin;
+        Nv = std::max<int64_t>(1, std::min<int64_t>(static_cast<int64_t>(rem / per_point_bytes), std::max<int64_t>(1, span)));
+    }
+    if (nc_end <= nc_begin) return;
     // ================================================================
     // Step 4: 构造 cagra::index<CentroidT, uint32_t> (zero-copy view, 只构造一次)
     // ================================================================
@@ -1656,6 +1805,21 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
     sp.max_iterations = 0;
     sp.algo           = cuvs::neighbors::cagra::search_algo::SINGLE_CTA;
     (void)search_max_iters;  // CAGRA 自己决定 iter, 参数保留为接口兼容
+
+    // #82: uint8 数据走 CAGRA (centroid > 32K) 时，索引和 queries 都用 uint8 而不是 float 副本:
+    // 每跳读的字节少 4 倍 (cuVS 26.10 sift1M 同一张图 itopk 32: uint8 1.95M QPS vs float 1.39M，recall 相同)。
+    // centroid 就是数据点 (整数值)，整数平方 L2 在 float 里精确 (128 × 255² < 2^24)，距离与 float 路径
+    // 逐位相同。centroid 不全是 [0,255] 内整数时退回 float。BUCKET2_ASSIGN_U8=0 关掉；
+    // BUCKET2_ASSIGN_U8_CHECK=1 每批再跑一遍 float 搜索并统计 top-2 不一致 (验证用)。
+    // 参考 cuVS cagra_build.cuh / CAGRA 本身按原数据类型 (uint8/int8) 建索引、搜索。
+    constexpr bool kU8Data = !is_pq && std::is_same<T, uint8_t>::value && std::is_same<CentroidT, float>::value;
+    bool u8_cagra = false;
+    uint8_t* d_cent_u8 = nullptr;
+    std::unique_ptr<cuvs::neighbors::device_padded_dataset<uint8_t, int64_t>> padded_u8_owner;
+    std::optional<cuvs::neighbors::cagra::device_padded_index<uint8_t, uint32_t>> cagra_idx_u8;
+    uint8_t* d_queries_u8 = nullptr;
+    const bool u8_check = std::getenv("BUCKET2_ASSIGN_U8_CHECK") && std::getenv("BUCKET2_ASSIGN_U8_CHECK")[0] == '1';
+    int64_t u8_mismatch = 0;
 
     // ================================================================
     // Step 5: 分批处理
@@ -1788,6 +1952,36 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
             reinterpret_cast<const float*>(d_centroids), d_cnorm, n_centroids, static_cast<int>(D));
         CUDA_CHECK(cudaGetLastError());
     }
+    if constexpr (kU8Data) {
+        if (!exact_f16 && !gpu_query_loader &&
+            !(std::getenv("BUCKET2_ASSIGN_U8") && std::getenv("BUCKET2_ASSIGN_U8")[0] == '0')) {
+            const int64_t n_el = n_centroids * static_cast<int64_t>(D);
+            int* d_bad = nullptr;
+            CUDA_CHECK(cudaMalloc(&d_cent_u8, static_cast<size_t>(n_el)));
+            CUDA_CHECK(cudaMalloc(&d_bad, sizeof(int)));
+            CUDA_CHECK(cudaMemset(d_bad, 0, sizeof(int)));
+            f32_to_u8_checked<<<static_cast<unsigned>((n_el + 255) / 256), 256>>>(
+                reinterpret_cast<const float*>(d_centroids), d_cent_u8, n_el, d_bad);
+            CUDA_CHECK(cudaGetLastError());
+            int h_bad = 0;
+            CUDA_CHECK(cudaMemcpy(&h_bad, d_bad, sizeof(int), cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaFree(d_bad));
+            if (h_bad) {
+                std::cout << "[BatchAssign] centroids are not 8-bit integers -> float CAGRA search\n";
+                CUDA_CHECK(cudaFree(d_cent_u8)); d_cent_u8 = nullptr;
+            } else {
+                cagra_idx_u8.emplace(make_padded_cagra_index<uint8_t>(res,
+                    raft::make_device_matrix_view<const uint8_t, int64_t>(d_cent_u8, n_centroids, static_cast<int64_t>(D)),
+                    graph_view, padded_u8_owner));
+                // uint8 queries 放进 d_queries 的缓冲 (float 大小，够用)；验证模式另开一份
+                d_queries_u8 = reinterpret_cast<uint8_t*>(d_queries);
+                if (u8_check) CUDA_CHECK(cudaMalloc(&d_queries_u8, static_cast<size_t>(Nv) * D));
+                u8_cagra = true;
+                std::cout << "[BatchAssign] uint8 CAGRA index over " << n_centroids << " centroids (#82)"
+                          << (u8_check ? " + float cross-check" : "") << "\n";
+            }
+        }
+    }
     std::optional<cuvs::neighbors::brute_force::index<float, float>> bf_idx;
     int64_t* d_top2_i64 = nullptr;
     std::vector<int64_t> h_top2_i64;
@@ -1810,11 +2004,33 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
     cudaStream_t copy_stream = nullptr;
     int pf_slot = 0;
     std::future<void> io_next;   // 在 raw_batch 之后声明: 先析构 (等后台读 / 传结束)
-    auto start_io = [&](int64_t bs, int slot) {
-        const int64_t be = std::min(bs + Nv, N_nc);
+    // S17: prefetch_io 时批长 Nv / 4 (显存按 Nv 分配不变): 每卡每轮只有 1–3 个整批时，第一批 (以及比前一批搜索
+    // 更长的读) 没有可重叠的搜索 (SIFT100M G=4 每卡每轮 read 3.5–4.3 s, wall 15 s)。批变小后每批的读盘 + H2D
+    // 都藏在前一批的搜索后面 (读 ~0.2 µs/点 < 搜索 ~0.4 µs/点)。只把第一批缩小没用: 等待挪到第二个整批 (第一版)。
+    // 每个点的 top-2 与分批无关。BUCKET2_STEP4_PF_DIV=1 关掉。参考 TAGORE large_index.cu 的 GPU–CPU–disk 流水线。
+    const int64_t pf_div = std::max<int64_t>(1, std::getenv("BUCKET2_STEP4_PF_DIV")
+                                                  ? std::atoll(std::getenv("BUCKET2_STEP4_PF_DIV")) : 4);
+    const int64_t batch_len = prefetch_io ? std::max<int64_t>(1, (Nv + pf_div - 1) / pf_div) : Nv;
+    auto batch_end_of = [&](int64_t bs) {
+        return std::min(bs + batch_len, nc_end);
+    };
+    // 领下一批 [bs, be): 返回 be，没有下一批 (区间做完 / spot: 段被偷到这里、实例被抢占、通知期来不及) → -1
+    spot::Lease* Lc = L0;
+    auto claim = [&](int64_t bs) -> int64_t {
+        if (!S) return bs < nc_end ? batch_end_of(bs) : -1;
+        const int64_t e = std::min<int64_t>(S->end_of(*Lc), N_nc);
+        if (bs >= e) return -1;
+        const int64_t be = std::min(bs + batch_len, e);
+        return S->may_start(*Lc, bs, be) ? be : -1;
+    };
+    auto start_io = [&](int64_t bs, int64_t be, int slot) {
+        if (bs < 0 || be > N_nc || bs >= be) throw std::runtime_error("batch_assign: prefetch batch out of bounds");
         const int64_t lo = non_centroid_indices[bs], hi = non_centroid_indices[be - 1];
         T* dst = d_raw_pf[slot];
-        io_next = std::async(std::launch::async, [&raw_batch, &input_path, copy_stream, dst, lo, hi, D] {
+        int io_dev = 0;
+        CUDA_CHECK(cudaGetDevice(&io_dev));   // 多 GPU Step 4: 后台线程要切到这张卡 (copy_stream 属于它)
+        io_next = std::async(std::launch::async, [&raw_batch, &input_path, copy_stream, dst, lo, hi, D, io_dev] {
+            CUDA_CHECK(cudaSetDevice(io_dev));
             int32_t n_tmp, d_tmp;
             load::read_bigann_raw_range<T>(input_path, lo, hi - lo + 1, raw_batch, n_tmp, d_tmp);
             CUDA_CHECK(cudaMemcpyAsync(dst, raw_batch.data(),
@@ -1824,21 +2040,42 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
     };
     if (prefetch_io) {
         size_t max_raw = 0;   // 所有批里最长的 [lo, hi] 区间 (元素)
-        for (int64_t bs = 0; bs < N_nc; bs += Nv) {
-            const int64_t be = std::min(bs + Nv, N_nc);
-            const int64_t lo = non_centroid_indices[bs], hi = non_centroid_indices[be - 1];
-            if (lo < 0 || hi >= N || lo > hi)   // bounds check
-                throw std::runtime_error("batch_assign: prefetch range out of bounds");
-            max_raw = std::max(max_raw, static_cast<size_t>(hi - lo + 1) * D);
+        if (!S) {
+            for (int64_t bs = nc_begin; bs < nc_end; ) {
+                const int64_t be = batch_end_of(bs);
+                const int64_t lo = non_centroid_indices[bs], hi = non_centroid_indices[be - 1];
+                bs = be;
+                if (lo < 0 || hi >= N || lo > hi)   // bounds check
+                    throw std::runtime_error("batch_assign: prefetch range out of bounds");
+                max_raw = std::max(max_raw, static_cast<size_t>(hi - lo + 1) * D);
+            }
+        } else {
+            // spot: 批可以从任意行开始 (租约起点任意) → 取任意 batch_len 行窗口的最长区间 (行号递增，窗口取满时最长)
+            int64_t mx = 0;
+            #pragma omp parallel for schedule(static) reduction(max:mx)
+            for (int64_t bs = 0; bs < N_nc; ++bs) {
+                const int64_t be = std::min(bs + batch_len, N_nc);
+                const int64_t lo = non_centroid_indices[bs], hi = non_centroid_indices[be - 1];
+                mx = std::max(mx, (lo < 0 || hi >= N || lo > hi) ? INT64_MAX / 2 : hi - lo + 1);
+            }
+            if (mx > N) throw std::runtime_error("batch_assign: prefetch range out of bounds");
+            max_raw = static_cast<size_t>(mx) * D;
         }
         for (auto& b : d_raw_pf) CUDA_CHECK(cudaMalloc(&b, max_raw * sizeof(T)));
         d_raw_cap = max_raw;
         CUDA_CHECK(cudaMalloc(&d_local_rows, Nv * sizeof(int32_t)));
         CUDA_CHECK(cudaStreamCreateWithFlags(&copy_stream, cudaStreamNonBlocking));
     }
-    for (int64_t batch_start = 0; batch_start < N_nc; batch_start += Nv) {
-        int64_t batch_end = std::min(batch_start + Nv, N_nc);
+    int64_t n_done = 0;   // 这个 worker 提交的行数
+    for (;;) {   // 每个租约一次 (spot 关闭: 只有一次)
+    if (S) { nc_begin = Lc->begin; nc_end = N_nc; }
+    int64_t next_be = claim(nc_begin);
+    for (int64_t batch_start = nc_begin, batch_end = 0; next_be > 0; batch_start = batch_end) {
+        batch_end = next_be;
+        next_be = -1;
         int64_t batch_size = batch_end - batch_start;
+        if (batch_start < 0 || batch_end > N_nc || batch_size <= 0)   // bounds check
+            throw std::runtime_error("batch_assign: batch out of bounds");
 
         // ---- 4a: 读取 batch 数据 (一次连续区间读)，转换为 CentroidT，上传到 GPU ----
         // non_centroid_indices 在这个 batch 内基本连续 (只跳过零星的 centroid
@@ -1855,11 +2092,12 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
                 throw std::runtime_error("batch_assign: host_raw range out of bounds");
             raw_ptr = host_raw + static_cast<size_t>(batch_lo) * D;
         } else if (prefetch_io) {
-            if (!io_next.valid()) start_io(batch_start, pf_slot);   // 第一批
+            if (!io_next.valid()) start_io(batch_start, batch_end, pf_slot);   // 第一批
             io_next.get();   // 本批已在 d_raw_pf[pf_slot] (读 + H2D 的等待时间算在 read 里)
             d_raw_range = d_raw_pf[pf_slot];
             pf_slot ^= 1;    // 另一个 buffer 上一批的 gather 已同步完成
-            if (batch_end < N_nc) start_io(batch_end, pf_slot);
+            next_be = claim(batch_end);   // 预读之前先领下一批 (spot: 领到才读)
+            if (next_be > 0) start_io(batch_end, next_be, pf_slot);
         } else {
             int32_t N_tmp, D_tmp;
             load::read_bigann_raw_range<T>(input_path, batch_lo, batch_hi - batch_lo + 1,
@@ -1905,16 +2143,33 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
                 h_local_rows[static_cast<size_t>(i)] = static_cast<int32_t>(local);
             }
             if (n_bad > 0) throw std::runtime_error("batch_assign: row offset out of read range");
-            if (!prefetch_io)
-                CUDA_CHECK(cudaMemcpy(d_raw_range, raw_ptr, raw_elems * sizeof(T),
-                                      cudaMemcpyHostToDevice));
+            if (!prefetch_io) {
+                // #93: 原始区间 (host 内存里的 raw_host / 读出的 raw_batch，都是 pageable) 经两块 64 MB pinned
+                // 暂存区双缓冲上传 (多线程拷进暂存 + 异步 DMA)，代替同步 pageable cudaMemcpy
+                // (msTuring10M round 2..4 每轮 4 GB: convert_upload 4.1 / 3.4 / 2.1 s，round 1 走 prefetch 0.7 s)。
+                // 字节相同，返回前已同步
+                const size_t bytes = raw_elems * sizeof(T);
+                // 只对大区间暂存 (≥ 512 MB): h2d_staged 每次调用分配 / 释放两块 64 MB pinned，小区间反而更慢
+                // (第一版阈值 64 MB: sift1M_large 每轮 128 MB 的 convert_upload 0.06–0.12 → 0.14–0.29 s，+5.5 %)
+                if (bytes >= (size_t(512) << 20)) h2d_staged(d_raw_range, raw_ptr, bytes);
+                else CUDA_CHECK(cudaMemcpy(d_raw_range, raw_ptr, bytes, cudaMemcpyHostToDevice));
+            }
             CUDA_CHECK(cudaMemcpy(d_local_rows, h_local_rows.data(), batch_size * sizeof(int32_t),
                                   cudaMemcpyHostToDevice));
             const int threads = 256;
             const int64_t total = batch_size * D;
-            gather_rows_int32<T><<<static_cast<unsigned>((total + threads - 1) / threads), threads>>>(
-                d_raw_range, d_local_rows, reinterpret_cast<float*>(d_queries), batch_size, D);
-            CUDA_CHECK(cudaGetLastError());
+            if constexpr (kU8Data) {
+                if (u8_cagra) {
+                    gather_rows_u8<<<static_cast<unsigned>((total + threads - 1) / threads), threads>>>(
+                        d_raw_range, d_local_rows, d_queries_u8, batch_size, D);
+                    CUDA_CHECK(cudaGetLastError());
+                }
+            }
+            if (!u8_cagra || u8_check) {
+                gather_rows_int32<T><<<static_cast<unsigned>((total + threads - 1) / threads), threads>>>(
+                    d_raw_range, d_local_rows, reinterpret_cast<float*>(d_queries), batch_size, D);
+                CUDA_CHECK(cudaGetLastError());
+            }
             // 只等默认 stream (gather 写完 d_queries、读完 d_raw_range)；cudaDeviceSynchronize
             // 会连后台 copy_stream 上下一批的 H2D 一起等
             CUDA_CHECK(cudaStreamSynchronize(cudaStreamLegacy));
@@ -2121,7 +2376,26 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
                 searched_bf = true;
             }
         }
-        if (!searched_bf && !searched_f16) {
+        if (!searched_bf && !searched_f16 && u8_cagra) {
+            cuvs::neighbors::cagra::search(res, sp, *cagra_idx_u8,
+                raft::make_device_matrix_view<const uint8_t, int64_t>(d_queries_u8, batch_size, static_cast<int64_t>(D)),
+                neighbors_view, distances_view);
+            if (u8_check) {   // 验证: float 搜索同一批，逐个比 top-2 id
+                uint32_t* d_ref = nullptr;
+                CUDA_CHECK(cudaMalloc(&d_ref, static_cast<size_t>(batch_size) * TOP_K * sizeof(uint32_t)));
+                float* d_refd = nullptr;
+                CUDA_CHECK(cudaMalloc(&d_refd, static_cast<size_t>(batch_size) * TOP_K * sizeof(float)));
+                cuvs::neighbors::cagra::search(res, sp, cagra_idx, queries_view,
+                    raft::make_device_matrix_view<uint32_t, int64_t>(d_ref, batch_size, static_cast<int64_t>(TOP_K)),
+                    raft::make_device_matrix_view<float, int64_t>(d_refd, batch_size, static_cast<int64_t>(TOP_K)));
+                CUDA_CHECK(cudaDeviceSynchronize());
+                std::vector<uint32_t> a(static_cast<size_t>(batch_size) * TOP_K), b(a.size());
+                CUDA_CHECK(cudaMemcpy(a.data(), d_top2, a.size() * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+                CUDA_CHECK(cudaMemcpy(b.data(), d_ref, b.size() * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+                for (size_t i = 0; i < a.size(); ++i) u8_mismatch += (a[i] != b[i]);
+                CUDA_CHECK(cudaFree(d_ref)); CUDA_CHECK(cudaFree(d_refd));
+            }
+        } else if (!searched_bf && !searched_f16) {
             cuvs::neighbors::cagra::search(res, sp, cagra_idx,
                 queries_view, neighbors_view, distances_view);
         }
@@ -2171,43 +2445,36 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
         auto tb4 = Clock::now();
         t_download += std::chrono::duration<double>(tb4 - tb3).count();
 
-        // ---- 4d: CPU 并行: local idx -> global idx 映射 + 均衡分配 ----
-        #pragma omp parallel for schedule(static)
-        for (int64_t i = 0; i < batch_size; ++i) {
-            uint32_t local_idx1 = h_top2[i * TOP_K];      // 最近
-            uint32_t local_idx2 = h_top2[i * TOP_K + 1];  // 第二近
-
-            // 映射: local centroid idx -> global dataset idx
-            // (caller 可通过 centroid_global_indices[local_idx] 得到全局)
-
-            // 比较两个聚类大小，做均衡分配
-            int64_t s1 = cluster_sizes[local_idx1].load(std::memory_order_relaxed);
-            int64_t s2 = cluster_sizes[local_idx2].load(std::memory_order_relaxed);
-
-            uint32_t chosen;
-            if (rule_dj) {
-                const float d1 = h_top2_d[static_cast<size_t>(i) * TOP_K], d2 = h_top2_d[static_cast<size_t>(i) * TOP_K + 1];
-                chosen = (s2 < s1 && d2 < 1.2f * d1) ? local_idx2 : local_idx1;   // DiskJoin add2choice
-            } else if (static_cast<double>(s2) < 0.8 * static_cast<double>(s1)) {
-                chosen = local_idx2;  // 聚类 2 太小，分配到聚类 2
-            } else {
-                chosen = local_idx1;  // 分配到最近的聚类 1
-            }
-
-            int64_t gi = non_centroid_indices[batch_start + i];
-            assignments[gi] = chosen;
-            cluster_sizes[chosen].fetch_add(1, std::memory_order_relaxed);
+        // ---- 4d 之前: 本批 top-2 (+ 距离) 写进全局数组 (4d 在所有卡算完后按单卡批次做) ----
+        auto write_back = [&] {
+            std::memcpy(h_top2_all.data() + static_cast<size_t>(batch_start) * TOP_K, h_top2.data(),
+                        static_cast<size_t>(batch_size) * TOP_K * sizeof(uint32_t));
+            if (rule_dj)
+                std::memcpy(h_top2_d_all.data() + static_cast<size_t>(batch_start) * TOP_K, h_top2_d.data(),
+                            static_cast<size_t>(batch_size) * TOP_K * sizeof(float));
+        };
+        if (!S) { write_back(); n_done += batch_size; }
+        else if (S->commit(*Lc, batch_end, write_back, batch_start)) n_done += batch_size;   // false: 被拒收 (过了抢占时刻 / 不再是 owner)
+        if (!S && (((batch_start - nc_begin) / Nv) % 10 == 0 || batch_end == nc_end)) {
+            std::cout << "[BatchAssign" << (G4 > 1 ? " gpu" + std::to_string(wi) : std::string()) << "] "
+                      << batch_end - nc_begin << "/" << nc_end - nc_begin << "\n";
         }
-        t_cpu_assign += std::chrono::duration<double>(Clock::now() - tb4).count();
-
-        if ((batch_start / Nv) % 10 == 0 || batch_end == N_nc) {
-            std::cout << "[BatchAssign] " << batch_end << "/" << N_nc << "\n";
-        }
+        if (!S) next_be = (prefetch_io ? next_be : claim(batch_end));
+        else if (!prefetch_io) next_be = claim(batch_end);
     }
+    if (prefetch_io && io_next.valid()) io_next.get();   // 不应发生 (只预读领到的批)；保险
+    if (!S || !(*next)(*Lc)) break;
+    }   // 租约循环
 
     // ================================================================
     // Step 6: 释放 per-batch GPU buffer（centroid 和 graph 保留）
     // ================================================================
+    if (u8_check && u8_cagra) {
+        std::cout << "[BatchAssign] #82 uint8 vs float CAGRA top-2 mismatches: " << u8_mismatch << "\n";
+        if (d_queries_u8) CUDA_CHECK(cudaFree(d_queries_u8));
+    }
+    cagra_idx_u8.reset(); padded_u8_owner.reset();
+    if (d_cent_u8)    CUDA_CHECK(cudaFree(d_cent_u8));
     if (d_queries)    CUDA_CHECK(cudaFree(d_queries));
     if (d_top2)       CUDA_CHECK(cudaFree(d_top2));
     if (d_distances)  CUDA_CHECK(cudaFree(d_distances));
@@ -2229,6 +2496,162 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
     if (d_raw_range)  CUDA_CHECK(cudaFree(d_raw_range));
     if (d_local_rows) CUDA_CHECK(cudaFree(d_local_rows));
     // NOTE: d_centroids 和 d_graph 由 caller 管理，本函数不释放
+    auto& stw = s4st[static_cast<size_t>(wi)];
+    // spot: 一个 worker 多个实例代 → 累加
+    stw.setup += t_setup; stw.read += t_read; stw.cu += t_convert_upload; stw.search += t_search; stw.dl += t_download;
+    stw.Nv = Nv; stw.n += n_done;
+    stw.wall += std::chrono::duration<double>(Clock::now() - w_t0).count();
+    if (S) S->note_setup(wi, t_setup);
+    };   // top2_worker
+
+    const bool spot4 = spot::Client::get().enabled() && !is_pq && !gpu_query_loader;
+    if (G4 == 1 && !spot4) {
+        top2_worker(0, 0, N_nc, d_centroids, d_graph, Mbatch_bytes);
+    } else {
+        // centroid / 图复制到其他卡 (peer copy)；每张卡的批显存按它自己的空闲显存算
+        int dev0 = 0;
+        CUDA_CHECK(cudaGetDevice(&dev0));
+        std::vector<CentroidT*> dc(static_cast<size_t>(G4), nullptr);
+        std::vector<uint32_t*> dg(static_cast<size_t>(G4), nullptr);
+        std::vector<size_t> mb(static_cast<size_t>(G4), Mbatch_bytes);
+        dc[0] = d_centroids; dg[0] = d_graph;
+        for (int g = 1; g < G4; ++g) {
+            CUDA_CHECK(cudaSetDevice(g));
+            size_t fr = 0, tot = 0;
+            CUDA_CHECK(cudaMemGetInfo(&fr, &tot));
+            mb[static_cast<size_t>(g)] = std::min(Mbatch_bytes, static_cast<size_t>(fr * 0.9));
+            CUDA_CHECK(cudaMalloc(&dc[static_cast<size_t>(g)], centroid_gpu_bytes));
+            CUDA_CHECK(cudaMalloc(&dg[static_cast<size_t>(g)], graph_bytes));
+            CUDA_CHECK(cudaMemcpyPeer(dc[static_cast<size_t>(g)], g, d_centroids, dev0, centroid_gpu_bytes));
+            CUDA_CHECK(cudaMemcpyPeer(dg[static_cast<size_t>(g)], g, d_graph, dev0, graph_bytes));
+        }
+        CUDA_CHECK(cudaSetDevice(dev0));
+        std::vector<std::thread> th;
+        std::vector<std::exception_ptr> exc(static_cast<size_t>(G4));
+        if (spot4) {
+            // ---- spot (SPOT_DESIGN §4.1): 单元 = non-centroid 行；初始切分 = 原来的 N_nc*g/G4，每段预留给该设备的
+            // spot worker (dedicated: 设备 0 = on-demand worker)。每个 worker 线程按实例代调 top2_worker；
+            // 同一张卡上的 worker (shared 模式的救场 worker) 用设备锁串行 (不能同时占显存)。
+            bool shared = false;
+            auto ws = spot::make_workers(G4, &shared);
+            std::vector<int64_t> cuts{0};
+            std::vector<int> owners;
+            for (int g = 0; g < G4; ++g) {
+                cuts.push_back(N_nc * (g + 1) / G4);
+                int o = -1;
+                for (size_t w = 0; w < ws.size(); ++w)
+                    if (ws[w].device == g && (o < 0 || (ws[static_cast<size_t>(o)].ondemand && !ws[w].ondemand))) o = static_cast<int>(w);
+                owners.push_back(o);
+            }
+            auto sopt4 = spot::options_from_env(shared);
+            if (!std::getenv("BUCKET2_SPOT_MIN_STEAL_S")) sopt4.min_steal_s = 0.5;   // 同一实例代内租约很便宜 (索引已建好)
+            sopt4.min_steal_units = std::max<int64_t>(1, N_nc / 1000);   // stage 速率未知时不把尾部切成碎片
+            spot::SegmentScheduler S("step4", N_nc, ws, cuts, owners, sopt4);
+            s4st.assign(ws.size(), S4Stat{});
+            std::vector<std::mutex> dev_m(static_cast<size_t>(G4));
+            exc.assign(ws.size(), nullptr);
+            for (size_t w = 0; w < ws.size(); ++w) {
+                th.emplace_back([&, w] {
+                    const int g = ws[w].device;
+                    try {
+                        if (g < 0 || g >= G4) throw std::runtime_error("spot step4: bad worker device");
+                        CUDA_CHECK(cudaSetDevice(g == 0 ? dev0 : g));
+                        S.run_worker_epochs(static_cast<int>(w), [&](spot::Lease& L, const std::function<bool(spot::Lease&)>& next) {
+                            std::lock_guard<std::mutex> dl(dev_m[static_cast<size_t>(g)]);
+                            top2_worker(static_cast<int>(w), L.begin, N_nc, dc[static_cast<size_t>(g)], dg[static_cast<size_t>(g)],
+                                        mb[static_cast<size_t>(g)], &S, &L, &next);
+                            CUDA_CHECK(cudaDeviceSynchronize());
+                        });
+                    } catch (...) { exc[w] = std::current_exception(); }
+                });
+            }
+            for (auto& t : th) t.join();
+            th.clear();
+            S.print_stats(std::cout);
+            std::string why;
+            bool exc_any = false;
+            for (auto& e : exc) if (e) exc_any = true;
+            if (!exc_any && !S.verify_complete(&why)) throw std::runtime_error("spot step4: incomplete: " + why);
+        }
+        for (int g = 0; g < G4 && !spot4; ++g) {
+            const int64_t b = N_nc * g / G4, e = N_nc * (g + 1) / G4;
+            th.emplace_back([&, g, b, e] {
+                try {
+                    CUDA_CHECK(cudaSetDevice(g == 0 ? dev0 : g));
+                    top2_worker(g, b, e, dc[static_cast<size_t>(g)], dg[static_cast<size_t>(g)], mb[static_cast<size_t>(g)]);
+                    CUDA_CHECK(cudaDeviceSynchronize());
+                } catch (...) { exc[static_cast<size_t>(g)] = std::current_exception(); }
+            });
+        }
+        for (auto& t : th) t.join();
+        for (int g = 1; g < G4; ++g) {
+            CUDA_CHECK(cudaSetDevice(g));
+            cudaFree(dc[static_cast<size_t>(g)]); cudaFree(dg[static_cast<size_t>(g)]);
+        }
+        CUDA_CHECK(cudaSetDevice(dev0));
+        for (auto& e : exc) if (e) std::rethrow_exception(e);
+    }
+    if (std::getenv("BUCKET2_STEP4_CHECKSUM") && std::getenv("BUCKET2_STEP4_CHECKSUM")[0] == '1') {
+        uint64_t h = 1469598103934665603ull;   // FNV-1a over top-2 ids (单卡 / 多卡对比用)
+        for (uint32_t v : h_top2_all) { h ^= v; h *= 1099511628211ull; }
+        std::cout << "[BatchAssign] top-2 checksum " << std::hex << h << std::dec << " over " << N_nc << " points\n";
+    }
+    t_setup = 0; t_read = 0; t_convert_upload = 0; t_search = 0; t_download = 0;
+    for (const auto& w : s4st) {   // 多卡: 各项取最慢那张卡 (单卡: 就是它自己)
+        t_setup = std::max(t_setup, w.setup); t_read = std::max(t_read, w.read);
+        t_convert_upload = std::max(t_convert_upload, w.cu); t_search = std::max(t_search, w.search);
+        t_download = std::max(t_download, w.dl);
+    }
+    if (G4 > 1 || spot4)
+        for (size_t g = 0; g < s4st.size(); ++g) {
+            const auto& w = s4st[g];
+            std::cout << "  [Step4 gpu" << g << "] points=" << w.n << " Nv=" << w.Nv << std::fixed << std::setprecision(3)
+                      << " setup=" << w.setup << "s read=" << w.read << "s convert_upload=" << w.cu
+                      << "s search=" << w.search << "s download=" << w.dl << "s wall=" << w.wall << "s\n";
+        }
+
+    // ---- 4d: 按单卡的 Nv 批次、原来的顺序做均衡分配 ----
+    {
+    const bool rule_dj = !h_top2_d_all.empty();
+    const int64_t Nv = Nv_assign;
+    // 测试用: BUCKET2_ASSIGN_DETERMINISTIC=1 → 4d 单线程按点顺序做 (默认的批内并行用 relaxed 原子读写簇大小，
+    // 结果随线程交错变化，整条 bucket2 因此不可逐字节复现；单卡 / 多卡逐字节对比时用这个)
+    static const bool det4d = std::getenv("BUCKET2_ASSIGN_DETERMINISTIC") && std::getenv("BUCKET2_ASSIGN_DETERMINISTIC")[0] == '1';
+    for (int64_t batch_start = 0; batch_start < N_nc; batch_start += Nv) {
+        const int64_t batch_end = std::min(batch_start + Nv, N_nc);
+        const int64_t batch_size = batch_end - batch_start;
+        auto tb4 = Clock::now();
+        // ---- 4d: CPU 并行: local idx -> global idx 映射 + 均衡分配 ----
+        #pragma omp parallel for schedule(static) if (!det4d)
+        for (int64_t i = 0; i < batch_size; ++i) {
+            uint32_t local_idx1 = h_top2_all[static_cast<size_t>(batch_start + i) * TOP_K];      // 最近
+            uint32_t local_idx2 = h_top2_all[static_cast<size_t>(batch_start + i) * TOP_K + 1];  // 第二近
+
+            // 映射: local centroid idx -> global dataset idx
+            // (caller 可通过 centroid_global_indices[local_idx] 得到全局)
+
+            // 比较两个聚类大小，做均衡分配
+            int64_t s1 = cluster_sizes[local_idx1].load(std::memory_order_relaxed);
+            int64_t s2 = cluster_sizes[local_idx2].load(std::memory_order_relaxed);
+
+            uint32_t chosen;
+            if (rule_dj) {
+                const float d1 = h_top2_d_all[static_cast<size_t>(batch_start + i) * TOP_K], d2 = h_top2_d_all[static_cast<size_t>(batch_start + i) * TOP_K + 1];
+                chosen = (s2 < s1 && d2 < 1.2f * d1) ? local_idx2 : local_idx1;   // DiskJoin add2choice
+            } else if (static_cast<double>(s2) < 0.8 * static_cast<double>(s1)) {
+                chosen = local_idx2;  // 聚类 2 太小，分配到聚类 2
+            } else {
+                chosen = local_idx1;  // 分配到最近的聚类 1
+            }
+
+            int64_t gi = non_centroid_indices[batch_start + i];
+            assignments[gi] = chosen;
+            cluster_sizes[chosen].fetch_add(1, std::memory_order_relaxed);
+        }
+        t_cpu_assign += std::chrono::duration<double>(Clock::now() - tb4).count();
+
+    }
+    }
 
     // 聚类大小统计
     int64_t min_sz = std::numeric_limits<int64_t>::max(), max_sz = 0;
@@ -2244,7 +2667,9 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
               << " max=" << max_sz
               << " avg=" << std::fixed << std::setprecision(1) << avg_sz << "\n";
     double ba_total = std::chrono::duration<double>(Clock::now() - ba_t0).count();
-    std::cout << "  [Step4 timing] setup=" << std::fixed << std::setprecision(3) << t_setup
+    std::cout << "  [Step4 timing] step0=" << std::fixed << std::setprecision(3) << t_step0
+              << "s init=" << t_init
+              << "s setup=" << t_setup
               << "s read=" << t_read
               << "s convert_upload=" << t_convert_upload
               << "s search=" << t_search
@@ -3629,7 +4054,8 @@ __global__ void dots_to_dist_inplace_kernel(
     const float* __restrict__ norms_pool,
     const int32_t* __restrict__ global_ids_bucket,
     const int32_t* __restrict__ global_ids_pool,
-    int bucket_size, int pool_size)
+    int bucket_size, int pool_size,
+    const float* __restrict__ q_norms = nullptr)   // 非空: 加上 ‖q‖² → 真实 L2² (跟 block top-M 路径一致)
 {
     static_assert(sizeof(DotsT) == sizeof(float),
                   "DotsT must be 4 bytes for in-place reuse");
@@ -3642,6 +4068,7 @@ __global__ void dots_to_dist_inplace_kernel(
 
     float dot = static_cast<float>(dots[tid]);
     float dist = norms_pool[j] - 2.0f * dot;
+    if (q_norms) dist += q_norms[i];
     if (global_ids_pool[j] == global_ids_bucket[i]) dist = INFINITY;
 
     reinterpret_cast<float*>(dots)[tid] = dist;
@@ -3681,8 +4108,12 @@ static inline void launch_extract_topM_raft(
     float*   d_select_dist,                 // RAFT dist 输出 scratch (也是最终距离输出)
     int32_t* d_out_neighbors,               // 最终输出 (邻居 global id)
     float*   d_out_distances,               // 可选, nullptr 表示不导出距离
-    int bucket_size, int pool_size, int actual_M)
+    int bucket_size, int pool_size, int actual_M, int ldd = -1,   // ldd: dots 行宽 (默认 = pool_size)
+    const float* d_q_norms = nullptr)                              // 非空: 输出真实 L2²
 {
+    if (ldd < 0) ldd = pool_size;
+    if (ldd != pool_size)   // dots_to_dist / select_k 按 pool_size 行宽读 (M > 256 时 GEMM 也用 ldd = pool_size)
+        throw std::runtime_error("launch_extract_topM_raft: dots row stride must equal pool_size");
     // 1) dots → dist (in-place, 含 self-loop +inf)
     {
         constexpr int threads = 256;
@@ -3690,7 +4121,7 @@ static inline void launch_extract_topM_raft(
         int64_t blocks = (total + threads - 1) / threads;
         dots_to_dist_inplace_kernel<DotsT><<<blocks, threads, 0, stream>>>(
             d_dots, d_norms_pool, d_ids_bucket, d_ids_pool,
-            bucket_size, pool_size);
+            bucket_size, pool_size, d_q_norms);
     }
 
     // 2) RAFT select_k: kAuto 会按 (batch, len, k) 自动选 radix-select / warp-sort
@@ -4647,7 +5078,15 @@ template <typename GemmT>
 __global__ void __launch_bounds__(256) a1_pull_join_kernel(
     const GemmT* __restrict__ data, const float* __restrict__ norms, int64_t N, int D,
     const int32_t* __restrict__ in_n, const float* __restrict__ in_d, int M, int S,
-    int32_t* __restrict__ out_n, float* __restrict__ out_d, A1Counters* __restrict__ ctr)
+    int32_t* __restrict__ out_n, float* __restrict__ out_d, A1Counters* __restrict__ ctr,
+    // #86: float 数据的 fp16 副本 (nullptr = 不筛)。每个候选先用 fp16 行 (half2 读，字节减半) 算近似距离，
+    // 只有近似距离 < kth + 严格误差界 的候选才走下面原来的精确 fp32 计算 (同一段代码、同一求和顺序，
+    // 结果逐位相同)；精确距离 < kth 的候选一定通过筛选，所以插入集合不变。
+    // 误差界: |q·p̃ − q·p| ≤ 2^-11 Σ|q_e p_e| + 2^-24 Σ|q_e| (fp16 舍入 / 次正规)，两边 fp32 累加各
+    // ≤ (D + 32)·2^-24 Σ|q_e p_e|，Σ|q_e p_e| ≤ ‖q‖‖p‖、Σ|q_e| ≤ √D ‖q‖；d = ‖a‖² + ‖v‖² − 2 q·p 的
+    // 两次加法 ≤ 2·2^-24 (‖a‖² + ‖v‖² + 2|q·p|) 每边。整体 × 1.25 余量。
+    // 参考 cuVS NN-Descent (nn_descent_gnnd.hpp) 用 fp16 算 local join 距离；这里加精确重算保持结果不变
+    const __half* __restrict__ data_h = nullptr)
 {
     const int64_t a = blockIdx.x;
     if (a >= N) return;
@@ -4672,12 +5111,30 @@ __global__ void __launch_bounds__(256) a1_pull_join_kernel(
         bool dup = false;                           // 已在 a 的表里
         for (int k = lane; k < M; k += 32) dup |= (s_old[k] == v);
         if (__any_sync(0xffffffffu, dup)) continue;
+        const float nv = norms[v];
+        if (data_h) {   // #86 筛选 (D 为偶数，调用方保证)
+            const __half2* ph = reinterpret_cast<const __half2*>(data_h + static_cast<int64_t>(v) * D);
+            float ap = 0.0f;
+            for (int e2 = lane; e2 < (D >> 1); e2 += 32) {
+                const float2 x = __half22float2(ph[e2]);
+                ap = fmaf(s_a[2 * e2], x.x, ap);
+                ap = fmaf(s_a[2 * e2 + 1], x.y, ap);
+            }
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1) ap += __shfl_xor_sync(0xffffffffu, ap, off);
+            const float qn = sqrtf(na), pnv = sqrtf(nv), qp = qn * pnv;
+            const float e_dot = (4.8828125e-4f + 2.0f * static_cast<float>(D + 32) * 5.9604645e-8f) * qp
+                              + 5.9604645e-8f * sqrtf(static_cast<float>(D)) * qn;
+            const float slack = 1.25f * (2.0f * e_dot + 4.0f * 5.9604645e-8f * (na + nv + 2.0f * fabsf(ap) + 2.0f * e_dot));
+            const float d_ap = na + nv - 2.0f * ap;
+            if (!(d_ap < kth + slack)) continue;   // 精确距离不可能 < kth (warp 一致: ap 已归约到所有 lane)
+        }
         float part = 0.0f;
         const GemmT* pv = data + static_cast<int64_t>(v) * D;
         for (int e = lane; e < D; e += 32) part += s_a[e] * static_cast<float>(pv[e]);
         #pragma unroll
         for (int off = 16; off > 0; off >>= 1) part += __shfl_xor_sync(0xffffffffu, part, off);
-        const float d = na + norms[v] - 2.0f * part;
+        const float d = na + nv - 2.0f * part;
         if (lane == 0 && d < kth) {
             const int p = atomicAdd(&s_np, 1);
             if (p < kA1MaxCand) { s_cid[p] = v; s_cd[p] = d; }
@@ -4793,17 +5250,60 @@ __global__ void resident_gather_pool_kernel(
     GemmT*   __restrict__ pool,
     float*   __restrict__ pool_norms,
     int32_t* __restrict__ pool_ids,
-    int D)
+    int D,
+    // #84 (float + #83 s6): 顺手写 s6 的 fp16 pool (行宽 Dh，补零列不动) + ‖p‖ + 溢出标志，省掉
+    // s6_to_f16_kernel 再把整个 pool 读一遍 (同一 __float2half_rn / sqrtf(norms)，结果逐位相同)。
+    // 参考 large 路径 devcache_gather_pool_kernel (#84)
+    __half* __restrict__ Bh = nullptr, float* __restrict__ pn = nullptr, int* __restrict__ bad = nullptr, int Dh = 0)
 {
+    // #84: 一段 (一个 bucket) 的行按 blockIdx.y 分给 gridDim.y 个 block (原来一段一个 block: pool ~97 段
+    // = 97 个 block，每个串行拷 ~1000 行；msTuring1M 这个 kernel 占 Step 6 GPU 时间 26%)
     int b = seg_bucket[blockIdx.x];
     if (b < 0) return;
     int64_t lo = member_offsets[b];
     int64_t cnt = member_offsets[b + 1] - lo;
     int64_t dst0 = seg_ofs[blockIdx.x];
+    const int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.y;
+    const int64_t t0 = static_cast<int64_t>(blockIdx.y) * blockDim.x + threadIdx.x;
     size_t row_bytes = static_cast<size_t>(D) * sizeof(GemmT);
-    if (row_bytes % 16 == 0) {
+    if constexpr (std::is_same<GemmT, float>::value) {
+        // float + s6: 一个 warp 一行，float4 读 / 写 pool + 4 个 half 一次写 Bh (D % 4 == 0；没有逐元素的 64 位除法)
+        if (Bh && (D & 3) == 0 && (Dh & 3) == 0) {
+            const int lane = threadIdx.x & 31;
+            const int64_t wid = (static_cast<int64_t>(blockIdx.y) * blockDim.x + threadIdx.x) >> 5;
+            const int64_t nw = stride >> 5;
+            const int D4 = D >> 2;
+            for (int64_t r = wid; r < cnt; r += nw) {
+                const int64_t gid = members[lo + r];
+                const float4* src = reinterpret_cast<const float4*>(data + gid * D);
+                float4* dst = reinterpret_cast<float4*>(pool + (dst0 + r) * D);
+                uint2* dh = reinterpret_cast<uint2*>(Bh + (dst0 + r) * Dh);
+                bool ovf = false;
+                for (int c4 = lane; c4 < D4; c4 += 32) {
+                    const float4 x = src[c4];
+                    dst[c4] = x;
+                    const __half2 h01 = __halves2half2(__float2half_rn(x.x), __float2half_rn(x.y));
+                    const __half2 h23 = __halves2half2(__float2half_rn(x.z), __float2half_rn(x.w));
+                    uint2 u;
+                    u.x = *reinterpret_cast<const unsigned*>(&h01);
+                    u.y = *reinterpret_cast<const unsigned*>(&h23);
+                    dh[c4] = u;
+                    ovf |= !(fabsf(x.x) < 65504.0f) || !(fabsf(x.y) < 65504.0f) ||
+                           !(fabsf(x.z) < 65504.0f) || !(fabsf(x.w) < 65504.0f);
+                }
+                if (ovf) *bad = 1;
+                if (lane == 0) {
+                    pool_ids[dst0 + r]   = static_cast<int32_t>(gid);
+                    pool_norms[dst0 + r] = norms[gid];
+                    pn[dst0 + r]         = sqrtf(norms[gid]);
+                }
+            }
+            return;
+        }
+    }
+    if (row_bytes % 16 == 0 && !Bh) {
         int vec_per_row = static_cast<int>(row_bytes / 16);
-        for (int64_t t = threadIdx.x; t < cnt * vec_per_row; t += blockDim.x) {
+        for (int64_t t = t0; t < cnt * vec_per_row; t += stride) {
             int64_t r = t / vec_per_row;
             int v = static_cast<int>(t - r * vec_per_row);
             int64_t gid = members[lo + r];
@@ -4811,16 +5311,25 @@ __global__ void resident_gather_pool_kernel(
                 reinterpret_cast<const int4*>(data + gid * D)[v];
         }
     } else {
-        for (int64_t t = threadIdx.x; t < cnt * D; t += blockDim.x) {
+        for (int64_t t = t0; t < cnt * D; t += stride) {
             int64_t r = t / D;
             int64_t gid = members[lo + r];
-            pool[(dst0 + r) * D + (t - r * D)] = data[gid * D + (t - r * D)];
+            const int64_t c = t - r * D;
+            const GemmT x = data[gid * D + c];
+            pool[(dst0 + r) * D + c] = x;
+            if constexpr (std::is_same<GemmT, float>::value) {
+                if (Bh) {
+                    Bh[(dst0 + r) * Dh + c] = __float2half_rn(x);
+                    if (!(fabsf(x) < 65504.0f)) *bad = 1;   // fp16 溢出或 NaN (同 s6_to_f16_kernel)
+                }
+            }
         }
     }
-    for (int64_t r = threadIdx.x; r < cnt; r += blockDim.x) {
+    for (int64_t r = t0; r < cnt; r += stride) {
         int32_t gid = members[lo + r];
         pool_ids[dst0 + r]   = gid;
         pool_norms[dst0 + r] = norms[gid];
+        if (pn) pn[dst0 + r] = sqrtf(norms[gid]);
     }
 }
 
@@ -4866,6 +5375,115 @@ __global__ void resident_merge_kernel(
     for (; w < M; ++w) { on[w] = -1; od[w] = INFINITY; }
 }
 
+// #86: resident_merge_kernel 的 warp 版 (同一输出，逐位相同): 一个 warp 一个点，两边各 M ≤ 64 项合并读进
+// shared memory；new 侧每项查是否在 running 侧出现 (每 lane 2 项 × M 次比较)；每项的输出位置直接算 =
+// 自己在本侧的序号 + 另一侧排在它前面的项数 (平手时 running 先: running 项 i 前面是 bd < ad[i] 的 new 项，
+// new 项 j 前面是 ad ≤ bd[j] 的 running 项)，位置 < M 才写；剩下的位置补 -1 / inf。原来一线程一个点、
+// 行距 M 的非合并读 + 每个 new 项在全局内存里扫 M 个 running 项 (msTuring1M 每轮 0.11–0.12 s)。
+constexpr int kMergeWarps = 8;
+__global__ void __launch_bounds__(kMergeWarps * 32) resident_merge_warp_kernel(
+    const int32_t* __restrict__ run_n, const float* __restrict__ run_d,
+    const int32_t* __restrict__ new_n, const float* __restrict__ new_d,
+    int32_t* __restrict__ out_n, float* __restrict__ out_d,
+    int64_t N, int M)
+{
+    __shared__ int32_t s_an[kMergeWarps][64], s_bn[kMergeWarps][64];
+    __shared__ float   s_ad[kMergeWarps][64], s_bd[kMergeWarps][64];
+    __shared__ int     s_bk[kMergeWarps][64];   // new 项去重后的序号 (重复 = -1)
+    const int lane = threadIdx.x & 31, w = threadIdx.x >> 5;
+    const int64_t row = static_cast<int64_t>(blockIdx.x) * kMergeWarps + w;
+    if (row >= N) return;
+    const int32_t* an = run_n + row * M; const float* ad = run_d + row * M;
+    const int32_t* bn = new_n + row * M; const float* bd = new_d + row * M;
+    for (int k = lane; k < M; k += 32) { s_an[w][k] = an[k]; s_ad[w][k] = ad[k]; s_bn[w][k] = bn[k]; s_bd[w][k] = bd[k]; }
+    __syncwarp();
+    // na / nb: 第一个 -1 之前的项数 (同原 kernel 的 while 扫描)
+    int na = M, nb = M;
+    for (int k = lane; k < M; k += 32) {
+        if (s_an[w][k] < 0) na = min(na, k);
+        if (s_bn[w][k] < 0) nb = min(nb, k);
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        na = min(na, __shfl_xor_sync(0xffffffffu, na, off));
+        nb = min(nb, __shfl_xor_sync(0xffffffffu, nb, off));
+    }
+    // new 项去重标记
+    for (int j = lane; j < M; j += 32) {
+        bool dup = false;
+        if (j < nb) { const int32_t id = s_bn[w][j]; for (int k = 0; k < na; ++k) dup |= (s_an[w][k] == id); }
+        s_bk[w][j] = (j < nb && !dup) ? 1 : 0;
+    }
+    __syncwarp();
+    // 去重后的前缀序号 (M ≤ 64: 两段 ballot 前缀)
+    {
+        const int j0 = lane, j1 = lane + 32;
+        const unsigned b0 = __ballot_sync(0xffffffffu, j0 < M && s_bk[w][j0]);
+        const unsigned b1 = __ballot_sync(0xffffffffu, j1 < M && s_bk[w][j1]);
+        const unsigned lt = (1u << lane) - 1u;
+        const int r0 = __popc(b0 & lt), r1 = __popc(b0) + __popc(b1 & lt);
+        const int k0 = (j0 < M && s_bk[w][j0]) ? r0 : -1, k1 = (j1 < M && s_bk[w][j1]) ? r1 : -1;
+        __syncwarp();
+        if (j0 < M) s_bk[w][j0] = k0;
+        if (j1 < M) s_bk[w][j1] = k1;
+    }
+    __syncwarp();
+    int32_t* on = out_n + row * M; float* od = out_d + row * M;
+    int nbn = 0;   // 去重后的 new 项数
+    for (int j = 0; j < M; ++j) nbn += (s_bk[w][j] >= 0);
+    // running 项 i: 位置 = i + #{去重后的 new j : bd[j] < ad[i]}
+    for (int i = lane; i < na; i += 32) {
+        const float x = s_ad[w][i];
+        int c = 0;
+        for (int j = 0; j < nb; ++j) c += (s_bk[w][j] >= 0 && s_bd[w][j] < x);
+        const int pos = i + c;
+        if (pos < M) { on[pos] = s_an[w][i]; od[pos] = x; }
+    }
+    // new 项 j (去重后序号 k): 位置 = k + #{running i : ad[i] <= bd[j]}
+    for (int j = lane; j < nb; j += 32) {
+        const int k = s_bk[w][j];
+        if (k < 0) continue;
+        const float x = s_bd[w][j];
+        int c = 0;
+        for (int i = 0; i < na; ++i) c += (s_ad[w][i] <= x);
+        const int pos = k + c;
+        if (pos < M) { on[pos] = s_bn[w][j]; od[pos] = x; }
+    }
+    for (int p = na + nbn + lane; p < M; p += 32) { on[p] = -1; od[p] = INFINITY; }
+}
+
+// #86: A1 筛选用的 fp16 数据副本 (溢出 / NaN 记 bad → 不筛)
+__global__ void a1_to_f16_kernel(const float* __restrict__ X, __half* __restrict__ Xh, int64_t total, int* __restrict__ bad)
+{
+    for (int64_t t = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; t < total;
+         t += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+        const float x = X[t];
+        if (!(fabsf(x) < 65504.0f)) *bad = 1;
+        Xh[t] = __float2half_rn(x);
+    }
+}
+
+// #83 resident s6: running 表第 M 个距离 → 按 gid 的 seed (s6_launch 的 seed_gid 格式)
+__global__ void resident_kth_kernel(const float* __restrict__ run_d, int64_t N, int M, float* __restrict__ kth)
+{
+    const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i < N) kth[i] = run_d[i * M + (M - 1)];
+}
+// #83 resident s6: 一个桶的输出 (bucket_size, K) 按 gid (= pool 前 bucket_size 行的 id) 写进本轮表 (行宽 out_ld)
+__global__ void resident_s6_scatter_kernel(const int32_t* __restrict__ oi, const float* __restrict__ od,
+                                           const int32_t* __restrict__ pool_ids, int bucket_size, int K,
+                                           int32_t* __restrict__ cur_n, float* __restrict__ cur_d, int out_ld, int64_t N,
+                                           int* __restrict__ bad)
+{
+    const int64_t t = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (t >= static_cast<int64_t>(bucket_size) * K) return;
+    const int q = static_cast<int>(t / K), k = static_cast<int>(t - static_cast<int64_t>(q) * K);
+    const int32_t g = pool_ids[q];
+    if (g < 0 || g >= N) { atomicExch(bad, 2); return; }   // bounds check
+    cur_n[static_cast<int64_t>(g) * out_ld + k] = oi[t];
+    cur_d[static_cast<int64_t>(g) * out_ld + k] = od[t];
+}
+
 template <typename DataT>
 struct GpuResidentKnn {
     using GemmT = typename ResidentGemmType<DataT>::type;
@@ -4892,6 +5510,17 @@ struct GpuResidentKnn {
         int32_t* pool_ids   = nullptr;
         float*   dots       = nullptr;
         size_t   pool_cap = 0, norms_cap = 0, ids_cap = 0, dots_cap = 0;   // 元素数
+        // #83 s6 (float 数据): fp16 pool / ‖p‖ / 阈值 / 计数 / 位图 / 一个桶的输出
+        __half*  s6_Bh = nullptr; float* s6_pn = nullptr; float* s6_thr = nullptr; unsigned* s6_hist = nullptr;
+        uint32_t* s6_bits = nullptr; int* s6_bad = nullptr; int32_t* s6_oi = nullptr; float* s6_od = nullptr;
+        size_t s6_Bh_cap = 0, s6_pn_cap = 0, s6_thr_cap = 0, s6_hist_cap = 0, s6_bits_cap = 0, s6_oi_cap = 0, s6_od_cap = 0;
+        void free_s6() {
+            cudaFree(s6_Bh); cudaFree(s6_pn); cudaFree(s6_thr); cudaFree(s6_hist); cudaFree(s6_bits);
+            cudaFree(s6_bad); cudaFree(s6_oi); cudaFree(s6_od);
+            s6_Bh = nullptr; s6_pn = nullptr; s6_thr = nullptr; s6_hist = nullptr; s6_bits = nullptr;
+            s6_bad = nullptr; s6_oi = nullptr; s6_od = nullptr;
+            s6_Bh_cap = s6_pn_cap = s6_thr_cap = s6_hist_cap = s6_bits_cap = s6_oi_cap = s6_od_cap = 0;
+        }
     };
     Slot slots[kStreams];
 
@@ -4937,14 +5566,17 @@ struct GpuResidentKnn {
     ~GpuResidentKnn() {
         for (auto& s : slots) {
             cudaFree(s.pool); cudaFree(s.pool_norms); cudaFree(s.pool_ids); cudaFree(s.dots);
+            s.free_s6();
             if (s.cublas) cublasDestroy(s.cublas);
             if (s.stream) cudaStreamDestroy(s.stream);
         }
         cudaFree(d_members); cudaFree(d_member_offsets); cudaFree(d_seg_bucket); cudaFree(d_seg_ofs);
         cudaFree(d_data); cudaFree(d_norms);
         cudaFree(d_run_n); cudaFree(d_run_d); cudaFree(d_cur_n); cudaFree(d_cur_d);
-        cudaFree(d_tmp_n); cudaFree(d_tmp_d);
+        cudaFree(d_tmp_n); cudaFree(d_tmp_d); cudaFree(d_kth); cudaFree(d_scatter_bad);
     }
+    float* d_kth = nullptr;   // #83: running 第 M 个距离 (按 gid)，s6 的 seed
+    int* d_scatter_bad = nullptr;
     GpuResidentKnn(const GpuResidentKnn&) = delete;
     GpuResidentKnn& operator=(const GpuResidentKnn&) = delete;
 
@@ -5059,11 +5691,45 @@ struct GpuResidentKnn {
         const int64_t max_ldd = (max_pool + 3) / 4 * 4;
         const int64_t row_tile = std::max<int64_t>(1, std::min<int64_t>(max_bucket,
             static_cast<int64_t>(kDotsSlotBytes / (sizeof(float) * std::max<int64_t>(1, max_ldd)))));
+        // #83: float 数据的 Step 6 改用 large 路径的 #72 fused 序列 (s6_launch: 自己桶精确 top-M → fp16 Tensor
+        // Core 扫描按严格误差界置位 → 置位列精确 fp32 重排)，不再 SGEMM 整块写 dots 再 top-M 扫一遍。
+        // 精确距离的定义同 large 路径 (逐维 fmaf，跟 SGEMM 只差 fp32 求和顺序)。msTuring1M: Step 6 11.2 s / 16 s。
+        // BUCKET2_RESIDENT_S6=0 关掉 (回 SGEMM)。只在 actual_M == M ∈ {32, 64, 128} 的桶上用，其余桶照旧 SGEMM
+        static const bool s6_env_on = !(std::getenv("BUCKET2_RESIDENT_S6") && std::getenv("BUCKET2_RESIDENT_S6")[0] == '0');
+        const bool use_s6 = !kHalf && D <= kS6MaxDh && s6_env_on && (M == 32 || M == 64 || M == 128);
+        const int s6_Dh = s6_pad16(D);
+        const size_t s6_W = static_cast<size_t>((max_pool + 31) / 32);
+        int num_sm = 80;
+        { int dev = 0; CUDA_CHECK(cudaGetDevice(&dev)); CUDA_CHECK(cudaDeviceGetAttribute(&num_sm, cudaDevAttrMultiProcessorCount, dev)); }
         for (auto& s : slots) {
             ensure_device(s.pool, s.pool_cap, static_cast<size_t>(max_pool) * D);
             ensure_device(s.pool_norms, s.norms_cap, static_cast<size_t>(max_pool));
             ensure_device(s.pool_ids, s.ids_cap, static_cast<size_t>(max_pool));
-            ensure_device(s.dots, s.dots_cap, static_cast<size_t>(row_tile) * max_ldd);
+            if (use_s6) {
+                const size_t bh = static_cast<size_t>(max_pool + kS6Q) * s6_Dh;   // 多 kS6Q 行给 WMMA 越界读
+                if (bh > s.s6_Bh_cap) {
+                    ensure_device(s.s6_Bh, s.s6_Bh_cap, bh);
+                    CUDA_CHECK(cudaMemset(s.s6_Bh, 0, bh * sizeof(__half)));
+                }
+                ensure_device(s.s6_pn, s.s6_pn_cap, static_cast<size_t>(max_pool));
+                ensure_device(s.s6_thr, s.s6_thr_cap, 2 * static_cast<size_t>(max_bucket));
+                ensure_device(s.s6_hist, s.s6_hist_cap, static_cast<size_t>(max_bucket) * kS6Bins);
+                ensure_device(s.s6_bits, s.s6_bits_cap, static_cast<size_t>(max_bucket) * s6_W);
+                ensure_device(s.s6_oi, s.s6_oi_cap, static_cast<size_t>(max_bucket) * M);
+                ensure_device(s.s6_od, s.s6_od_cap, static_cast<size_t>(max_bucket) * M);
+                if (!s.s6_bad) { CUDA_CHECK(cudaMalloc(&s.s6_bad, sizeof(int))); CUDA_CHECK(cudaMemset(s.s6_bad, 0, sizeof(int))); }
+            } else {
+                ensure_device(s.dots, s.dots_cap, static_cast<size_t>(row_tile) * max_ldd);
+            }
+        }
+        if (use_s6) {   // scatter 的越界标志 (s6_launch 每个桶会清零自己的 bad，不能共用)
+            if (!d_scatter_bad) CUDA_CHECK(cudaMalloc(&d_scatter_bad, sizeof(int)));
+            CUDA_CHECK(cudaMemset(d_scatter_bad, 0, sizeof(int)));
+        }
+        if (use_s6 && has_run) {
+            if (!d_kth) CUDA_CHECK(cudaMalloc(&d_kth, static_cast<size_t>(N) * sizeof(float)));
+            resident_kth_kernel<<<static_cast<unsigned>((N + 255) / 256), 256>>>(d_run_d, N, M, d_kth);
+            CUDA_CHECK(cudaGetLastError());
         }
 
         size_t nm = static_cast<size_t>(N) * M;
@@ -5073,8 +5739,13 @@ struct GpuResidentKnn {
         double t_setup = std::chrono::duration<double>(Clock::now() - t0).count();
 
         // ---- 3) bucket 循环: gather -> GEMM -> top-M (按 gid 写 cur)，无 host 同步 ----
+        // #84: gather 每段的 block 数 (BUCKET2_RES_GATHER_SPLIT，A/B 用)
+        static const unsigned gather_split = [] {
+            const char* e = std::getenv("BUCKET2_RES_GATHER_SPLIT");
+            return e ? static_cast<unsigned>(std::max(1, std::atoi(e))) : 8u;
+        }();
         auto t1 = Clock::now();
-        int64_t launched = 0;
+        int64_t launched = 0, s6_buckets = 0;
         for (int64_t c = 0; c < n_centroids; ++c) {
             int bucket_size = static_cast<int>(offsets[c + 1] - offsets[c]);
             int ps = static_cast<int>(pool_size[c]);
@@ -5084,11 +5755,35 @@ struct GpuResidentKnn {
             Slot& s = slots[launched % kStreams];
             ++launched;
 
-            resident_gather_pool_kernel<GemmT><<<static_cast<unsigned>(S), 256, 0, s.stream>>>(
+            const bool s6_this = use_s6 && actual_M == M;
+            if (s6_this) CUDA_CHECK(cudaMemsetAsync(s.s6_bad, 0, sizeof(int), s.stream));   // bh_ready: s6_launch 不再清零
+            resident_gather_pool_kernel<GemmT><<<dim3(static_cast<unsigned>(S), gather_split), 256, 0, s.stream>>>(
                 d_data, d_norms, d_members, d_member_offsets,
                 d_seg_bucket + c * S, d_seg_ofs + c * S,
-                s.pool, s.pool_norms, s.pool_ids, D);
+                s.pool, s.pool_norms, s.pool_ids, D,
+                s6_this ? s.s6_Bh : nullptr, s6_this ? s.s6_pn : nullptr, s6_this ? s.s6_bad : nullptr, s6_Dh);
             CUDA_CHECK(cudaGetLastError());
+
+            if constexpr (!kHalf) {
+                if (s6_this) {
+                    const float* Bf = reinterpret_cast<const float*>(s.pool);
+#define RS6_LAUNCH(KV) s6_launch<KV>(s.stream, Bf, s.pool_norms, s.pool_ids, bucket_size, ps, D, s.s6_Bh, s.s6_pn, \
+                                     s.s6_bad, s.s6_thr, s.s6_bits, s.s6_hist, has_run ? d_kth : nullptr, has_run ? N : 0, \
+                                     s.s6_oi, s.s6_od, num_sm, /*bh_ready=*/true)
+                    if      (M == 32) RS6_LAUNCH(32);
+                    else if (M == 64) RS6_LAUNCH(64);
+                    else              RS6_LAUNCH(128);
+#undef RS6_LAUNCH
+                    CUDA_CHECK(cudaGetLastError());
+                    const int64_t tot = static_cast<int64_t>(bucket_size) * M;
+                    resident_s6_scatter_kernel<<<static_cast<unsigned>((tot + 255) / 256), 256, 0, s.stream>>>(
+                        s.s6_oi, s.s6_od, s.pool_ids, bucket_size, M, d_cur_n, d_cur_d, M, N, d_scatter_bad);
+                    CUDA_CHECK(cudaGetLastError());
+                    ++s6_buckets;
+                    continue;
+                }
+                if (use_s6) ensure_device(s.dots, s.dots_cap, static_cast<size_t>(row_tile) * max_ldd);   // pool 太小 → SGEMM
+            }
 
             for (int r0 = 0; r0 < bucket_size; r0 += static_cast<int>(row_tile)) {
                 const int rows = std::min(static_cast<int>(row_tile), bucket_size - r0);
@@ -5120,6 +5815,11 @@ struct GpuResidentKnn {
         double t_launch = std::chrono::duration<double>(Clock::now() - t1).count();
         CUDA_CHECK(cudaDeviceSynchronize());
         double t_loop = std::chrono::duration<double>(Clock::now() - t1).count();
+        if (s6_buckets > 0) {   // scatter 的越界标志 (s6 自己的 bad 只表示 fp16 溢出，K3 已精确兜底)
+            int h_bad = 0;
+            CUDA_CHECK(cudaMemcpy(&h_bad, d_scatter_bad, sizeof(int), cudaMemcpyDeviceToHost));
+            if (h_bad) throw std::runtime_error("GpuResidentKnn: s6 scatter gid out of range");
+        }
 
         // ---- 4) 跨轮合并 ----
         auto t2 = Clock::now();
@@ -5127,16 +5827,42 @@ struct GpuResidentKnn {
             std::swap(d_run_n, d_cur_n); std::swap(d_run_d, d_cur_d);
             has_run = true;
         } else {
-            resident_merge_kernel<<<(N + 127) / 128, 128>>>(
-                d_run_n, d_run_d, d_cur_n, d_cur_d, d_tmp_n, d_tmp_d, N, M);
+            static const bool merge_warp = M <= 64 &&
+                !(std::getenv("BUCKET2_MERGE_WARP") && std::getenv("BUCKET2_MERGE_WARP")[0] == '0');
+            if (merge_warp)
+                resident_merge_warp_kernel<<<static_cast<unsigned>((N + kMergeWarps - 1) / kMergeWarps), kMergeWarps * 32>>>(
+                    d_run_n, d_run_d, d_cur_n, d_cur_d, d_tmp_n, d_tmp_d, N, M);
+            else
+                resident_merge_kernel<<<(N + 127) / 128, 128>>>(
+                    d_run_n, d_run_d, d_cur_n, d_cur_d, d_tmp_n, d_tmp_d, N, M);
             CUDA_CHECK(cudaGetLastError());
             CUDA_CHECK(cudaDeviceSynchronize());
+            if (merge_warp && std::getenv("BUCKET2_MERGE_CHECK") && std::getenv("BUCKET2_MERGE_CHECK")[0] == '1') {
+                // 验证: 原 kernel 写进 d_kth 不够大，借一份临时缓冲逐项比较
+                const size_t nm = static_cast<size_t>(N) * M;
+                int32_t* r_n = nullptr; float* r_d = nullptr;
+                CUDA_CHECK(cudaMalloc(&r_n, nm * sizeof(int32_t))); CUDA_CHECK(cudaMalloc(&r_d, nm * sizeof(float)));
+                resident_merge_kernel<<<(N + 127) / 128, 128>>>(d_run_n, d_run_d, d_cur_n, d_cur_d, r_n, r_d, N, M);
+                CUDA_CHECK(cudaGetLastError());
+                CUDA_CHECK(cudaDeviceSynchronize());
+                std::vector<int32_t> a_n(nm), b_n(nm); std::vector<float> a_d(nm), b_d(nm);
+                CUDA_CHECK(cudaMemcpy(a_n.data(), d_tmp_n, nm * sizeof(int32_t), cudaMemcpyDeviceToHost));
+                CUDA_CHECK(cudaMemcpy(b_n.data(), r_n, nm * sizeof(int32_t), cudaMemcpyDeviceToHost));
+                CUDA_CHECK(cudaMemcpy(a_d.data(), d_tmp_d, nm * sizeof(float), cudaMemcpyDeviceToHost));
+                CUDA_CHECK(cudaMemcpy(b_d.data(), r_d, nm * sizeof(float), cudaMemcpyDeviceToHost));
+                size_t mis = 0;
+                for (size_t i = 0; i < nm; ++i) mis += (a_n[i] != b_n[i]) || (std::memcmp(&a_d[i], &b_d[i], sizeof(float)) != 0);
+                std::cout << "  [GpuResidentKNN] #86 warp merge vs original: " << mis << " differing entries of " << nm << "\n";
+                cudaFree(r_n); cudaFree(r_d);
+            }
             std::swap(d_run_n, d_tmp_n); std::swap(d_run_d, d_tmp_d);
         }
         double t_merge = std::chrono::duration<double>(Clock::now() - t2).count();
 
         std::cout << "  [GpuResidentKNN] buckets=" << launched << " max_pool=" << max_pool
-                  << " max_bucket=" << max_bucket << " row_tile=" << row_tile << " gemm=" << (kHalf ? "FP16-TC" : "FP32")
+                  << " max_bucket=" << max_bucket << " row_tile=" << row_tile
+                  << " gemm=" << (kHalf ? "FP16-TC" : s6_buckets > 0 ? "FP32/s6-fused" : "FP32")
+                  << " s6_buckets=" << s6_buckets
                   << " | setup=" << std::fixed << std::setprecision(3) << t_setup
                   << "s loop=" << t_loop << "s (host launch " << t_launch
                   << "s) merge=" << t_merge << "s\n";
@@ -5190,13 +5916,45 @@ struct GpuResidentKnn {
         if (D > 256 || S < 1 || S > 32 || S > M) throw std::runtime_error("A1-R: needs D <= 256 and 1 <= S <= min(32, M)");
         A1Counters* d_ctr = nullptr;
         CUDA_CHECK(cudaMalloc(&d_ctr, sizeof(A1Counters)));
+        // #86: float 数据先做一份 fp16 副本给 A1 筛选用 (BUCKET2_A1_F16=0 关掉；
+        // BUCKET2_A1_F16_CHECK=1 每趟再跑一遍纯精确版本，逐项比较输出)
+        __half* d_data_h = nullptr;
+        const bool a1_f16 = !kHalf && (D % 2 == 0) &&
+            !(std::getenv("BUCKET2_A1_F16") && std::getenv("BUCKET2_A1_F16")[0] == '0');
+        const bool a1_check = a1_f16 && std::getenv("BUCKET2_A1_F16_CHECK") && std::getenv("BUCKET2_A1_F16_CHECK")[0] == '1';
+        if (a1_f16) {
+            int* d_bad = nullptr; int h_bad = 0;
+            CUDA_CHECK(cudaMalloc(&d_data_h, static_cast<size_t>(N) * D * sizeof(__half)));
+            CUDA_CHECK(cudaMalloc(&d_bad, sizeof(int)));
+            CUDA_CHECK(cudaMemset(d_bad, 0, sizeof(int)));
+            a1_to_f16_kernel<<<1024, 256>>>(reinterpret_cast<const float*>(d_data), d_data_h, N * D, d_bad);
+            CUDA_CHECK(cudaGetLastError());
+            CUDA_CHECK(cudaMemcpy(&h_bad, d_bad, sizeof(int), cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaFree(d_bad));
+            if (h_bad) { CUDA_CHECK(cudaFree(d_data_h)); d_data_h = nullptr; std::cout << "  [A1-R] fp16 overflow -> exact only\n"; }
+        }
         for (int it = 0; it < passes; ++it) {
             auto t0 = std::chrono::high_resolution_clock::now();
             CUDA_CHECK(cudaMemset(d_ctr, 0, sizeof(A1Counters)));
             a1_pull_join_kernel<GemmT><<<static_cast<unsigned>(N), 256>>>(
-                d_data, d_norms, N, D, d_run_n, d_run_d, M, S, d_tmp_n, d_tmp_d, d_ctr);
+                d_data, d_norms, N, D, d_run_n, d_run_d, M, S, d_tmp_n, d_tmp_d, d_ctr, d_data_h);
             CUDA_CHECK(cudaGetLastError());
             CUDA_CHECK(cudaDeviceSynchronize());
+            if (a1_check && d_data_h) {   // 验证: 纯精确版本写进 cur 缓冲，逐项比较
+                a1_pull_join_kernel<GemmT><<<static_cast<unsigned>(N), 256>>>(
+                    d_data, d_norms, N, D, d_run_n, d_run_d, M, S, d_cur_n, d_cur_d, d_ctr, nullptr);
+                CUDA_CHECK(cudaGetLastError());
+                CUDA_CHECK(cudaDeviceSynchronize());
+                const size_t nm = static_cast<size_t>(N) * M;
+                std::vector<int32_t> a_n(nm), b_n(nm); std::vector<float> a_d(nm), b_d(nm);
+                CUDA_CHECK(cudaMemcpy(a_n.data(), d_tmp_n, nm * sizeof(int32_t), cudaMemcpyDeviceToHost));
+                CUDA_CHECK(cudaMemcpy(b_n.data(), d_cur_n, nm * sizeof(int32_t), cudaMemcpyDeviceToHost));
+                CUDA_CHECK(cudaMemcpy(a_d.data(), d_tmp_d, nm * sizeof(float), cudaMemcpyDeviceToHost));
+                CUDA_CHECK(cudaMemcpy(b_d.data(), d_cur_d, nm * sizeof(float), cudaMemcpyDeviceToHost));
+                size_t mis = 0;
+                for (size_t i = 0; i < nm; ++i) mis += (a_n[i] != b_n[i]) || (std::memcmp(&a_d[i], &b_d[i], sizeof(float)) != 0);
+                std::cout << "  [A1-R] #86 fp16-screened vs exact pass " << it + 1 << ": " << mis << " differing entries of " << nm << "\n";
+            }
             std::swap(d_run_n, d_tmp_n); std::swap(d_run_d, d_tmp_d);
             A1Counters h{};
             CUDA_CHECK(cudaMemcpy(&h, d_ctr, sizeof(A1Counters), cudaMemcpyDeviceToHost));
@@ -5205,13 +5963,18 @@ struct GpuResidentKnn {
                       << " points=" << N << " dist_computed_avg=" << static_cast<double>(h.cand) / N
                       << " cand_pass_avg=" << static_cast<double>(h.pass) / N
                       << " inserted_avg=" << static_cast<double>(h.inserted) / N
-                      << " seconds=" << std::fixed << std::setprecision(3) << s << "\n";
+                      << " seconds=" << std::fixed << std::setprecision(3) << s
+                      << (d_data_h ? " (fp16 screen)" : "") << "\n";
         }
         cudaFree(d_ctr);
+        if (d_data_h) cudaFree(d_data_h);
     }
 
     void release_device() {
+        cudaFree(d_kth); d_kth = nullptr;
+        cudaFree(d_scatter_bad); d_scatter_bad = nullptr;
         for (auto& s : slots) {
+            s.free_s6();
             cudaFree(s.pool); cudaFree(s.pool_norms); cudaFree(s.pool_ids); cudaFree(s.dots);
             s.pool = nullptr; s.pool_norms = nullptr; s.pool_ids = nullptr; s.dots = nullptr;
             s.pool_cap = s.norms_cap = s.ids_cap = s.dots_cap = 0;
@@ -5358,15 +6121,58 @@ struct ChunkedKnnAccumulator {
         }
         return p;
     }
-    uint64_t arrival_bytes = 0;   // 本轮写出的 arrival 字节 (统计；只在写 arrival 的线程上累加)
+    uint64_t arrival_bytes = 0;   // 本轮写出的 arrival 字节 (统计；finish_iteration_writes 从各 lane 汇总)
 
     struct ChunkBuf {
-        std::vector<char> data;     // ≥ 一条最长的变长记录
+        size_t cap = 0;             // 每条 lane 的写缓冲字节数 (≥ 一条最长的变长记录)
         size_t capacity_records = 0;
-        size_t count = 0;           // data 里已用的字节数
-        std::ofstream file;
+        std::ofstream file;         // 超出内存预算的部分写这里 (多 lane 时在 chunk_mtx[c] 下写)
     };
     std::vector<ChunkBuf> bufs;
+
+    // S2 (scale loop): 写入 lane。多 GPU Step 6 每张卡一个 scatter 线程 = 一条 lane，各有一套 per-chunk 写缓冲，
+    // 追加 (memcpy) 不加锁；缓冲满了交给 mem_arrival / 写 chunk 文件时只锁那一个 chunk (chunk_mtx[c])。
+    // 原来一把 append_mtx 把所有卡的追加串行 (SIFT100M G=4: 3 张卡 scatter_pending 20–26 s / 轮在等它)。
+    // #97 / scale0 试过同样的 lane，当时缓冲写盘 → 并行写顶满 dirty 页 (被拒)；S1 之后缓冲是交给内存，没有这个问题。
+    // 记录先后顺序变了，merge 结果跟顺序无关 → vector_knn 不变。G = 1: 一条 lane、不加锁。
+    struct LaneBuf { std::unique_ptr<char[]> data; size_t count = 0; };   // data 不清零
+    struct Lane {
+        std::vector<LaneBuf> buf;   // [chunk]
+        uint64_t arrival = 0, mem_written = 0;   // 本轮字节 (统计)
+        // 诊断 (scatter worker 时间拆分): flush 的耗时 / 次数 / 字节，其余 = memcpy + 分派；每轮由 Step 6 打印后清零
+        double   flush_s = 0;
+        uint64_t flush_n = 0, flush_bytes = 0, append_n = 0;
+    };
+    std::vector<Lane> lanes;
+    std::unique_ptr<std::mutex[]> chunk_mtx;   // [chunk] (unique_ptr: 结构体要能 move)
+    void set_lanes(int L) {
+        L = std::max(1, L);
+        for (auto& ln : lanes)
+            for (auto& lb : ln.buf)
+                if (lb.count != 0) throw std::runtime_error("ChunkedKnnAccumulator::set_lanes with buffered data");
+        lanes.resize(static_cast<size_t>(L));
+        for (auto& ln : lanes) {
+            if (ln.buf.size() == static_cast<size_t>(num_chunks)) continue;
+            ln.buf.resize(static_cast<size_t>(num_chunks));
+            for (int64_t c = 0; c < num_chunks; ++c)
+                ln.buf[static_cast<size_t>(c)].data.reset(new char[bufs[static_cast<size_t>(c)].cap]);
+        }
+        if (!chunk_mtx) chunk_mtx.reset(new std::mutex[static_cast<size_t>(num_chunks)]);
+    }
+
+    // S1 (scale loop): arrival 记录放内存 (size-gated，超预算的 flush 照旧写 chunk_<c>_iter<t>.bin)。
+    // SIFT100M 每轮 ~35 GB arrival 全部经 page cache 写到 ~0.29 GB/s 的盘上，round 1 的还要留到最终
+    // merge (deferred)，dirty 页顶到阈值后 Step 6 的追加被内核限速 (多 GPU 时所有卡都在等这一个写线程)。
+    // 写满的 write buffer 整块挂到 mem_arrival[iter % 3][c] (不拷贝)，merge 直接解码这些块；同一 chunk 的
+    // 记录可以一部分在内存、一部分在文件——merge 结果跟到达顺序 / 存放位置无关 (逐位相同)。
+    // 槽位 iter % 3: 同时活着的只有 deferred 留下的 iter-1、正在 merge 的 iter、正在追加的 iter+1
+    // (下一轮 merge 发起前先等上一轮 merge 完)。预算 0 = 关闭 (原行为)；1B 规模超预算的部分自动落盘。
+    struct MemBlock { std::unique_ptr<char[]> p; size_t n = 0, cap = 0; };
+    std::vector<std::vector<MemBlock>> mem_arrival[3];
+    size_t arrival_mem_budget = 0;
+    std::unique_ptr<std::atomic<size_t>> arrival_mem_bytes = std::make_unique<std::atomic<size_t>>(0);   // 追加线程 CAS 加、merge 线程减
+    int cur_iter = 0;
+    void set_arrival_mem_budget(size_t bytes) { arrival_mem_budget = bytes; }
 
     static std::string iter_path(const std::string& dir, int64_t c, int iter) {
         return dir + "/chunk_" + std::to_string(c) + "_iter" + std::to_string(iter) + ".bin";
@@ -5478,8 +6284,10 @@ struct ChunkedKnnAccumulator {
         acc.bufs.resize(static_cast<size_t>(acc.num_chunks));
         for (auto& b : acc.bufs) {
             b.capacity_records = cap_records;
-            b.data.resize(std::max(cap_records * rec_bytes, compact_record_max(M)));
+            b.cap = std::max(cap_records * rec_bytes, compact_record_max(M));
         }
+        for (auto& slot : acc.mem_arrival) slot.resize(static_cast<size_t>(acc.num_chunks));
+        acc.set_lanes(1);
 
         std::cout << "[ChunkedKNN] N=" << N << " M=" << M
                   << " num_chunks=" << acc.num_chunks
@@ -5490,9 +6298,12 @@ struct ChunkedKnnAccumulator {
     }
 
     void start_iteration(int iter) {
+        cur_iter = iter;
         for (int64_t c = 0; c < num_chunks; ++c) {
             auto& b = bufs[static_cast<size_t>(c)];
-            b.count = 0;
+            for (auto& ln : lanes) ln.buf[static_cast<size_t>(c)].count = 0;
+            if (!mem_arrival[iter % 3][static_cast<size_t>(c)].empty())
+                throw std::runtime_error("ChunkedKnnAccumulator: in-memory arrival slot still in use for iter " + std::to_string(iter));
             b.file.open(iter_path(dir, c, iter),
                        std::ios::binary | std::ios::out | std::ios::trunc);
             if (!b.file.is_open())
@@ -5500,14 +6311,38 @@ struct ChunkedKnnAccumulator {
         }
     }
 
-    void flush_chunk(int64_t c) {
+    void flush_chunk(int64_t c, int lane = 0) {
         auto& b = bufs[static_cast<size_t>(c)];
-        if (b.count == 0) return;
-        b.file.write(b.data.data(), static_cast<std::streamsize>(b.count));
-        arrival_bytes += b.count;
-        if (!b.file.good())
-            throw std::runtime_error("ChunkedKnnAccumulator: flush failed for chunk " + std::to_string(c));
-        b.count = 0;
+        auto& ln = lanes[static_cast<size_t>(lane)];
+        auto& lb = ln.buf[static_cast<size_t>(c)];
+        if (lb.count == 0) return;
+        ln.arrival += lb.count;
+        // S1: 预算内就整块挂到内存 (CAS 占预算: 几条 lane 同时 flush 也不会超)
+        bool to_mem = false;
+        size_t cur = arrival_mem_bytes->load(std::memory_order_relaxed);
+        while (cur + b.cap <= arrival_mem_budget)
+            if (arrival_mem_bytes->compare_exchange_weak(cur, cur + b.cap, std::memory_order_relaxed)) { to_mem = true; break; }
+        // S21: 还要能从共用的 host 预算里拿到这一块，拿不到就照旧落盘
+        if (to_mem && !g_host_budget.try_reserve(b.cap)) {
+            arrival_mem_bytes->fetch_sub(b.cap, std::memory_order_relaxed);
+            to_mem = false;
+        }
+        {
+            std::unique_lock<std::mutex> lk;
+            if (lanes.size() > 1) lk = std::unique_lock<std::mutex>(chunk_mtx[static_cast<size_t>(c)]);
+            if (to_mem) {
+                mem_arrival[cur_iter % 3][static_cast<size_t>(c)].push_back(MemBlock{std::move(lb.data), lb.count, b.cap});
+            } else {
+                b.file.write(lb.data.get(), static_cast<std::streamsize>(lb.count));
+                if (!b.file.good())
+                    throw std::runtime_error("ChunkedKnnAccumulator: flush failed for chunk " + std::to_string(c));
+            }
+        }
+        if (to_mem) {
+            ln.mem_written += lb.count;
+            lb.data.reset(new char[b.cap]);
+        }
+        lb.count = 0;
     }
 
     // 一条 arrival 记录编码到 dst (≥ compact_record_max(M))，返回字节数。nbrs/dists 是按距离
@@ -5521,23 +6356,37 @@ struct ChunkedKnnAccumulator {
         return static_cast<size_t>(encode_compact(dst, rel, gid, cnt, nbrs, dists) - dst);
     }
 
-    // 只在写 arrival 的线程上调用 (Step 6 的 scatter 线程，按入队顺序)：把编码好的记录追加进
-    // gid 所在 chunk 的内存 write buffer，偶尔整块顺序 flush，没有 seek。
-    void append_encoded(int64_t gid, const char* rec, size_t len) {
+    // 只在 lane 自己的写线程上调用 (Step 6 的 scatter 线程，按入队顺序)：把编码好的记录追加进
+    // gid 所在 chunk 的这条 lane 的 write buffer，偶尔整块 flush，没有 seek。
+    void append_encoded(int64_t gid, const char* rec, size_t len, int lane = 0) {
         const int64_t c = std::min(gid / chunk_size, num_chunks - 1);
-        auto& b = bufs[static_cast<size_t>(c)];
-        if (b.count + len > b.data.size()) flush_chunk(c);
-        std::memcpy(b.data.data() + b.count, rec, len);
-        b.count += len;
+        auto& ln = lanes[static_cast<size_t>(lane)];
+        auto& lb = ln.buf[static_cast<size_t>(c)];
+        ++ln.append_n;
+        if (lb.count + len > bufs[static_cast<size_t>(c)].cap) {
+            const auto tf0 = std::chrono::steady_clock::now();
+            ln.flush_bytes += lb.count;
+            flush_chunk(c, lane);
+            ln.flush_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - tf0).count();
+            ++ln.flush_n;
+        }
+        std::memcpy(lb.data.get() + lb.count, rec, len);
+        lb.count += len;
     }
 
     void finish_iteration_writes() {
+        const auto tfin0 = std::chrono::steady_clock::now();
         for (int64_t c = 0; c < num_chunks; ++c) {
-            flush_chunk(c);
+            for (int l = 0; l < static_cast<int>(lanes.size()); ++l) flush_chunk(c, l);
             bufs[static_cast<size_t>(c)].file.close();
         }
-        std::cout << "  [ChunkedKNN] arrival records written: " << arrival_bytes / 1e9 << " GB (fixed-width would be "
-                  << static_cast<double>(N) * record_bytes(M) / 1e9 << " GB)\n";
+        uint64_t mem_written = 0;
+        for (auto& ln : lanes) { arrival_bytes += ln.arrival; mem_written += ln.mem_written; ln.arrival = 0; ln.mem_written = 0; }
+        std::cout << "  [ChunkedKNN] arrival records written: " << arrival_bytes / 1e9 << " GB (in memory "
+                  << mem_written / 1e9 << " GB, held " << arrival_mem_bytes->load() / 1e9 << " / "
+                  << arrival_mem_budget / 1e9 << " GB budget; fixed-width would be "
+                  << static_cast<double>(N) * record_bytes(M) / 1e9 << " GB; final flush+close "
+                  << std::chrono::duration<double>(std::chrono::steady_clock::now() - tfin0).count() << " s)\n";
         arrival_bytes = 0;
     }
 
@@ -5585,29 +6434,48 @@ struct ChunkedKnnAccumulator {
             return;
         }
 
-        id_sort_buf.assign(run_nbrs, run_nbrs + na);
-        std::sort(id_sort_buf.begin(), id_sort_buf.end());
+        // S34 (scale loop): 原来每条记录 std::sort running 的 na 个 id + binary_search 判重、scratch 是 vector<pair> push_back
+        // (最终 merge: SIFT100M 954 chunk 的 merge_cpu 合计 821 s，Wait ≈ 21 s 里的大头)。现在 running id 进一个
+        // 线程局部的开放寻址哈希表 (2^k ≥ 4·na 槽，代际戳免清零)，判重 O(1)；结果写进固定数组。合并顺序、
+        // 并列规则 (run_dists[i] <= new_dists[j] 取 running) 跟原来完全一样 → 输出逐字节相同。
+        (void)scratch; (void)id_sort_buf;
+        constexpr int kMaxM = 1024;
+        if (M > kMaxM) throw std::runtime_error("merge_one_record: M too large");
+        static thread_local int32_t h_key[4 * kMaxM];
+        static thread_local uint32_t h_gen[4 * kMaxM];
+        static thread_local uint32_t gen = 0;
+        static thread_local int32_t o_nbrs[kMaxM];
+        static thread_local float o_dists[kMaxM];
+        if (++gen == 0) { std::fill(h_gen, h_gen + 4 * kMaxM, 0u); gen = 1; }
+        int hbits = 4; while ((1 << hbits) < 4 * na) ++hbits;
+        const uint32_t hmask = (1u << hbits) - 1u;
+        auto hslot = [&](int32_t id) { return (static_cast<uint32_t>(id) * 2654435761u) >> (32 - hbits); };
+        for (int k = 0; k < na; ++k) {
+            uint32_t h = hslot(run_nbrs[k]);
+            while (h_gen[h] == gen && h_key[h] != run_nbrs[k]) h = (h + 1) & hmask;
+            h_gen[h] = gen; h_key[h] = run_nbrs[k];
+        }
+        auto in_run = [&](int32_t id) {
+            uint32_t h = hslot(id);
+            while (h_gen[h] == gen) { if (h_key[h] == id) return true; h = (h + 1) & hmask; }
+            return false;
+        };
 
-        scratch.clear();
+        int written = 0;
         int i = 0, j = 0;
-        while (static_cast<int>(scratch.size()) < M && (i < na || j < nb)) {
+        while (written < M && (i < na || j < nb)) {
             bool take_a = (j >= nb) || (i < na && run_dists[i] <= new_dists[j]);
             if (take_a) {
-                scratch.push_back({run_dists[i], run_nbrs[i]});
+                o_dists[written] = run_dists[i]; o_nbrs[written] = run_nbrs[i]; ++written;
                 ++i;
             } else {
                 int32_t id = new_nbrs[j];
-                bool dup = std::binary_search(id_sort_buf.begin(), id_sort_buf.end(), id);
-                if (!dup) scratch.push_back({new_dists[j], id});
+                if (!in_run(id)) { o_dists[written] = new_dists[j]; o_nbrs[written] = id; ++written; }
                 ++j;
             }
         }
-
-        int written = static_cast<int>(scratch.size());
-        for (int k = 0; k < written; ++k) {
-            run_dists[k] = scratch[k].first;
-            run_nbrs[k]  = scratch[k].second;
-        }
+        std::memcpy(run_dists, o_dists, static_cast<size_t>(written) * sizeof(float));
+        std::memcpy(run_nbrs, o_nbrs, static_cast<size_t>(written) * sizeof(int32_t));
         for (int k = written; k < M; ++k) {
             run_nbrs[k] = -1;
             run_dists[k] = std::numeric_limits<float>::infinity();
@@ -5644,10 +6512,11 @@ struct ChunkedKnnAccumulator {
         // running 文件里是第 base_iter 轮 merge 后的状态 (没有 = 全 sentinel)
         const int base_iter = (kept_iter >= 0) ? kept_iter - 1 : iter - 1;
         int fd_knn = -1, fd_dist = -1;
+        char* map_knn = nullptr; char* map_dist = nullptr; size_t map_bytes = 0;   // S26
         const off_t hdr = static_cast<off_t>(sizeof(int64_t) + sizeof(int32_t));
         if (is_final) {
             auto open_out = [&](const std::string& path) {
-                int fd = ::open(path.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0644);
+                int fd = ::open(path.c_str(), O_CREAT | O_RDWR | O_TRUNC, 0644);   // S26: O_RDWR (MAP_SHARED 写要可读)
                 if (fd < 0) throw std::runtime_error("ChunkedKnnAccumulator: cannot open " + path);
                 char h[sizeof(int64_t) + sizeof(int32_t)];
                 int32_t M32 = static_cast<int32_t>(M);
@@ -5662,7 +6531,33 @@ struct ChunkedKnnAccumulator {
             };
             fd_knn = open_out(final_knn_path);
             if (!final_dist_path.empty()) fd_dist = open_out(final_dist_path);   // 空 = 不写 vector_dists
+            // S26 (scale loop): 最终 vector_knn (SIFT100M 25.6 GB) 原来是各 chunk 线程 pwrite 到同一个文件：经 page cache 的
+            // buffered 写对单个文件不随线程数扩展 (per-inode 锁，S20 实测 `/` 1.0–1.2 GB/s) → Wait ≈ 25.6 GB / ~1.05 GB/s ≈ 24 s。
+            // 现在 MAP_SHARED 映射输出文件，chunk 结果直接 memcpy 进映射 (= 写文件，同样不 fsync、由内核回写)，写完的
+            // 整页马上 madvise(MADV_DONTNEED)：共享文件映射只撤掉页表项，脏数据留在 page cache，RSS 不随文件变大。
+            // 只是写法不同，文件字节相同；虚拟地址空间 = 文件大小 (1B: 256 GB 虚拟，不占内存)。BUCKET2_FINAL_MMAP=0 = 原来的 pwrite。
+            // 参考 S20 optimize final_graph.bin 的 mmap 写。
+            const char* fm = std::getenv("BUCKET2_FINAL_MMAP");
+            if (!(fm && fm[0] == '0')) {
+                const size_t fbytes = static_cast<size_t>(hdr) + static_cast<size_t>(N) * M * 4;
+                auto map_out = [&](int fd) -> char* {
+                    void* m = ::mmap(nullptr, fbytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+                    return (m == MAP_FAILED) ? nullptr : static_cast<char*>(m);
+                };
+                map_knn = map_out(fd_knn);
+                if (map_knn && fd_dist >= 0) {
+                    map_dist = map_out(fd_dist);
+                    if (!map_dist) { ::munmap(map_knn, fbytes); map_knn = nullptr; }
+                }
+                map_bytes = map_knn ? fbytes : 0;   // 映射失败 → 回到 pwrite
+            }
         }
+        auto write_mapped = [](char* base, const void* src, size_t n, size_t off) {
+            std::memcpy(base + off, src, n);
+            const size_t pg = static_cast<size_t>(::sysconf(_SC_PAGESIZE));
+            const size_t lo = (off + pg - 1) / pg * pg, hi = (off + n) / pg * pg;   // 只放掉完全在本段内的页
+            if (hi > lo) ::madvise(base + lo, hi - lo, MADV_DONTNEED);
+        };
         auto pwrite_all = [](int fd, const void* buf, size_t n, off_t off) {
             const char* p = static_cast<const char*>(buf);
             while (n > 0) {
@@ -5740,11 +6635,32 @@ struct ChunkedKnnAccumulator {
                 auto t3 = now();
                 for (int ai : {kept_iter, iter}) {
                 if (ai < 0) continue;
+                const bool keep = defer && ai == iter;   // 这一轮要留给最终 merge 的 arrival 不删
+                size_t n_file = 0;
+                auto merge_buf = [&](const char* rp, const char* const rend) {
+                    while (rp < rend) {
+                        ++n_file;
+                        // 紧凑记录 (见 encode_compact)，读回后补齐成 M 宽 (-1/+inf)；解码带边界检查
+                        int64_t gid;
+                        rp = decode_compact(rp, rend, chunk_start, M, gid, new_nbrs.data(), new_dists.data());
+                        if (!rp)
+                            throw std::runtime_error("ChunkedKnnAccumulator: bad arrival record in chunk " + std::to_string(c));
+                        int64_t pos = gid - chunk_start;
+                        if (pos < 0 || pos >= chunk_c_size) continue;  // 不应该发生，保险起见
+                        merge_one_record(
+                            run_nbrs.data() + static_cast<size_t>(pos) * M,
+                            run_dists.data() + static_cast<size_t>(pos) * M,
+                            new_nbrs.data(), new_dists.data(), M,
+                            scratch, id_sort_buf);
+                    }
+                };
+                // 落盘的部分: 整个 arrival 文件一次性读进内存 (一次 read 系统调用，而不是
+                // 每条记录一次)，读磁盘和后面逐条 merge 的 CPU 计算分开计时。
                 auto ta0 = now();
                 std::string ip = iter_path(dir, c, ai);
                 std::ifstream in(ip, std::ios::binary);
-                size_t n_file = 0;
-                if (in.is_open()) {
+                const bool had_file = in.is_open();
+                if (had_file) {
                     in.seekg(0, std::ios::end);
                     std::streamoff sz = in.tellg();
                     in.seekg(0, std::ios::beg);
@@ -5757,27 +6673,19 @@ struct ChunkedKnnAccumulator {
                 auto ta1 = now();
                 tm.read_arrival += secs_between(ta0, ta1);
                 t3 = ta1;
-
-                const char* rp = arrival_buf.data();
-                const char* const rend = rp + arrival_buf.size();
-                while (rp < rend) {
-                    ++n_file;
-                    // 紧凑记录 (见 encode_compact)，读回后补齐成 M 宽 (-1/+inf)；解码带边界检查
-                    int64_t gid;
-                    rp = decode_compact(rp, rend, chunk_start, M, gid, new_nbrs.data(), new_dists.data());
-                    if (!rp)
-                        throw std::runtime_error("ChunkedKnnAccumulator: bad arrival record in chunk " + std::to_string(c));
-                    int64_t pos = gid - chunk_start;
-                    if (pos < 0 || pos >= chunk_c_size) continue;  // 不应该发生，保险起见
-                    merge_one_record(
-                        run_nbrs.data() + static_cast<size_t>(pos) * M,
-                        run_dists.data() + static_cast<size_t>(pos) * M,
-                        new_nbrs.data(), new_dists.data(), M,
-                        scratch, id_sort_buf);
+                merge_buf(arrival_buf.data(), arrival_buf.data() + arrival_buf.size());
+                // S1: 再合内存里的块 (每块都是整条记录，flush 时不会把一条记录切开)
+                auto& blocks = mem_arrival[ai % 3][static_cast<size_t>(c)];
+                for (const auto& blk : blocks) merge_buf(blk.p.get(), blk.p.get() + blk.n);
+                if (!keep && !blocks.empty()) {
+                    size_t freed = 0;
+                    for (const auto& blk : blocks) freed += blk.cap;
+                    std::vector<MemBlock>().swap(blocks);
+                    arrival_mem_bytes->fetch_sub(freed, std::memory_order_relaxed);
+                    g_host_budget.release(freed);   // S21
                 }
                 n_records += n_file;
-                // 这一轮要留给最终 merge 的 arrival 文件不删
-                if (n_file > 0 && !(defer && ai == iter)) std::filesystem::remove(ip);
+                if (had_file && !keep) std::filesystem::remove(ip);
                 }   // ai
                 tm.n_records = static_cast<int64_t>(n_records);
                 if (!is_final) {
@@ -5791,7 +6699,11 @@ struct ChunkedKnnAccumulator {
                 if (is_final) {
                     // chunk c 在最终文件里是第 [chunk_start, chunk_start+chunk_c_size) 行
                     const off_t ofs = hdr + static_cast<off_t>(chunk_start) * M * 4;
-                    if (!pwrite_all(fd_knn, run_nbrs.data(), run_nbrs.size() * sizeof(int32_t), ofs) ||
+                    if (map_knn) {
+                        write_mapped(map_knn, run_nbrs.data(), run_nbrs.size() * sizeof(int32_t), static_cast<size_t>(ofs));
+                        if (map_dist)
+                            write_mapped(map_dist, run_dists.data(), run_dists.size() * sizeof(float), static_cast<size_t>(ofs));
+                    } else if (!pwrite_all(fd_knn, run_nbrs.data(), run_nbrs.size() * sizeof(int32_t), ofs) ||
                         (fd_dist >= 0 && !pwrite_all(fd_dist, run_dists.data(), run_dists.size() * sizeof(float), ofs)))
                         throw std::runtime_error("ChunkedKnnAccumulator: final pwrite failed for chunk " + std::to_string(c));
                     if (base_iter >= 0) { std::filesystem::remove(np); std::filesystem::remove(dp); }
@@ -5821,6 +6733,8 @@ struct ChunkedKnnAccumulator {
             kth_valid = true;
         }
         if (is_final) {
+            if (map_knn) { ::munmap(map_knn, map_bytes); map_knn = nullptr; }
+            if (map_dist) { ::munmap(map_dist, map_bytes); map_dist = nullptr; }
             if (::close(fd_knn) != 0 || (fd_dist >= 0 && ::close(fd_dist) != 0))
                 throw std::runtime_error("ChunkedKnnAccumulator: close failed for final outputs");
             final_written = true;
@@ -6305,7 +7219,13 @@ void build_vector_knn_with_tensorcore(
     size_t cache_bytes,
     const std::vector<int32_t>* precomputed_order = nullptr,
     size_t gpu_cache_bytes = 0,
-    const float* seed_kth = nullptr)   // (N,) 上一轮 merge 后每点 running 第 M 个距离 (#62)
+    const float* seed_kth = nullptr,   // (N,) 上一轮 merge 后每点 running 第 M 个距离 (#62)
+    // 多 GPU: 只处理处理顺序里的 [pos_begin, pos_end) 段 (调用方每张卡一段，已 cudaSetDevice)；默认整段
+    int32_t pos_begin = 0, int32_t pos_end = -1,
+    int acc_lane = 0,   // 多 GPU: 写 arrival 用的 lane (= 卡号；调用方先 acc.set_lanes(G))
+    // spot (SPOT_DESIGN §4.2): 这次调用 = 一个租约 [pos_begin, pos_end)；每个位置前 may_start (段被偷 / 抢占 →
+    // 停止发新桶，排空后返回)，scatter 线程按位置的连续前缀 commit (append 进 lane)，被拒收的桶丢弃
+    spot::SegmentScheduler* spot_S = nullptr, const spot::Lease* spot_L = nullptr)
 {
     auto func_t0 = std::chrono::high_resolution_clock::now();
     constexpr bool want_distances = true;  // 合并去重总是需要距离
@@ -6384,6 +7304,13 @@ void build_vector_knn_with_tensorcore(
               bucket_order::adjacency_from_flat_graph(
                   order_graph, n_centroids, static_cast<int32_t>(order_graph_K)),
               order_window);
+    if (pos_begin > 0 || (pos_end >= 0 && pos_end < static_cast<int32_t>(bucket_order_seq.size()))) {
+        const int32_t e = (pos_end < 0) ? static_cast<int32_t>(bucket_order_seq.size()) : pos_end;
+        if (pos_begin < 0 || pos_begin > e || e > static_cast<int32_t>(bucket_order_seq.size()))
+            throw std::runtime_error("build_vector_knn: bad position range");
+        bucket_order_seq = std::vector<int32_t>(bucket_order_seq.begin() + pos_begin, bucket_order_seq.begin() + e);
+    }
+    const int32_t n_pos = static_cast<int32_t>(bucket_order_seq.size());
     double t_setup_order = std::chrono::duration<double>(
         std::chrono::high_resolution_clock::now() - func_t0).count() - t_setup_bucket_count;
 
@@ -6430,8 +7357,13 @@ void build_vector_knn_with_tensorcore(
     // GPU 端 bucket 缓存跟 host 缓存用同一份未来访问表 (8-bit / float32 数据、预算 > 0 时用)
     std::vector<std::vector<int32_t>> future_access_dev;
     if (use_dev_cache) future_access_dev = future_access;
+    // S21: host bucket 缓存预算记在共用 host 预算上 (拿到多少用多少，函数返回时释放)
+    const size_t cache_granted = g_host_budget.reserve_up_to(cache_bytes);
+    if (cache_granted < cache_bytes)
+        std::cout << "  [HostBudget] Step 6 host bucket cache " << cache_bytes / 1e6 << " -> " << cache_granted / 1e6 << " MB\n";
+    struct S21CacheRelease { size_t b; ~S21CacheRelease() { g_host_budget.release(b); } } cache_release{cache_granted};
     bucket_order::BeladyBucketCache<VecBucket<DataT>> bucket_cache(
-        std::move(future_access), cache_bytes, vec_bucket_bytes);
+        std::move(future_access), cache_granted, vec_bucket_bytes);
     auto bucket_loader = [&](int32_t bid) {
         VecBucket<DataT> vb;
         bucket_vecs.read_bucket(bid, vb.ids, vb.vecs);
@@ -6709,6 +7641,7 @@ void build_vector_knn_with_tensorcore(
         int     bucket_size = 0;
         int     actual_M    = 0;
         bool    fused_out   = false; // dists 紧跟在 h_out 的 ids 后面 (block top-M 路径)
+        int32_t pos         = -1;    // 这个桶在本次调用里的位置 (spot 提交用)
     };
     Pending pending[MAX_SLOTS]{};   // 全部默认初始化为 {-1, 0, 0}
 
@@ -6785,6 +7718,7 @@ void build_vector_knn_with_tensorcore(
     // 只按入队顺序 (seq) 把编码好的记录追加进 chunk 写缓冲 + flush，跟单线程时写出的字节完全一样。
     struct ScatterJob {
         int bs = 0, aM = 0;
+        int32_t pos = -1;               // 本次调用里的位置 (spot 提交用)
         uint64_t seq = 0;
         std::vector<int32_t> gid, nb;
         std::vector<float>   d;
@@ -6800,6 +7734,7 @@ void build_vector_knn_with_tensorcore(
     bool scatter_done = false;            // guarded by scatter_mtx
     std::exception_ptr scatter_exc;
     double t_scatter_worker = 0;
+    double t_scatter_wait = 0;   // 诊断: scatter 线程等下一个按序编码好的 job 的时间
     std::atomic<int64_t> t_scatter_encode_ns{0};
     const int n_enc = [] {
         const char* e = std::getenv("BUCKET2_SCATTER_ENCODERS");
@@ -6818,6 +7753,50 @@ void build_vector_knn_with_tensorcore(
         if (!scatter_exc) scatter_exc = std::current_exception();
         scatter_queue.clear();
         scatter_encoded.clear();
+    };
+    // ---- spot 提交 (只在 spot_S 时用): scatter 的顺序不一定是位置顺序 (slot 轮转 + 空桶跳过 + 尾部按 slot 号)，
+    // 所以按位置攒住编码好的 job，位置连续前缀完成时一次 commit(L, pos_begin + p, append 这些 job)。
+    // 主线程对每个位置先 may_start，确定它有没有 job (空桶 / actual_M <= 0 没有) 后写 spot_has_job[p]，
+    // 再发布 spot_resolved = p + 1 (release)；只有 resolved 的位置才能算完成。
+    std::vector<uint8_t> spot_has_job(spot_S ? static_cast<size_t>(n_pos) : 0, 0);
+    std::atomic<int32_t> spot_resolved{0};
+    int32_t spot_next = 0;   // 第一个还没提交的位置 (scatter 线程; 收尾时主线程)
+    std::map<int32_t, std::unique_ptr<ScatterJob>> spot_held;
+    int64_t spot_rejected_buckets = 0;
+    auto spot_resolve = [&](int32_t p, bool has_job) {
+        if (!spot_S) return;
+        spot_has_job[static_cast<size_t>(p)] = has_job ? 1 : 0;
+        spot_resolved.store(p + 1, std::memory_order_release);
+    };
+    auto spot_flush = [&]() {   // scatter 线程 (或 scatter 线程退出后的主线程) 调用
+        const int32_t res = spot_resolved.load(std::memory_order_acquire);
+        int32_t p = spot_next;
+        std::vector<std::unique_ptr<ScatterJob>> batch;
+        while (p < res) {
+            if (spot_has_job[static_cast<size_t>(p)]) {
+                auto it = spot_held.find(p);
+                if (it == spot_held.end()) break;
+                batch.push_back(std::move(it->second));
+                spot_held.erase(it);
+            }
+            ++p;
+        }
+        if (p == spot_next) return;
+        const int64_t u0c = static_cast<int64_t>(pos_begin) + spot_next;
+        const bool ok = spot_S->commit(*spot_L, static_cast<int64_t>(pos_begin) + p, [&] {
+            for (auto& job : batch) {
+                size_t beg = 0;
+                for (int i = 0; i < job->bs; ++i) {
+                    const size_t end = job->enc_end[static_cast<size_t>(i)];
+                    acc.append_encoded(job->gid[static_cast<size_t>(i)], job->enc.data() + beg, end - beg, acc_lane);
+                    beg = end;
+                }
+            }
+        }, u0c);
+        if (!ok) spot_rejected_buckets += static_cast<int64_t>(batch.size());
+        spot_next = p;
+        std::lock_guard<std::mutex> lk(scatter_mtx);
+        for (auto& job : batch) if (scatter_free.size() < kScatterFreeMax) scatter_free.push_back(std::move(job));
     };
     std::vector<std::thread> enc_threads;
     for (int t = 0; t < n_enc; ++t) enc_threads.emplace_back([&]() {
@@ -6861,6 +7840,7 @@ void build_vector_knn_with_tensorcore(
         try {
             for (;;) {
                 std::unique_ptr<ScatterJob> job;
+                const auto tw0 = std::chrono::high_resolution_clock::now();
                 {
                     std::unique_lock<std::mutex> lk(scatter_mtx);
                     scatter_cv.wait(lk, [&] {
@@ -6873,11 +7853,21 @@ void build_vector_knn_with_tensorcore(
                     scatter_encoded.erase(it);
                     ++scatter_seq_out;
                 }
+                t_scatter_wait += std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - tw0).count();
                 auto ts0 = std::chrono::high_resolution_clock::now();
+                if (spot_S) {
+                    if (job->pos < 0 || job->pos >= n_pos || spot_held.count(job->pos))   // bounds check
+                        throw std::runtime_error("build_vector_knn: spot scatter job with bad position");
+                    spot_held.emplace(job->pos, std::move(job));
+                    spot_flush();
+                    t_scatter_worker += std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - ts0).count();
+                    scatter_cv.notify_all();
+                    continue;
+                }
                 size_t beg = 0;
                 for (int i = 0; i < job->bs; ++i) {
                     const size_t end = job->enc_end[static_cast<size_t>(i)];
-                    acc.append_encoded(job->gid[static_cast<size_t>(i)], job->enc.data() + beg, end - beg);
+                    acc.append_encoded(job->gid[static_cast<size_t>(i)], job->enc.data() + beg, end - beg, acc_lane);
                     beg = end;
                 }
                 t_scatter_worker += std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - ts0).count();
@@ -6921,7 +7911,7 @@ void build_vector_knn_with_tensorcore(
         }
         if (!job) job = std::make_unique<ScatterJob>();
         const size_t n_out = static_cast<size_t>(bs) * aM;
-        job->bs = bs; job->aM = aM;
+        job->bs = bs; job->aM = aM; job->pos = pending[slot].pos;
         job->gid.assign(h_ids_bucket[slot], h_ids_bucket[slot] + bs);
         job->nb.assign(h_out[slot], h_out[slot] + n_out);
         const float* hd = pending[slot].fused_out
@@ -7134,9 +8124,12 @@ void build_vector_knn_with_tensorcore(
 
     auto producer = [&]() {
         try {
+            // 多 GPU Step 6: cudaSetDevice 是线程级的，producer 是新线程 (默认在 0 号卡)，
+            // 必须切到调用方这张卡，否则用的是别的卡上创建的 stream / event → invalid resource handle
+            CUDA_CHECK(cudaSetDevice(dev_id));
             std::vector<CopyJob> jobs;
             jobs.reserve(static_cast<size_t>(K) + 1);
-            for (int32_t pos = 0; pos < static_cast<int32_t>(n_centroids); ++pos) {
+            for (int32_t pos = 0; pos < n_pos; ++pos) {
                 int64_t c = bucket_order_seq[pos];
                 if (bucket_count[c] == 0) continue;
                 int slot = static_cast<int>(pos % num_slots);
@@ -7426,9 +8419,14 @@ void build_vector_knn_with_tensorcore(
         }
     } prod_join{prod_thread, stage_mtx, stage_cv, stage_abort};
 
-    for (int32_t pos = 0; pos < static_cast<int32_t>(n_centroids); ++pos) {
+    bool spot_stopped = false;
+    for (int32_t pos = 0; pos < n_pos; ++pos) {
+        if (spot_S && !spot_S->may_start(*spot_L, static_cast<int64_t>(pos_begin) + pos, static_cast<int64_t>(pos_begin) + pos + 1)) {
+            spot_stopped = true;   // 段被偷到这里 / 实例被抢占 / 通知期来不及: 不再发新桶
+            break;
+        }
         int64_t c = bucket_order_seq[pos];
-        if (bucket_count[c] == 0) continue;
+        if (bucket_count[c] == 0) { spot_resolve(pos, false); continue; }
 
         // slot 必须按遍历位置 pos 轮转 (不是按桶 id c)——c 现在是按 DiskJoin
         // 顺序跳着走的，只有 pos 才是真正连续递增的循环步数，slot 轮转要靠它
@@ -7465,6 +8463,7 @@ void build_vector_knn_with_tensorcore(
             }
             stage_cv.notify_all();
             t_wait_producer += diag_secs(dt2, diag_now());
+            spot_resolve(pos, false);
             continue;
         }
         std::memcpy(h_ids_bucket[slot], staged_ids_bucket[slot].data(),
@@ -7597,8 +8596,8 @@ void build_vector_knn_with_tensorcore(
             CUDA_CHECK(cudaGetLastError());
             fused_out = true;
         } else {
-        if (bucket_size > static_cast<int>(dots_rows) && actual_M > 256)   // raft 回退不分块
-            throw std::runtime_error("VectorKNN: M > 256 needs bucket_size <= dots row tile");
+        // M > 256 (高度数，1B / degree 256–512 目标): raft select_k 回退也按 dots 行块做 (原来整 bucket 一次，
+        // bucket 行数 > dots 行块就报错)；每块的输入 / 输出都是 bucket 的 [r0, r0 + rows) 行，结果跟整块相同
         cublasSetStream(cublas_handle, streams[slot]);
         if (gemm_timing) CUDA_CHECK(cudaEventRecord(ev_gemm_start[slot], streams[slot]));
         for (int r0 = 0; r0 < bucket_size; r0 += static_cast<int>(dots_rows)) {
@@ -7671,11 +8670,13 @@ void build_vector_knn_with_tensorcore(
                 streams[slot],
                 d_dots[slot],
                 d_norms_pool[slot],
-                d_ids_bucket[slot], d_ids_pool[slot],
-                d_select_idx[slot], d_select_dist[slot],
-                d_out_neighbors[slot],
-                want_distances ? d_out_dists[slot] : nullptr,
-                bucket_size, pool_size, actual_M);
+                d_ids_bucket[slot] + r0, d_ids_pool[slot],
+                d_select_idx[slot] + static_cast<size_t>(r0) * actual_M,
+                d_select_dist[slot] + static_cast<size_t>(r0) * actual_M,
+                d_out_neighbors[slot] + static_cast<size_t>(r0) * actual_M,
+                want_distances ? d_out_dists[slot] + static_cast<size_t>(r0) * actual_M : nullptr,
+                rows, pool_size, actual_M, ldd_c,
+                d_norms_pool[slot] + r0);   // pool 的前 bucket_size 行就是本桶 → ‖q‖²
         #else
             // 自写 warp-cooperative kernel: 一 warp 处理一 query,
             // K_PER_LANE = K_OUT/32 个 slot 全在寄存器
@@ -7716,10 +8717,15 @@ void build_vector_knn_with_tensorcore(
         }
         t_submit += diag_secs(dt3, diag_now());
 
-        pending[slot] = {c, bucket_size, actual_M, fused_out};
+        pending[slot] = {c, bucket_size, actual_M, fused_out, pos};
+        spot_resolve(pos, true);
         ++processed_buckets;
     }
 
+    if (spot_stopped) {   // producer 可能在等这些位置的 slot 腾出来 → 让它退出
+        { std::lock_guard<std::mutex> lk(stage_mtx); stage_abort = true; }
+        stage_cv.notify_all();
+    }
     prod_thread.join();   // 已经全部消费完；ProducerJoin 析构时 joinable() 为 false
 
     // ---- Tail flush: 处理两 slot 上的最后未消费结果 ----
@@ -7737,11 +8743,26 @@ void build_vector_knn_with_tensorcore(
         for (auto& e : enc_threads) e.join();
         scatter_thread.join();
         if (scatter_exc) std::rethrow_exception(scatter_exc);
+        if (spot_S) {
+            spot_flush();   // 尾部的空桶 / 最后一批 (scatter 线程已退出，这里单线程)
+            if (!spot_held.empty())
+                throw std::runtime_error("build_vector_knn: spot jobs left uncommitted (" + std::to_string(spot_held.size()) + ")");
+            if (spot_rejected_buckets > 0)
+                std::cout << "  [VectorKNN] spot: " << spot_rejected_buckets << " finished buckets rejected (lane " << acc_lane << ")\n";
+        }
         std::cout << "  [VectorKNN] scatter worker: " << std::fixed << std::setprecision(3)
                   << t_scatter_worker << "s, encode " << t_scatter_encode_ns.load() / 1e9 << "s on "
                   << n_enc << " threads (tail drain "
                   << std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - tj0).count()
                   << "s)\n";
+        auto& dl = acc.lanes[static_cast<size_t>(acc_lane)];   // 这张卡自己的 lane 计数 (别的卡不碰)
+        const double memcpy_s = t_scatter_worker - dl.flush_s;
+        std::cout << "  [VectorKNN] scatter worker split (lane " << acc_lane << "): flush=" << dl.flush_s
+                  << "s (" << dl.flush_n << " flushes, " << dl.flush_bytes / 1e9 << " GB, "
+                  << (dl.flush_s > 0 ? dl.flush_bytes / 1e9 / dl.flush_s : 0.0) << " GB/s)"
+                  << " memcpy+dispatch=" << memcpy_s << "s (" << dl.append_n << " records)"
+                  << " idle_wait=" << t_scatter_wait << "s\n";
+        dl.flush_s = 0; dl.flush_n = 0; dl.flush_bytes = 0; dl.append_n = 0;
     }
 
     auto loop_t1 = std::chrono::high_resolution_clock::now();
@@ -8008,11 +9029,35 @@ static ReorderInfo compute_bucket_reorder(
     ReorderInfo r;
     r.bucket_offsets.assign(n_buckets + 1, 0);
 
+    // #96: 并行版。[0, N) 切成 nt 段连续 old_id 区间，每线程先数自己那段的
+    // per-bucket 计数；bucket b 里线程 t 的写入起点 = b 的区间起点 + 前面线程在 b
+    // 的计数之和。每线程按 old_id 升序写自己那段 → 每个 bucket 内仍按 old_id 升序，
+    // inverse_perm / bucket_offsets / centroid_new_ids 跟原来的串行版逐位相同。
+    // 线程数受 nt × n_buckets 计数表大小限制 (≤ 256 MB)。
+    int nt = std::max(1, omp_get_max_threads());
+    if (n_buckets > 0)
+        nt = static_cast<int>(std::max<int64_t>(1, std::min<int64_t>(nt,
+                (256LL << 20) / (n_buckets * static_cast<int64_t>(sizeof(uint32_t))))));
+    if (N < (1LL << 20)) nt = 1;
+    auto range_of = [&](int t, int64_t& lo, int64_t& hi) { lo = N * t / nt; hi = N * (t + 1) / nt; };
+    std::vector<uint32_t> tcounts(static_cast<size_t>(nt) * static_cast<size_t>(n_buckets), 0);
+    #pragma omp parallel num_threads(nt)
+    {
+        const int t = omp_get_thread_num();
+        int64_t lo, hi; range_of(t, lo, hi);
+        uint32_t* tc = tcounts.data() + static_cast<size_t>(t) * n_buckets;
+        for (int64_t i = lo; i < hi; ++i) {
+            const int64_t b = assignments[i];
+            if (b >= 0 && b < n_buckets) tc[b]++;
+        }
+    }
     // Count per bucket (indexed by raw bucket id, same as `assignments`).
     std::vector<int64_t> counts(n_buckets, 0);
-    for (int64_t i = 0; i < N; ++i) {
-        int64_t b = assignments[i];
-        if (b >= 0 && b < n_buckets) counts[b]++;
+    #pragma omp parallel for schedule(static)
+    for (int64_t b = 0; b < n_buckets; ++b) {
+        int64_t s = 0;
+        for (int t = 0; t < nt; ++t) s += tcounts[static_cast<size_t>(t) * n_buckets + b];
+        counts[b] = s;
     }
 
     // Lay ranges out in bucket_order sequence (position pos -> raw bucket
@@ -8030,23 +9075,46 @@ static ReorderInfo compute_bucket_reorder(
     r.inverse_perm.assign(r.total_in_buckets, 0);
     r.centroid_new_ids.assign(centroid_global_indices.size(), 0xFFFFFFFFu);
 
-    // old_id -> index into centroid_global_indices；只有 n_centroids 个条目，
-    // 不是 N 个——这就是不再需要全量 perm[] 数组的关键。
-    std::unordered_map<int64_t, size_t> centroid_old_id_to_k;
-    centroid_old_id_to_k.reserve(centroid_global_indices.size() * 2);
-    for (size_t k = 0; k < centroid_global_indices.size(); ++k)
-        centroid_old_id_to_k[centroid_global_indices[k]] = k;
-
-    std::vector<uint32_t> cursor = new_id_range_start;
-    for (int64_t old_id = 0; old_id < N; ++old_id) {
-        int64_t b = assignments[old_id];
-        if (b >= 0 && b < n_buckets) {
-            uint32_t new_id = cursor[b]++;
-            r.inverse_perm[new_id] = static_cast<uint32_t>(old_id);
-            auto it = centroid_old_id_to_k.find(old_id);
-            if (it != centroid_old_id_to_k.end())
-                r.centroid_new_ids[it->second] = new_id;
+    // tcounts[t][b] 原地换成线程 t 在 bucket b 的写入游标 (exclusive prefix over t)
+    #pragma omp parallel for schedule(static)
+    for (int64_t b = 0; b < n_buckets; ++b) {
+        uint32_t run = new_id_range_start[b];
+        for (int t = 0; t < nt; ++t) {
+            uint32_t& c = tcounts[static_cast<size_t>(t) * n_buckets + b];
+            const uint32_t n = c;
+            c = run;
+            run += n;
         }
+    }
+    #pragma omp parallel num_threads(nt)
+    {
+        const int t = omp_get_thread_num();
+        int64_t lo, hi; range_of(t, lo, hi);
+        uint32_t* cur = tcounts.data() + static_cast<size_t>(t) * n_buckets;
+        for (int64_t old_id = lo; old_id < hi; ++old_id) {
+            const int64_t b = assignments[old_id];
+            if (b >= 0 && b < n_buckets)
+                r.inverse_perm[cur[b]++] = static_cast<uint32_t>(old_id);
+        }
+    }
+
+    // old_id -> new_id 只需要 n_centroids 个 centroid 的：原来在 O(N) 循环里对每个点
+    // 查一次 unordered_map。现在: centroid c 的 bucket b = assignments[c]，它在 b 里的
+    // 名次 = b 区间内 inverse_perm 中 old_id 的位置 (区间内按 old_id 升序) → 二分查找。
+    const int64_t n_cent = static_cast<int64_t>(centroid_global_indices.size());
+    #pragma omp parallel for schedule(static)
+    for (int64_t k = 0; k < n_cent; ++k) {
+        const int64_t c = centroid_global_indices[static_cast<size_t>(k)];
+        if (c < 0 || c >= N) continue;
+        const int64_t b = assignments[c];
+        if (b < 0 || b >= n_buckets) continue;
+        const uint32_t s = new_id_range_start[b];
+        const uint32_t e = s + static_cast<uint32_t>(counts[b]);
+        const uint32_t* first = r.inverse_perm.data() + s;
+        const uint32_t* last = r.inverse_perm.data() + e;
+        const uint32_t* it = std::lower_bound(first, last, static_cast<uint32_t>(c));
+        if (it != last && *it == static_cast<uint32_t>(c))
+            r.centroid_new_ids[static_cast<size_t>(k)] = static_cast<uint32_t>(it - r.inverse_perm.data());
     }
     return r;
 }
@@ -8236,7 +9304,9 @@ int run_pipeline_impl(
 
         // 采样索引: sampled_indices[sample_idx] = raw_idx
         std::vector<int64_t> sampled_indices;
-        std::vector<float> X_sampled;
+        // #88: 不清零的分配器 (整份读盘 / 并行转换就是首次写入)
+        using HostF32Vec = std::vector<float, load::uninit_allocator<float>>;
+        HostF32Vec X_sampled;
         int64_t working_N = 0;  // X_sampled 的行数；Step 2 等 lambda 外的代码要用
         // 非空时: 当前坐标系 id → X_sampled 的行号 (round 1 重排后 X_sampled 仍是
         // 旧坐标系，只在 KMeans|| 抽训练子集时按它 gather，省掉整份重排)
@@ -8253,7 +9323,16 @@ int run_pipeline_impl(
         // （round 1 重排不改变点数/维度，只改变 ID 的物理排列），可以直接复用。
         // 原始 (N, D) 数据集的 host 副本 (DataT)：GPU-resident 路径建常驻数据集 /
         // round 1 重排时用，out-of-core 预算够时跨轮复用 (见下面 ooc_host_raw)。
-        std::vector<DataT> raw_host;
+        // #88: 不清零的分配器 (见 load::uninit_allocator)，读盘就是首次写入
+        using HostRawVec = std::vector<DataT, load::uninit_allocator<DataT>>;
+        HostRawVec raw_host;
+        // #91: round 1 重排后的整份数据集 (out-of-core、多轮、放得进 host 预算时 Step 4.5 单窗重排的窗缓冲)，
+        // 给 round 2 的重新采样和 round 1 的 Step 6 当 host blob 用，round 1 Step 6 之后释放
+        std::shared_ptr<char[]> r1_blob;
+        // #96: Step 1 (!fits_in_gpu) 的排序后采样行号；Step 4.5 resample 原来用同样的
+        // (N, working_N, seed) 再抽一遍、再排序，结果一样，直接复用
+        std::vector<int64_t> step1_sorted_rows;
+        int64_t step1_sorted_N = -1; uint32_t step1_sorted_seed = 0;
         auto sample_from = [&](const std::string& path) {
             if (!mem_est.fits_in_gpu) {
                 // 只从 disk 读取采样行，不加载完整数据集
@@ -8294,6 +9373,9 @@ int run_pipeline_impl(
 
                 // sampled_indices 需要和 X_sampled 行顺序一致 (sorted_order)
                 sampled_indices = std::move(sorted_order);
+                // #96: 留一份给 Step 4.5 的 in-memory resample (同 N / working_N / seed → 同一组行)
+                step1_sorted_rows = sampled_indices;
+                step1_sorted_N = N; step1_sorted_seed = config.seed;
                 std::cout << "  Sampled " << working_N << " rows from disk ("
                           << X_sampled.size() * sizeof(float) / 1e9 << " GB)\n";
             } else {
@@ -8345,7 +9427,7 @@ int run_pipeline_impl(
         std::future<void> reorder_write;
         auto join_reorder_write = [&] { if (reorder_write.valid()) reorder_write.get(); };
         auto write_reordered_async = [&](const std::string& path, const DataT* p, size_t n,
-                                         std::shared_ptr<std::vector<DataT>> holder) {
+                                         std::shared_ptr<void> holder) {   // holder: 写完之前保活缓冲 (任意类型)
             const int32_t n32 = static_cast<int32_t>(N), d32 = static_cast<int32_t>(D);
             // 文件在这里同步创建: blob 模式下 round 1 的 reader 不 join 就构造 (只 open、不读)，
             // 文件若还没被后台线程建出来就会 "cannot open" (SIFT1M large 偶发)
@@ -8381,10 +9463,32 @@ int run_pipeline_impl(
         // 用它，不再每轮读盘 2~3 遍。超预算时 (SIFT10M 以上) 照旧按区间读盘。
         // 预算: 给了 --bucket-mem-mb (run_pipeline 按数据集算好的 host 记录预算) 就用它，否则
         // cpu-limit/4 (P2.4b: msTuring10M float 两份 8 GB > 16 GB/4，原来 Step 4 每轮重读 3.3 s)
-        const size_t host_raw_budget = config.bucket_mem_mb > 0 ? (config.bucket_mem_mb << 20)
-                                                                : config.cpu_limit_bytes / 4;
-        const bool ooc_host_raw = !gres &&
+        size_t host_raw_budget = config.bucket_mem_mb > 0 ? (config.bucket_mem_mb << 20)
+                                                          : config.cpu_limit_bytes / 4;
+        // 测试用: BUCKET2_HOST_RAW_BUDGET_MB 覆盖 (小数据集上走 SIFT100M 的 keep_blob / S18 路径做逐字节检查)
+        if (const char* e = std::getenv("BUCKET2_HOST_RAW_BUDGET_MB")) host_raw_budget = static_cast<size_t>(std::atoll(e)) << 20;
+        bool ooc_host_raw = !gres &&
             static_cast<size_t>(N) * D * sizeof(DataT) * 2 <= host_raw_budget;
+        // S21: 整份 raw_host (按 2 份计，跟上面的判断一样) 记在共用 host 预算上；拿不到 → 不留 raw_host (读文件)
+        size_t ooc_raw_reserved = 0;
+        if (ooc_host_raw) {
+            const size_t want = static_cast<size_t>(N) * D * sizeof(DataT) * 2;
+            if (g_host_budget.try_reserve(want)) ooc_raw_reserved = want;
+            else {
+                ooc_host_raw = false;
+                std::cout << "[HostBudget] out-of-core raw_host " << want / 1e9 << " GB denied (used " << g_host_budget.used.load() / 1e9
+                          << " / " << g_host_budget.cap / 1e9 << " GB) -> read from file\n";
+            }
+        }
+        struct S21Release { size_t& b; ~S21Release() { g_host_budget.release(b); b = 0; } } ooc_raw_release{ooc_raw_reserved};
+        // Step 4 / round 2..t bucket 写的整份数据 (当前坐标系): raw_host (ooc_host_raw)，否则 S18: round 2 (iter == 1)
+        // 用 Step 4.5 留下的 r1_blob (= data_reordered 的内容)，不读后台还在写的文件
+        int iter_now = 0;
+        auto host_raw_now = [&]() -> const DataT* {
+            if (ooc_host_raw) return raw_host.data();
+            if (r1_blob && iter_now == 1) return reinterpret_cast<const DataT*>(r1_blob.get());
+            return nullptr;
+        };
         if (x_lazy && !ooc_host_raw) {
             // raw_host 不会跨轮保留 (GPU-resident / 超预算): 照旧整份转 float
             X_sampled.resize(raw_host.size());
@@ -8402,7 +9506,7 @@ int run_pipeline_impl(
             std::cout << "  [HostRaw] out-of-core dataset kept in host memory: "
                       << raw_host.size() * sizeof(DataT) / 1e9 << " GB\n";
         } else if (!gres) {
-            raw_host = std::vector<DataT>();   // 预读了但用不上 (超预算)
+            raw_host = HostRawVec();   // 预读了但用不上 (超预算)
         }
 
         elapsed_step1 = std::chrono::duration<double>(Clock::now() - t1).count();
@@ -8440,6 +9544,8 @@ int run_pipeline_impl(
                 ChunkedKnnAccumulator::create(
                     knn_chunk_tmp_dir, N, static_cast<int>(neighbors_m),
                     config.cpu_limit_bytes / 4));
+            knn_acc->set_arrival_mem_budget(config.arrival_mem_mb << 20);
+            std::cout << "[ChunkedKNN] arrival records in host memory up to " << config.arrival_mem_mb << " MB\n";
         }
 
         // 这些值由最后一次 iteration 决定 (用于 Step 5/7)
@@ -8464,6 +9570,7 @@ int run_pipeline_impl(
         size_t X_train_cap = 0;   // floats
 
         for (int iter = 0; iter < iterations; ++iter) {
+            iter_now = iter;   // S18: host_raw_now
             // 每次 iteration 用不同 seed (centroid 选取多样化)
             uint32_t iter_seed = config.seed + static_cast<uint32_t>(iter);
             LoadConfig iter_config = config;
@@ -8726,7 +9833,7 @@ int run_pipeline_impl(
                 d_centroids_u8, u8_bytes,
                 d_graph, graph_bytes,
                 K, quantizer, Mbatch_bytes, search_max_iters, {},
-                ooc_host_raw ? raw_host.data() : nullptr);
+                host_raw_now());
 
             CUDA_CHECK(cudaFree(d_centroids_u8));
         } else {
@@ -8743,7 +9850,7 @@ int run_pipeline_impl(
                 d_centroids_f32, centroid_gpu_bytes,
                 d_graph, graph_bytes,
                 K, quantizer, Mbatch_bytes, search_max_iters, loader,
-                ooc_host_raw ? raw_host.data() : nullptr);
+                host_raw_now());
 
             CUDA_CHECK(cudaFree(d_centroids_f32));
         }
@@ -8773,9 +9880,14 @@ int run_pipeline_impl(
             write_bucket_vectors_from_assignments<DataT>(
                 working_input_path, N, D, n_centroids,
                 centroid_global_indices, assignments, *bucket_vecs_ptr,
-                512LL * 1024 * 1024, ooc_host_raw ? raw_host.data() : nullptr);
+                512LL * 1024 * 1024, host_raw_now());
             // 最后一轮写完 bucket 之后 Step 6 只读 bucket_vecs，原始数据不再需要
-            if (ooc_host_raw && iter + 1 == iterations) { join_reorder_write(); raw_host = std::vector<DataT>(); }
+            if (ooc_host_raw && iter + 1 == iterations) {
+                join_reorder_write(); raw_host = HostRawVec();
+                g_host_budget.release(ooc_raw_reserved); ooc_raw_reserved = 0;   // S21
+            }
+            // S18: round 2 的 Step 4 + bucket 写已经用完 r1_blob；后面的轮次 (iterations > 2) 要读 data_reordered 文件
+            if (r1_blob && iter == 1) { r1_blob.reset(); if (iter + 1 < iterations) join_reorder_write(); }
         }
         double t4_bucket_write = std::chrono::duration<double>(Clock::now() - t4_bw0).count();
 
@@ -8889,23 +10001,25 @@ int run_pipeline_impl(
             if (gres) {
                 // 原始数据已经在内存里: 按 inverse_perm 原地重排后一次顺序写出，
                 // 显存里的常驻数据集同步换到新坐标系。
-                std::vector<DataT> reordered(raw_host.size());
+                // #88: 重排缓冲不清零 (std::vector 的值初始化在单线程里把 400 MB 清零 + 缺页: msTuring1M 0.29 s，
+                // 计时见 OPTIMIZATION_LOG #88)，首次写入就是下面的并行拷贝。内容逐字节不变
+                const size_t n_el = raw_host.size();
+                std::shared_ptr<DataT[]> reordered(new DataT[n_el]);
                 #pragma omp parallel for schedule(static)
                 for (int64_t i = 0; i < N; ++i) {
-                    std::memcpy(reordered.data() + static_cast<size_t>(i) * D,
+                    std::memcpy(reordered.get() + static_cast<size_t>(i) * D,
                                 raw_host.data() + static_cast<size_t>(reorder_info.inverse_perm[i]) * D,
                                 static_cast<size_t>(D) * sizeof(DataT));
                 }
-                raw_host = std::vector<DataT>();
-                auto holder = std::make_shared<std::vector<DataT>>(std::move(reordered));
-                write_reordered_async(data_reordered_path, holder->data(), holder->size(), holder);
+                raw_host = HostRawVec();
+                write_reordered_async(data_reordered_path, reordered.get(), n_el, reordered);
                 gres->permute(reorder_info.inverse_perm);
             } else if (static_cast<size_t>(N) * D * sizeof(DataT) * 2 <= host_raw_budget) {
                 // out-of-core 但原始数据 (两份: 读入 + 重排后) 放得进 CPU 预算的
                 // 1/4: 跟 GPU-resident 一样整份读入、按 inverse_perm 并行重排、一次
                 // 顺序写出 (SIFT1M 128 MB: 1.0 s → ~0.3 s)。超预算时走下面按桶缓冲
                 // 散写的流式 writer (内存只占 bucket_vec_buffer)。
-                std::vector<DataT> raw_all;
+                HostRawVec raw_all;
                 if (ooc_host_raw) {
                     raw_all = std::move(raw_host);   // Step 1 已整份读入 (旧坐标系)
                 } else {
@@ -8915,21 +10029,21 @@ int run_pipeline_impl(
                 if (static_cast<int64_t>(raw_all.size()) != N * static_cast<int64_t>(D) ||
                     static_cast<int64_t>(reorder_info.inverse_perm.size()) != N)
                     throw std::runtime_error("Inline reorder: size mismatch in in-memory path");
-                std::vector<DataT> reordered(raw_all.size());
+                HostRawVec reordered(raw_all.size());
                 #pragma omp parallel for schedule(static)
                 for (int64_t i = 0; i < N; ++i) {
                     std::memcpy(reordered.data() + static_cast<size_t>(i) * D,
                                 raw_all.data() + static_cast<size_t>(reorder_info.inverse_perm[i]) * D,
                                 static_cast<size_t>(D) * sizeof(DataT));
                 }
-                raw_all = std::vector<DataT>();
+                raw_all = HostRawVec();
                 // 重排后的副本就是新坐标系下的原始数据集：round 2..t 继续用它 (后台写文件
                 // 直接用 raw_host 的缓冲，释放 raw_host 之前 join)；否则交给 holder 保活
                 if (ooc_host_raw && iterations > 1) {
                     raw_host = std::move(reordered);
                     write_reordered_async(data_reordered_path, raw_host.data(), raw_host.size(), nullptr);
                 } else {
-                    auto holder = std::make_shared<std::vector<DataT>>(std::move(reordered));
+                    auto holder = std::make_shared<HostRawVec>(std::move(reordered));
                     write_reordered_async(data_reordered_path, holder->data(), holder->size(), holder);
                 }
             } else {
@@ -8971,7 +10085,22 @@ int run_pipeline_impl(
                 const char* win_env = std::getenv("BUCKET2_REORDER_WIN_GB");   // A/B: 窗大小 (GB)，覆盖上面的规则
                 const int64_t win_bytes = win_env ? std::max<int64_t>(1, std::atoll(win_env)) << 30
                                                   : std::max<int64_t>(int64_t(4) << 30, static_cast<int64_t>(host_raw_budget / 2));
-                const int64_t win_rows = std::max<int64_t>(1, std::min<int64_t>(N, win_bytes / row_bytes));
+                // #91: 多轮、整份重排数据放得进 host 预算时单窗: 输入只读一遍 (原来 2 窗各读一遍)，窗缓冲留作
+                // r1_blob (round 2 的重新采样 + round 1 Step 6 直接用，不再从刚写的文件读回)。BUCKET2_R1_BLOB=0 关掉。
+                // 参考 cuVS cagra_ace.cuh::ace_check_use_disk_mode: 放得进内存就走内存模式，放不下才落盘再读
+                bool keep_blob = iterations > 1 && !win_env &&
+                    static_cast<size_t>(N) * static_cast<size_t>(row_bytes) <= host_raw_budget &&
+                    !(std::getenv("BUCKET2_R1_BLOB") && std::getenv("BUCKET2_R1_BLOB")[0] == '0');
+                // S21: r1_blob 记在共用 host 预算上 (r1_blob 的 deleter 释放)；拿不到 → 原来的多窗 + 读文件路径
+                const size_t blob_bytes_s21 = static_cast<size_t>(N) * static_cast<size_t>(row_bytes);
+                if (keep_blob && !g_host_budget.try_reserve(blob_bytes_s21)) {
+                    keep_blob = false;
+                    std::cout << "[HostBudget] r1_blob " << blob_bytes_s21 / 1e9 << " GB denied (used " << g_host_budget.used.load() / 1e9
+                              << " / " << g_host_budget.cap / 1e9 << " GB) -> windowed reorder\n";
+                }
+                const int64_t win_rows = keep_blob ? N : std::max<int64_t>(1, std::min<int64_t>(N, win_bytes / row_bytes));
+                // S18 (user 2026-11-20: Step 4.5 may overlap GPU stages): keep_blob 时 data_reordered 后台写。BUCKET2_REORDER_BG=0 关掉
+                const bool bg_write = keep_blob && !(std::getenv("BUCKET2_REORDER_BG") && std::getenv("BUCKET2_REORDER_BG")[0] == '0');
                 const int64_t chunk_rows = std::max<int64_t>(1, (int64_t(8) << 20) / row_bytes);
                 const int64_t n_chunks = (N + chunk_rows - 1) / chunk_rows;
                 std::unique_ptr<char[]> win(new char[static_cast<size_t>(win_rows * row_bytes)]);
@@ -9003,6 +10132,7 @@ int run_pipeline_impl(
                         }
                     }
                     if (!io_ok) break;
+                    if (bg_write) break;   // S18: 单窗 (keep_blob)，下面交给后台线程写
                     // 窗内容顺序写出 (按 64 MB 片并行)
                     const int64_t wn = (w1 - w0) * row_bytes;
                     const int64_t piece = int64_t(64) << 20;
@@ -9017,8 +10147,37 @@ int run_pipeline_impl(
                     if (!io_ok) break;
                 }
                 ::close(in_fd);
-                if (::close(out_fd) != 0) io_ok = false;
-                if (!io_ok) throw std::runtime_error("Inline reorder: I/O failed writing " + data_reordered_path);
+                if (!bg_write && ::close(out_fd) != 0) io_ok = false;
+                if (!io_ok) { if (bg_write) ::close(out_fd); throw std::runtime_error("Inline reorder: I/O failed writing " + data_reordered_path); }
+                if (keep_blob) {
+                    r1_blob = std::shared_ptr<char[]>(win.release(), [blob_bytes_s21](char* p) { delete[] p; g_host_budget.release(blob_bytes_s21); });
+                    if (bg_write) {
+                        // S18: data_reordered 在后台按 64 MB 片顺序写，每片 sync_file_range 发起回写、等 4 片之前的写完:
+                        // 脏页不超过 ~256 MB，写速跟着磁盘走。S6 (一次全写进页缓存) 让 12.8 GB 脏页跟 round 1 Step 6
+                        // 抢回写 / 页缓存 (+11.6 s)。进程内读这个文件的地方 (iterations > 2 的后续轮、非 blob 路径) 和
+                        // 进程结束前都 join。
+                        std::shared_ptr<char[]> blob = r1_blob;
+                        const int64_t wn = N * row_bytes;
+                        const std::string path = data_reordered_path;
+                        reorder_write = std::async(std::launch::async, [blob, out_fd, wn, hdr_bytes, path, pio] {
+                            const int64_t piece = int64_t(64) << 20;
+                            const int lag = 4;
+                            bool ok = true;
+                            for (int64_t o = 0, k = 0; ok && o < wn; o += piece, ++k) {
+                                const int64_t len = std::min<int64_t>(piece, wn - o);
+                                ok = pio(true, out_fd, blob.get() + o, static_cast<size_t>(len), hdr_bytes + static_cast<off_t>(o));
+                                ::sync_file_range(out_fd, hdr_bytes + static_cast<off_t>(o), len, SYNC_FILE_RANGE_WRITE);
+                                if (k >= lag)
+                                    ::sync_file_range(out_fd, hdr_bytes + static_cast<off_t>(o - lag * piece), piece,
+                                        SYNC_FILE_RANGE_WAIT_BEFORE | SYNC_FILE_RANGE_WRITE | SYNC_FILE_RANGE_WAIT_AFTER);
+                            }
+                            if (::close(out_fd) != 0) ok = false;
+                            if (!ok) throw std::runtime_error("Inline reorder: background write failed " + path);
+                        });
+                    }
+                    std::cout << "  [Step4.5] reordered dataset kept in host memory for round 1 / resample: "
+                              << static_cast<double>(N) * row_bytes / 1e9 << " GB (#91)\n";
+                }
             }
             std::cout << "  Wrote " << data_reordered_path << "\n";
             {
@@ -9104,7 +10263,7 @@ int run_pipeline_impl(
                 // fits_in_gpu 时 X_sampled 就是整份数据集 (sampled_indices = iota)，
                 // 直接在内存里按 inverse_perm 重排，不用重新读盘。
                 auto tresample0 = Clock::now();
-                std::vector<float> X_new(X_sampled.size());
+                HostF32Vec X_new(X_sampled.size());
                 #pragma omp parallel for schedule(static)
                 for (int64_t i = 0; i < N; ++i) {
                     std::memcpy(X_new.data() + static_cast<size_t>(i) * D,
@@ -9117,10 +10276,56 @@ int run_pipeline_impl(
                 std::cout << "  Re-sampling for rounds 2.." << iterations
                           << " from the reordered dataset...\n";
                 auto tresample0 = Clock::now();
+                if (r1_blob && !mem_est.fits_in_gpu) {
+                    // #91: 跟 sample_from 的 !fits_in_gpu 分支同一组采样行 (同 seed、排序)，同样转 float，
+                    // 只是从内存里的重排数据集取，不再读刚写的 data_reordered (结果逐位相同)
+                    working_N = mem_est.sampled_data_rows;
+                    std::vector<int64_t> sorted_order;
+                    const bool reuse_rows = step1_sorted_N == N && step1_sorted_seed == config.seed &&
+                        static_cast<int64_t>(step1_sorted_rows.size()) == working_N &&
+                        !(std::getenv("BUCKET2_RESAMPLE_REUSE") && std::getenv("BUCKET2_RESAMPLE_REUSE")[0] == '0');
+                    if (reuse_rows) {
+                        sorted_order = std::move(step1_sorted_rows);   // #96: 跟下面重新抽的完全相同
+                        step1_sorted_rows.clear(); step1_sorted_rows.shrink_to_fit();
+                    } else {
+                        sorted_order = sample_without_replacement(N, working_N, config.seed);
+                        std::sort(sorted_order.begin(), sorted_order.end());
+                    }
+                    const auto t_rows = Clock::now();
+                    const DataT* src = reinterpret_cast<const DataT*>(r1_blob.get());
+                    X_sampled.resize(static_cast<size_t>(working_N) * D);
+                    int64_t n_bad = 0;
+                    #pragma omp parallel for schedule(static) reduction(+:n_bad)
+                    for (int64_t i = 0; i < working_N; ++i) {
+                        const int64_t r = sorted_order[static_cast<size_t>(i)];
+                        if (r < 0 || r >= N) { ++n_bad; continue; }   // bounds check
+                        const DataT* srow = src + static_cast<size_t>(r) * D;
+                        float* drow = X_sampled.data() + static_cast<size_t>(i) * D;
+                        for (int64_t d = 0; d < D; ++d) drow[d] = static_cast<float>(srow[d]);
+                    }
+                    if (n_bad > 0) throw std::runtime_error("Step 4.5: sampled row out of range");
+                    sampled_indices = std::move(sorted_order);
+                    std::cout << "  Sampled " << working_N << " rows from the in-memory reordered dataset ("
+                              << X_sampled.size() * sizeof(float) / 1e9 << " GB, #91; rows "
+                              << (reuse_rows ? "reused from Step 1" : "redrawn") << " "
+                              << std::fixed << std::setprecision(3)
+                              << std::chrono::duration<double>(t_rows - tresample0).count() << " s, gather "
+                              << std::chrono::duration<double>(Clock::now() - t_rows).count() << " s)\n";
+                    if (std::getenv("BUCKET2_R1_BLOB_CHECK") && std::getenv("BUCKET2_R1_BLOB_CHECK")[0] == '1') {
+                        // 验证: 原来的读文件采样 → 逐字节比较 X_sampled / sampled_indices
+                        auto x_mem = X_sampled; auto i_mem = sampled_indices;
+                        join_reorder_write();
+                        sample_from(working_input_path);
+                        const bool same = x_mem.size() == X_sampled.size() &&
+                            std::memcmp(x_mem.data(), X_sampled.data(), x_mem.size() * sizeof(float)) == 0 && i_mem == sampled_indices;
+                        std::cout << "  [Step4.5] #91 in-memory resample vs file resample: " << (same ? "IDENTICAL" : "DIFFERENT") << "\n";
+                    }
+                } else {
                 // data_reordered 可能还在后台写 (上面的内存重排分支 write_reordered_async)：读之前必须写完，
                 // 否则读到半截文件 (msTuring10M 不带 --kmeans-train-fraction 时 "Failed to read float payload")
                 join_reorder_write();
                 sample_from(working_input_path);
+                }
                 t45_resample = std::chrono::duration<double>(Clock::now() - tresample0).count();
             }
 
@@ -9210,26 +10415,158 @@ int run_pipeline_impl(
             // 每轮开始前先开新文件。
             knn_acc->start_iteration(iter);
 
+            // ---- 多 GPU Step 6 (--num-gpus G > 1): 处理顺序按点数切成 G 段连续区间，每张卡一个线程跑同一个
+            // build_vector_knn_with_tensorcore (各自的 producer / GPU bucket 缓存 / slot / stream)，共用 arrival 累加器
+            // (每卡一条写入 lane，S2；merge 结果跟记录到达顺序无关 → vector_knn 跟单卡相同)。host 缓存预算按卡数平分。
+            auto run_step6 = [&](auto& reader, const std::vector<int32_t>* order_in, const float* seed) {
+                const int G6 = std::max(1, g_num_gpus);
+                const bool spot6 = spot::Client::get().enabled();
+                if (G6 == 1 && !spot6) {
+                    build_vector_knn_with_tensorcore<DataT>(
+                        N, D, reader, graph_ptr, n_centroids, graph_K, neighbors_m, *knn_acc,
+                        centroid_knn_graph_host.data(), K, order_window_arg, step6_cache_bytes,
+                        order_in, config.gpu_bucket_cache_mb << 20, seed);
+                    return;
+                }
+                std::vector<int32_t> order_local;
+                if (!order_in) {   // 跟函数里同一个默认顺序
+                    const int32_t ow = (order_window_arg > 0) ? order_window_arg
+                                                              : std::max<int32_t>(4 * static_cast<int32_t>(K), 16);
+                    order_local = bucket_order::compute_bucket_processing_order(
+                        bucket_order::adjacency_from_flat_graph(centroid_knn_graph_host.data(), n_centroids,
+                                                                static_cast<int32_t>(K)), ow);
+                    order_in = &order_local;
+                }
+                const auto& ord = *order_in;
+                const int32_t npos = static_cast<int32_t>(ord.size());
+                bool shared6 = false;
+                const auto ws6 = spot6 ? spot::make_workers(G6, &shared6) : std::vector<spot::WorkerSpec>{};
+                knn_acc->set_lanes(spot6 ? static_cast<int>(ws6.size()) : G6);   // S2: 每张卡一条写入 lane (spot: 每个 worker 一条)
+                // S3 (scale loop): 按估计代价切，不按点数切。桶 c 的代价 ≈ s_c × pool_c (pool = 自己 + K 个邻居桶，
+                // 跟 max_pool_size_ub 同一个上界) + 每桶固定开销 κ × 平均 s·pool。按点数切时大桶区段的卡慢得多
+                // (SIFT100M G=2 round 1: 51.4 vs 36.9 s，0.76 vs 0.28 ms/桶；S2 之后 50.2 vs 34.5 s)。κ 扫描 (G=2, round 1 / 2 的
+                // GPU0 vs GPU1 loop): κ=0.5 45.4/39.5、39.3/30.8 s；κ=0 36.1/48.6、31.8/38.8 s → 插值平衡点 0.34 / 0.23，取 0.3。
+                // 只改分工 → vector_knn 不变。BUCKET2_S6_CUT=points 退回按点数切；BUCKET2_S6_CUT_FIXED 改 κ。
+                const char* cut_env = std::getenv("BUCKET2_S6_CUT");
+                const bool cut_by_points = cut_env && std::string(cut_env) == "points";
+                double kappa = 0.3;
+                if (const char* e = std::getenv("BUCKET2_S6_CUT_FIXED")) kappa = std::max(0.0, std::atof(e));
+                std::vector<double> wcost(static_cast<size_t>(npos));
+                double tot = 0;
+                for (int32_t p = 0; p < npos; ++p) {
+                    const int32_t c = ord[static_cast<size_t>(p)];
+                    const double s = static_cast<double>(reader.count(c));
+                    double pool = s;
+                    if (!cut_by_points)
+                        for (uint32_t k = 0; k < graph_K; ++k) {   // nprobe 展开后的图 (pool 的真实成员)
+                            const uint32_t nb = graph_ptr[static_cast<size_t>(c) * graph_K + k];
+                            if (nb < static_cast<uint32_t>(n_centroids)) pool += static_cast<double>(reader.count(static_cast<int32_t>(nb)));
+                        }
+                    wcost[static_cast<size_t>(p)] = cut_by_points ? s : s * pool;
+                    tot += wcost[static_cast<size_t>(p)];
+                }
+                if (!cut_by_points && npos > 0) {   // 每桶固定开销
+                    const double fixed = kappa * tot / npos;
+                    for (auto& w : wcost) w += fixed;
+                    tot += fixed * npos;
+                }
+                std::vector<int32_t> cut(static_cast<size_t>(G6) + 1, npos);
+                cut[0] = 0;
+                {
+                    double acc_w = 0; int g = 1;
+                    for (int32_t p = 0; p < npos && g < G6; ++p) {
+                        acc_w += wcost[static_cast<size_t>(p)];
+                        if (acc_w * G6 >= tot * g) cut[static_cast<size_t>(g++)] = p + 1;
+                    }
+                }
+                int dev0 = 0;
+                CUDA_CHECK(cudaGetDevice(&dev0));
+                std::vector<std::thread> th;
+                std::vector<std::exception_ptr> exc(static_cast<size_t>(G6));
+                if (spot6) {
+                    // ---- spot (SPOT_DESIGN §4.2): 单元 = 处理顺序里的位置；初始切分 = 上面的代价切分 (每段预留给该设备的
+                    // spot worker; dedicated: 设备 0 = on-demand worker)，偷按 wcost 对半。每个租约调一次
+                    // build_vector_knn_with_tensorcore([L.begin, end))，同卡 worker 用设备锁串行。lane = worker 下标。
+                    std::vector<int64_t> cuts6(cut.begin(), cut.end());
+                    std::vector<int> owners6;
+                    for (int g = 0; g < G6; ++g) {
+                        int o = -1;
+                        for (size_t w = 0; w < ws6.size(); ++w)
+                            if (ws6[w].device == g && (o < 0 || (ws6[static_cast<size_t>(o)].ondemand && !ws6[w].ondemand))) o = static_cast<int>(w);
+                        owners6.push_back(o);
+                    }
+                    auto sopt6 = spot::options_from_env(shared6);
+                    if (!std::getenv("BUCKET2_SPOT_MIN_STEAL_S")) sopt6.min_steal_s = 4.0;   // 每个租约重建 future_access / 缓存
+                    spot::SegmentScheduler S6("step6", npos, ws6, cuts6, owners6, sopt6, wcost);
+                    std::vector<std::mutex> dev_m(static_cast<size_t>(G6));
+                    exc.assign(ws6.size(), nullptr);
+                    for (size_t w = 0; w < ws6.size(); ++w) {
+                        th.emplace_back([&, w] {
+                            const int g = ws6[w].device;
+                            try {
+                                if (g < 0 || g >= G6) throw std::runtime_error("spot step6: bad worker device");
+                                CUDA_CHECK(cudaSetDevice(g == 0 ? dev0 : g));
+                                S6.run_worker(static_cast<int>(w), [] {}, [&](const spot::Lease& L) {
+                                    std::lock_guard<std::mutex> dl(dev_m[static_cast<size_t>(g)]);
+                                    const int64_t e = S6.end_of(L);
+                                    if (L.begin < 0 || e > npos || L.begin >= e) return;   // bounds check (段被偷空)
+                                    build_vector_knn_with_tensorcore<DataT>(
+                                        N, D, reader, graph_ptr, n_centroids, graph_K, neighbors_m, *knn_acc,
+                                        centroid_knn_graph_host.data(), K, order_window_arg, step6_cache_bytes / G6,
+                                        order_in, config.gpu_bucket_cache_mb << 20, seed,
+                                        static_cast<int32_t>(L.begin), static_cast<int32_t>(e), static_cast<int>(w), &S6, &L);
+                                    CUDA_CHECK(cudaDeviceSynchronize());
+                                }, [] {});
+                            } catch (...) { exc[w] = std::current_exception(); }
+                        });
+                    }
+                    for (auto& t : th) t.join();
+                    CUDA_CHECK(cudaSetDevice(dev0));
+                    for (auto& e : exc) if (e) std::rethrow_exception(e);
+                    S6.print_stats(std::cout);
+                    std::string why;
+                    if (!S6.verify_complete(&why)) throw std::runtime_error("spot step6: incomplete: " + why);
+                    return;
+                }
+                for (int g = 0; g < G6; ++g) {
+                    th.emplace_back([&, g] {
+                        try {
+                            CUDA_CHECK(cudaSetDevice(g == 0 ? dev0 : g));
+                            build_vector_knn_with_tensorcore<DataT>(
+                                N, D, reader, graph_ptr, n_centroids, graph_K, neighbors_m, *knn_acc,
+                                centroid_knn_graph_host.data(), K, order_window_arg, step6_cache_bytes / G6,
+                                order_in, config.gpu_bucket_cache_mb << 20, seed,
+                                cut[static_cast<size_t>(g)], cut[static_cast<size_t>(g) + 1], g);
+                            CUDA_CHECK(cudaDeviceSynchronize());
+                        } catch (...) { exc[static_cast<size_t>(g)] = std::current_exception(); }
+                    });
+                }
+                for (auto& t : th) t.join();
+                CUDA_CHECK(cudaSetDevice(dev0));
+                for (auto& e : exc) if (e) std::rethrow_exception(e);
+                std::cout << "  [Step6] multi-GPU: " << G6 << " devices, position cuts";
+                for (auto c : cut) std::cout << " " << c;
+                std::cout << "\n";
+            };
+
             // round 1: 数据集已经在 Step 4.5 里重排写进 data_reordered.<ext> 了，
             // 直接按 offset 读，不用碰 BucketVectorAccumulator 那份全空的临时
             // 文件（batch_assign_with_cagra_anns 在 round 1 传了 nullptr 跳过
             // 了它）。round 2..t 照旧用 BucketVectorAccumulator。
             if (iter == 0) {
                 // 不能走 blob 模式时 reader 要读 data_reordered 文件: 先等后台写完
-                if (!(ooc_host_raw && static_cast<int64_t>(raw_host.size()) == N * static_cast<int64_t>(D)))
-                    join_reorder_write();
+                if (!(ooc_host_raw && static_cast<int64_t>(raw_host.size()) == N * static_cast<int64_t>(D)) && !r1_blob)
+                    join_reorder_write();   // S18: r1_blob 时 reader 也是 blob 模式，不读文件
                 reordered_io::ReorderedDatasetBucketReader<DataT> reader(
                     working_input_path, D, reorder_offsets_new, reorder_pos_of);
                 // raw_host 这时是重排后的整份数据集 (ooc_host_raw 且多轮时) → blob 模式
                 if (ooc_host_raw && static_cast<int64_t>(raw_host.size()) == N * static_cast<int64_t>(D))
                     reader.set_host_data(raw_host.data(), N);
-                build_vector_knn_with_tensorcore<DataT>(
-                    N, D, reader, graph_ptr,
-                    n_centroids, graph_K, neighbors_m,
-                    *knn_acc,
-                    centroid_knn_graph_host.data(), K,
-                    order_window_arg, step6_cache_bytes,
-                    &bucket_process_order_round1, config.gpu_bucket_cache_mb << 20);
+                else if (r1_blob)   // #91: Step 4.5 单窗重排留下的整份数据 (data_reordered 已同步写完)
+                    reader.set_host_data(reinterpret_cast<const DataT*>(r1_blob.get()), N);
+                run_step6(reader, &bucket_process_order_round1, nullptr);
+                // S18: r1_blob 留到 round 2 的 Step 4 + bucket 写 (见 host_raw_now)；只有 1 轮时这里就放掉
+                if (iterations < 2) r1_blob.reset();
             } else {
                 // bucket 处理顺序在 Step 3 之后已经在后台算好
                 std::vector<int32_t> order_rk = order_future.valid() ? order_future.get()
@@ -9240,14 +10577,8 @@ int run_pipeline_impl(
                 std::vector<float> kth_seed;
                 const bool have_seed = knn_acc->snapshot_kth(kth_seed);
                 std::cout << "  [Step6] k-th seed: " << (have_seed ? "from the last completed merge" : "none yet") << "\n";
-                build_vector_knn_with_tensorcore<DataT>(
-                    N, D, *bucket_vecs_ptr, graph_ptr,
-                    n_centroids, graph_K, neighbors_m,
-                    *knn_acc,
-                    centroid_knn_graph_host.data(), K,
-                    order_window_arg, step6_cache_bytes,
-                    order_rk.empty() ? nullptr : &order_rk, config.gpu_bucket_cache_mb << 20,
-                    have_seed ? kth_seed.data() : nullptr);
+                run_step6(*bucket_vecs_ptr, order_rk.empty() ? nullptr : &order_rk,
+                          have_seed ? kth_seed.data() : nullptr);
             }
             double t6_after_build = std::chrono::duration<double>(Clock::now() - t6).count();
             double t6_build_vector_knn = t6_after_build - t6_topk_expand;
@@ -9395,6 +10726,8 @@ int run_pipeline_impl(
         if (neighbors_m > 0) {
             std::cout << "  Step 6   (Per-vector KNN, merge included):      " << elapsed_step6 << "s\n";
             std::cout << "  Wait     (final iteration's background merge):  " << elapsed_final_merge_wait << "s" << rss_note() << "\n";
+            std::cout << "  [HostBudget] cap " << g_host_budget.cap / 1e9 << " GB (0 = none), peak reserved "
+                      << g_host_budget.peak.load() / 1e9 << " GB, denied/shrunk " << g_host_budget.denied.load() << "\n";   // S21
             std::cout << "  Write    (close + .npy convert):    " << elapsed_write_knn << "s\n";
         }
         std::cout << "  --------------------------------\n";
@@ -9435,6 +10768,8 @@ int run_pipeline_impl(
 //   .ibin      → int32_t
 //   .ubin      → uint32_t
 int main(int argc, char** argv) {
+    // spot 模拟 (BUCKET2_SPOT_DIR): 必须在任何线程 / CUDA 之前 (屏蔽 SIGUSR1、映射 spot_sim.py 的状态文件)
+    spot::Client::get().init();
     try {
         // ---- 提高 RLIMIT_NOFILE ----
         // ChunkedKnnAccumulator 在 Step 6 build 期间给每个 chunk 常驻打开一个
@@ -9486,6 +10821,8 @@ int main(int argc, char** argv) {
                 "Output directory for bucket files")
             ("cpu-limit",     po::value<size_t>(),     "CPU memory limit (bytes)")
             ("gpu-limit",     po::value<size_t>(),     "GPU memory limit (bytes, 0=auto)")
+            ("num-gpus",      po::value<int>(),
+                "Use visible CUDA devices 0..G-1 for the multi-GPU stages (Step 4 batch assignment, Step 6); default 1")
             ("bucket-vec-buffer", po::value<size_t>(),  "Step 4 bucket-vector-cache total write-buffer budget across all buckets (bytes, default 1GB)")
             ("sample-rate",   po::value<float>(),      "Sampling ratio (default 0.1)")
             ("centroid-ratio", po::value<float>(),     "Centroid ratio (default 0.01)")
@@ -9493,6 +10830,13 @@ int main(int argc, char** argv) {
             ("kmeans-train-fraction", po::value<float>(),
                 "Step 2 (dataset fits on GPU): train KMeans|| on this random fraction of the points "
                 "(centroid count stays N*centroid-ratio; default 1.0 = all points)")
+            ("host-budget-mb", po::value<size_t>(),
+                "One host-memory budget in MB shared by all in-memory fast paths (arrival records, bucket records, "
+                "Step 4.5 reordered blob, out-of-core raw data, Step 6 host bucket cache); a fast path that does not fit "
+                "falls back to the disk path (default 0 = no shared cap, per-component caps only)")
+            ("arrival-mem-mb", po::value<size_t>(),
+                "Out-of-core Step 6: keep the per-round arrival records in host memory up to this budget in MB "
+                "(default 0 = all on disk); the rest is written to the chunk files as before")
             ("bucket-mem-mb", po::value<size_t>(),
                 "Rounds 2..t: keep the bucket records (Step 4 → Step 6) in host memory when they fit this budget in MB "
                 "(default 0 = cpu-limit/4); Step 6 then copies GPU-cache misses straight from it")
@@ -9542,6 +10886,27 @@ int main(int argc, char** argv) {
             return 0;
         }
         po::notify(vm);
+        if (vm.count("num-gpus")) {
+            int ndev = 0;
+            if (cudaGetDeviceCount(&ndev) != cudaSuccess) ndev = 1;
+            const int want = vm["num-gpus"].as<int>();
+            if (want < 1) throw std::runtime_error("--num-gpus must be >= 1");
+            if (want > ndev)
+                throw std::runtime_error("--num-gpus " + std::to_string(want) + " > visible CUDA devices (" +
+                                         std::to_string(ndev) + ")");
+            g_num_gpus = want;
+            // 其它卡也各装一个跟 GPU0 一样的 RMM 池 (raft / CAGRA 的临时分配)
+            for (int g = 1; g < g_num_gpus; ++g) {
+                CUDA_CHECK(cudaSetDevice(g));
+                rmm::mr::set_current_device_resource(rmm::mr::pool_memory_resource(
+                    rmm::mr::cuda_memory_resource{}, 256UL * 1024 * 1024, 2UL * 1024 * 1024 * 1024));
+                for (int h = 0; h < g_num_gpus; ++h)   // NVLink peer access (Step 6 / prune / optimize 的设备间拷贝)
+                    if (h != g) { int ok = 0; cudaDeviceCanAccessPeer(&ok, g, h); if (ok) { cudaError_t e = cudaDeviceEnablePeerAccess(h, 0); if (e == cudaErrorPeerAccessAlreadyEnabled) cudaGetLastError(); } }
+            }
+            CUDA_CHECK(cudaSetDevice(0));
+            for (int h = 1; h < g_num_gpus; ++h) { int ok = 0; cudaDeviceCanAccessPeer(&ok, 0, h); if (ok) { cudaError_t e = cudaDeviceEnablePeerAccess(h, 0); if (e == cudaErrorPeerAccessAlreadyEnabled) cudaGetLastError(); } }
+            std::cout << "[main] multi-GPU: " << g_num_gpus << " devices\n";
+        }
 
         std::string input_path  = vm["input"].as<std::string>();
         std::string output_root = vm["output"].as<std::string>();

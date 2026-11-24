@@ -1,0 +1,48 @@
+diff --git a/bucketDemo/buildBucket/src/bucket.cu b/bucketDemo/buildBucket/src/bucket.cu
+index a5b1562..74c361d 100644
+--- a/bucketDemo/buildBucket/src/bucket.cu
++++ b/bucketDemo/buildBucket/src/bucket.cu
+@@ -1943,8 +1943,18 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
+     cudaStream_t copy_stream = nullptr;
+     int pf_slot = 0;
+     std::future<void> io_next;   // 在 raw_batch 之后声明: 先析构 (等后台读 / 传结束)
++    // S17: prefetch_io 时批长 Nv / 4 (显存按 Nv 分配不变): 每卡每轮只有 1–3 个整批时，第一批 (以及比前一批搜索
++    // 更长的读) 没有可重叠的搜索 (SIFT100M G=4 每卡每轮 read 3.5–4.3 s, wall 15 s)。批变小后每批的读盘 + H2D
++    // 都藏在前一批的搜索后面 (读 ~0.2 µs/点 < 搜索 ~0.4 µs/点)。只把第一批缩小没用: 等待挪到第二个整批 (第一版)。
++    // 每个点的 top-2 与分批无关。BUCKET2_STEP4_PF_DIV=1 关掉。参考 TAGORE large_index.cu 的 GPU–CPU–disk 流水线。
++    const int64_t pf_div = std::max<int64_t>(1, std::getenv("BUCKET2_STEP4_PF_DIV")
++                                                  ? std::atoll(std::getenv("BUCKET2_STEP4_PF_DIV")) : 4);
++    auto batch_end_of = [&](int64_t bs) {
++        const int64_t len = prefetch_io ? std::max<int64_t>(1, (Nv + pf_div - 1) / pf_div) : Nv;
++        return std::min(bs + len, nc_end);
++    };
+     auto start_io = [&](int64_t bs, int slot) {
+-        const int64_t be = std::min(bs + Nv, nc_end);
++        const int64_t be = batch_end_of(bs);
+         const int64_t lo = non_centroid_indices[bs], hi = non_centroid_indices[be - 1];
+         T* dst = d_raw_pf[slot];
+         int io_dev = 0;
+@@ -1960,9 +1970,10 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
+     };
+     if (prefetch_io) {
+         size_t max_raw = 0;   // 所有批里最长的 [lo, hi] 区间 (元素)
+-        for (int64_t bs = nc_begin; bs < nc_end; bs += Nv) {
+-            const int64_t be = std::min(bs + Nv, nc_end);
++        for (int64_t bs = nc_begin; bs < nc_end; ) {
++            const int64_t be = batch_end_of(bs);
+             const int64_t lo = non_centroid_indices[bs], hi = non_centroid_indices[be - 1];
++            bs = be;
+             if (lo < 0 || hi >= N || lo > hi)   // bounds check
+                 throw std::runtime_error("batch_assign: prefetch range out of bounds");
+             max_raw = std::max(max_raw, static_cast<size_t>(hi - lo + 1) * D);
+@@ -1972,8 +1983,8 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
+         CUDA_CHECK(cudaMalloc(&d_local_rows, Nv * sizeof(int32_t)));
+         CUDA_CHECK(cudaStreamCreateWithFlags(&copy_stream, cudaStreamNonBlocking));
+     }
+-    for (int64_t batch_start = nc_begin; batch_start < nc_end; batch_start += Nv) {
+-        int64_t batch_end = std::min(batch_start + Nv, nc_end);
++    for (int64_t batch_start = nc_begin, batch_end = 0; batch_start < nc_end; batch_start = batch_end) {
++        batch_end = batch_end_of(batch_start);
+         int64_t batch_size = batch_end - batch_start;
+ 
+         // ---- 4a: 读取 batch 数据 (一次连续区间读)，转换为 CentroidT，上传到 GPU ----

@@ -49,6 +49,15 @@
 #include <boost/program_options.hpp>
 
 #include <cuda_runtime.h>
+#include <cub/device/device_segmented_sort.cuh>
+#include <cub/device/device_scan.cuh>
+#include <thrust/iterator/transform_iterator.h>
+#include <thread>
+#include <mutex>
+#include <future>
+#include <sys/mman.h>
+#include <atomic>
+#include <exception>
 #include <thrust/device_ptr.h>
 #include <thrust/execution_policy.h>
 #include <thrust/scan.h>
@@ -58,6 +67,7 @@
 #include "load.hpp"
 #include "graph_io.hpp"
 #include "edge_chunk_accumulator.hpp"
+#include "translate_graph_ids.hpp"
 
 namespace po = boost::program_options;
 
@@ -101,6 +111,15 @@ static void parallel_pread_file(const std::string& path, off_t off, size_t bytes
 
 // 两块 64 MB pinned 暂存区双缓冲的 H2D / 按行块 D2H (DMA 跟 host 拷贝 / sink 重叠)，
 // 免掉整块 cudaMallocHost (1.28 GB 要 0.7 s) 或 pageable 整块拷贝
+// S10: staging memcpy 的 OpenMP 线程数。多卡时每张卡的线程各自开一个 team，默认 80 线程 × G 个 team 互相抢核 /
+// 内存带宽，H2D 掉到 ~2.4 GB/s/卡 (SIFT100M G=2 count 阶段)；每个 team 只用几个线程就够喂满 PCIe
+// (SIFT10M G=2: count h2d 0.23 → 0.10 s)。G = 1 不变 (0 = OpenMP 默认)。OC_STAGE_THREADS 覆盖 (测试用)。
+static int g_stage_threads = 0;
+static int stage_threads() {
+    static const int env = [] { const char* e = std::getenv("OC_STAGE_THREADS"); return e ? std::max(1, std::atoi(e)) : 0; }();
+    if (env > 0) return env;
+    return g_stage_threads > 0 ? g_stage_threads : omp_get_max_threads();
+}
 struct PinnedStaging {
     static constexpr size_t kChunk = size_t(64) << 20;
     void* pin[2] = {nullptr, nullptr};
@@ -126,7 +145,7 @@ struct PinnedStaging {
             const size_t n = std::min(kChunk, bytes - off);
             if (used[b]) CUDA_CHECK(cudaEventSynchronize(ev[b]));
             const int64_t pieces = static_cast<int64_t>((n + (size_t(1) << 20) - 1) >> 20);
-            #pragma omp parallel for schedule(static)
+            #pragma omp parallel for schedule(static) num_threads(stage_threads())
             for (int64_t i = 0; i < pieces; ++i) {
                 const size_t o = static_cast<size_t>(i) << 20;
                 std::memcpy(static_cast<char*>(pin[b]) + o, static_cast<const char*>(h) + off + o,
@@ -137,6 +156,30 @@ struct PinnedStaging {
             used[b] = true;
         }
         CUDA_CHECK(cudaStreamSynchronize(st));
+    }
+    // 整段 D2H 进 pageable 的 h (按 64 MB 片双缓冲，片内多线程拷出)
+    void d2h(void* h, const void* d, size_t bytes) {
+        if (bytes == 0) return;
+        auto issue = [&](size_t off, int b) {
+            CUDA_CHECK(cudaMemcpyAsync(pin[b], static_cast<const char*>(d) + off, std::min(kChunk, bytes - off),
+                                       cudaMemcpyDeviceToHost, st));
+            CUDA_CHECK(cudaEventRecord(ev[b], st));
+        };
+        issue(0, 0);
+        for (size_t off = 0, k = 0; off < bytes; off += kChunk, ++k) {
+            const int b = static_cast<int>(k & 1);
+            if (off + kChunk < bytes) issue(off + kChunk, b ^ 1);
+            CUDA_CHECK(cudaEventSynchronize(ev[b]));
+            const size_t n = std::min(kChunk, bytes - off);
+            const int64_t pieces = static_cast<int64_t>((n + (size_t(1) << 20) - 1) >> 20);
+            #pragma omp parallel for schedule(static) num_threads(stage_threads())
+            for (int64_t i = 0; i < pieces; ++i) {
+                const size_t o = static_cast<size_t>(i) << 20;
+                std::memcpy(static_cast<char*>(h) + off + o, static_cast<const char*>(pin[b]) + o,
+                            std::min(size_t(1) << 20, n - o));
+            }
+        }
+        used[0] = used[1] = true;
     }
     template <typename Sink>
     void d2h_rows(const uint32_t* d, int64_t N, int w, Sink&& sink) {
@@ -1445,6 +1488,597 @@ __global__ void kern_e_merge(const uint32_t* __restrict__ fwd, const uint32_t* _
     for (int p = 0; p < K_out; ++p) out[j * K_out + p] = row[p];
 }
 
+// =====================================================================
+// #96: Method E 多 chunk 时的反向边 top-K_out 在 GPU 上做 (代替 CPU 的 TopKReverseStore)。
+// 结果定义跟 TopKReverseStore 完全相同: 每个目标点 j 留 (rank, src) 最小的 K_out 条反向边，
+// (rank, src) 升序。键压成 32 位: key = rank << src_bits | src (src < N ≤ 2^src_bits,
+// rank < K_out ≤ 2^rank_bits, rank_bits + src_bits ≤ 32)，排序跟 64 位 (rank << 32 | src) 一致。
+// 同一行里的键两两不同 (同一个 (src, rank) 只对应 src 前向行里的一个位置)，所以选出的集合和
+// 顺序跟边的到达顺序 (atomic) 无关 → Phase 2 输出逐字节相同。
+//   (1) 整张前向图读进 host (Phase 2 也直接在这份上就地 merge，不再重读文件)
+//   (2) 扫一遍: GPU 上数每个 dst 的入度 → host 前缀和 = 全部反向边的 CSR 行偏移
+//   (3) 按显存把 dst 切成几段 (按边数切)，每段再扫一遍前向图，只填 dst 落在段内的边
+//       (atomic 行内游标)，每行一个线程选出最小的 K_out 个、升序写回行首，D2H
+// 显存: 每段 4 B/边 + 12 B/行 + 批缓冲。host: N·K_out·4 (前向图) + 4 B/边 + 8 B/行。
+// OC_GPU_REV=0 退回 CPU TopKReverseStore (A/B、逐字节对比用)。
+// =====================================================================
+// S11: 计数归约 (卡 0 上: dst += src，src 可以是别卡的显存，经 NVLink peer 读)
+__global__ void kern_add_u32(uint32_t* __restrict__ dst, const uint32_t* __restrict__ src, uint64_t n)
+{
+    const uint64_t i = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] += src[i];
+}
+struct U32ToU64 { __host__ __device__ uint64_t operator()(uint32_t x) const { return x; } };
+__global__ void kern_rev_count(const uint32_t* __restrict__ fwd, uint64_t n_elems, uint64_t N,
+                               uint32_t* __restrict__ cnt, unsigned long long* __restrict__ n_bad)
+{
+    const uint64_t t = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (t >= n_elems) return;
+    const uint32_t j = fwd[t];
+    if (j >= N) { atomicAdd(n_bad, 1ull); return; }   // bounds check
+    atomicAdd(&cnt[j], 1u);
+}
+
+// 键 = rank << src_bits | src (KeyT = uint32 放得下时；否则 uint64、src_bits = 32，即 CPU store 的键)
+template <typename KeyT>
+__global__ void kern_rev_fill(const uint32_t* __restrict__ fwd, uint64_t row0, uint32_t rows, uint32_t K,
+                              uint32_t lo, uint32_t hi, const uint64_t* __restrict__ off_rel,
+                              uint32_t* __restrict__ cur, KeyT* __restrict__ keys, uint32_t src_bits,
+                              int* __restrict__ err)
+{
+    const uint64_t t = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (t >= static_cast<uint64_t>(rows) * K) return;
+    const uint32_t j = fwd[t];
+    if (j < lo || j >= hi) return;
+    const uint32_t r = static_cast<uint32_t>(t / K);
+    const uint32_t col = static_cast<uint32_t>(t - static_cast<uint64_t>(r) * K);
+    const uint32_t src = static_cast<uint32_t>(row0 + r);
+    const uint32_t p = atomicAdd(&cur[j - lo], 1u);
+    if (off_rel[j - lo] + p >= off_rel[j - lo + 1]) { atomicExch(err, 1); return; }   // bounds check: 行内游标 ≤ 入度
+    keys[off_rel[j - lo] + p] = (static_cast<KeyT>(col) << src_bits) | static_cast<KeyT>(src);
+}
+
+// S9: 多段 fill —— 一轮里各卡的 dst 段 (按卡号升序、首尾相接) 同时在显存里；每张卡只扫自己的源行，
+// 边直接写进持有 dst 段那张卡的 keys (NVLink peer 写 + peer atomicAdd)。off_rel 是本卡上的只读副本。
+// 参考 cuVS mg/snmg.cuh 分片构建 (每个 rank 只处理自己的 shard)。
+struct RevSegDev { uint32_t lo, hi; const uint64_t* off_rel; uint32_t* cur; void* keys; };
+template <typename KeyT>
+__global__ void kern_rev_fill_multi(const uint32_t* __restrict__ fwd, uint64_t row0, uint32_t rows, uint32_t K,
+                                    const RevSegDev* __restrict__ segs, int nseg, uint32_t src_bits,
+                                    int* __restrict__ err)
+{
+    const uint64_t t = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (t >= static_cast<uint64_t>(rows) * K) return;
+    const uint32_t j = fwd[t];
+    if (j < segs[0].lo || j >= segs[nseg - 1].hi) return;
+    int s = 0;
+    while (s + 1 < nseg && j >= segs[s].hi) ++s;
+    const RevSegDev sd = segs[s];
+    const uint32_t r = static_cast<uint32_t>(t / K);
+    const uint32_t col = static_cast<uint32_t>(t - static_cast<uint64_t>(r) * K);
+    const uint32_t src = static_cast<uint32_t>(row0 + r);
+    const uint32_t jr = j - sd.lo;
+    const uint32_t p = atomicAdd(&sd.cur[jr], 1u);
+    if (sd.off_rel[jr] + p >= sd.off_rel[jr + 1]) { atomicExch(err, 1); return; }   // bounds check: 行内游标 ≤ 入度
+    static_cast<KeyT*>(sd.keys)[sd.off_rel[jr] + p] = (static_cast<KeyT>(col) << src_bits) | static_cast<KeyT>(src);
+}
+
+// L ≤ 64: 每行一个线程，行内 n 个键里最小的 min(n, L) 个，升序写回行首
+template <int LMAX, typename KeyT>
+__global__ void kern_rev_select(const uint64_t* __restrict__ off_rel, uint32_t R, uint32_t L,
+                                KeyT* __restrict__ keys)
+{
+    const uint32_t r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= R) return;
+    KeyT* row = keys + off_rel[r];
+    const uint64_t n = off_rel[r + 1] - off_rel[r];
+    KeyT top[LMAX];
+    uint32_t c = 0;
+    for (uint64_t e = 0; e < n; ++e) {
+        const KeyT key = row[e];
+        uint32_t pos;
+        if (c < L) { pos = c; ++c; }
+        else if (key < top[L - 1]) { pos = L - 1; }
+        else continue;
+        while (pos > 0 && top[pos - 1] > key) { top[pos] = top[pos - 1]; --pos; }
+        top[pos] = key;
+    }
+    for (uint32_t i = 0; i < c; ++i) row[i] = top[i];
+}
+
+// 合并 (跟 edge_chunk::merge_rank_ordered_into_row / kern_e_merge 同一规则): 行 j 的反向源 = 它那段键的前
+// min(n, L) 个 ((rank, src) 升序)，从最弱到最强插入，保护前 K/2 条正向边
+template <int KMAX, typename KeyT>
+__global__ void kern_rev_merge(uint32_t* __restrict__ rows, uint32_t R, int K, const uint64_t* __restrict__ off_rel,
+                               uint32_t r_first, const KeyT* __restrict__ keys, uint32_t L, KeyT src_mask)
+{
+    const uint32_t r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= R) return;
+    uint32_t row[KMAX];
+    uint32_t* gr = rows + static_cast<uint64_t>(r) * K;
+    for (int p = 0; p < K; ++p) row[p] = gr[p];
+    const uint64_t b = off_rel[r_first + r];
+    const uint64_t n = min(off_rel[r_first + r + 1] - b, static_cast<uint64_t>(L));
+    const uint32_t num_protected = static_cast<uint32_t>(K) / 2;
+    for (uint64_t k = n; k > 0; ) {
+        --k;
+        const uint32_t i = static_cast<uint32_t>(keys[b + k] & src_mask);
+        uint32_t pos = static_cast<uint32_t>(K);
+        for (int p = 0; p < K; ++p) if (row[p] == i) { pos = static_cast<uint32_t>(p); break; }
+        if (pos < num_protected) continue;
+        uint32_t num_shift = (pos == static_cast<uint32_t>(K)) ? (K - num_protected - 1) : (pos - num_protected);
+        for (uint32_t sft = num_shift; sft > 0; --sft) row[num_protected + sft] = row[num_protected + sft - 1];
+        row[num_protected] = i;
+    }
+    for (int p = 0; p < K; ++p) gr[p] = row[p];
+}
+
+// =====================================================================
+// #96 / 1B: Method E 多 chunk 时整个反向边 + 合并在 GPU 上做 (代替 CPU TopKReverseStore + CPU 合并)，按 dst 分段流式:
+//   (1) 扫一遍前向图 (host 里整份): GPU 数每个 dst 的入度 → host 前缀和 = 反向边 CSR 行偏移 (8 B/行)
+//   (2) dst 按显存切段 (按边数)；每段: 再扫一遍前向图只填段内的边 → 每行选 (rank, src) 最小的 L = K 个
+//       (L ≤ 64: 每行一个线程；更大: cub 分段排序) → 段内的前向行按 4M 行块传上来、合并、经 pinned 区按行流给 emit
+// 结果跟 CPU 路径逐字节相同 (同一行里键两两不同 → 跟 atomic 到达顺序无关；合并规则相同)。键放不进 32 位
+// (1B: src 30 位 + rank 9 位) 时用 64 位键。host 只多 8 B/行 (不再存全部反向边)；K ≤ 512。
+// =====================================================================
+static int g_num_gpus = 1;   // --num-gpus: GPU 反向合并的设备数 (可见设备 0..G-1)
+struct GpuReverseMerge {
+    double t_count = 0, t_fill = 0, t_select = 0, t_merge = 0, t_h2d = 0;
+    int passes = 0;
+    bool key64 = false, segsort = false, src_split = false, src_resident = false;
+    uint64_t n_edges = 0;
+
+    static constexpr int kMaxK = 512;
+    static bool supported(int64_t n, int32_t k) { return n > 0 && n < (int64_t(1) << 32) && k >= 1 && k <= kMaxK; }
+
+    template <typename Emit>
+    void run(const uint32_t* h_fwd, int64_t N, int32_t K, Emit&& emit) {
+        uint32_t sb = 0; while ((int64_t(1) << sb) < N) ++sb;
+        uint32_t rb = 0; while ((1u << rb) < static_cast<uint32_t>(K)) ++rb;
+        key64 = (sb + rb > 32) || (std::getenv("OC_GPU_REV_KEY64") && std::getenv("OC_GPU_REV_KEY64")[0] == '1');
+        segsort = K > 64;
+        if (key64) run_t<uint64_t>(h_fwd, N, K, 32u, emit);
+        else       run_t<uint32_t>(h_fwd, N, K, sb, emit);
+    }
+
+    int num_gpus = 1;   // 可见设备 0..num_gpus-1
+
+    template <typename KeyT, typename Emit>
+    void run_t(const uint32_t* h_fwd, int64_t N, int32_t K, uint32_t src_bits, Emit& emit) {
+        using Clock = std::chrono::steady_clock;
+        auto secs = [](Clock::time_point a) { return std::chrono::duration<double>(Clock::now() - a).count(); };
+        const int G = std::max(1, num_gpus);
+        const uint32_t L = static_cast<uint32_t>(K);
+        const KeyT src_mask = (src_bits >= 32) ? static_cast<KeyT>(0xFFFFFFFFu) : static_cast<KeyT>((1u << src_bits) - 1u);
+        const uint64_t n_elems = static_cast<uint64_t>(N) * K;
+        int64_t batch_bytes = int64_t(512) << 20;
+        if (const char* e = std::getenv("OC_GPU_REV_BATCH_MB")) batch_bytes = std::max<int64_t>(1, std::atoll(e)) << 20;   // 测试用
+        const uint32_t batch_rows = static_cast<uint32_t>(std::max<int64_t>(1,
+            std::min<int64_t>(N, batch_bytes / (int64_t(K) * 4))));
+        int dev0 = 0;
+        CUDA_CHECK(cudaGetDevice(&dev0));
+        auto dev_of = [&](int g) { return g == 0 ? dev0 : g; };
+        auto run_on_gpus = [&](auto&& fn) {   // fn(g) 在每张卡的线程上 (G = 1: 当前线程)
+            if (G == 1) { fn(0); return; }
+            std::vector<std::thread> th; std::vector<std::exception_ptr> exc(static_cast<size_t>(G));
+            for (int g = 0; g < G; ++g)
+                th.emplace_back([&, g] {
+                    try { CUDA_CHECK(cudaSetDevice(dev_of(g))); fn(g); CUDA_CHECK(cudaDeviceSynchronize()); }
+                    catch (...) { exc[static_cast<size_t>(g)] = std::current_exception(); }
+                });
+            for (auto& t : th) t.join();
+            CUDA_CHECK(cudaSetDevice(dev0));
+            for (auto& e : exc) if (e) std::rethrow_exception(e);
+        };
+        // 一张卡上: 源行 [r_lo, r_hi) 按批传上来，每批跑 fn(r0, rows)
+        auto for_each_batch = [&](PinnedStaging& stg, uint32_t* d_fwd, int64_t r_lo, int64_t r_hi, double& th2d, auto&& fn) {
+            for (int64_t r0 = r_lo; r0 < r_hi; r0 += batch_rows) {
+                const uint32_t rows = static_cast<uint32_t>(std::min<int64_t>(batch_rows, r_hi - r0));
+                auto q = Clock::now();
+                stg.h2d(d_fwd, h_fwd + static_cast<size_t>(r0) * K, static_cast<size_t>(rows) * K * sizeof(uint32_t));
+                th2d += secs(q);
+                fn(r0, rows);
+                // kernel 在默认 stream 上异步读 d_fwd，staging 的 H2D 在另一条 non-blocking stream 上：
+                // 下一批覆盖 d_fwd 之前必须等这一批的 kernel 读完 (#96 第一版漏了这个同步)
+                CUDA_CHECK(cudaStreamSynchronize(cudaStreamLegacy));
+            }
+        };
+
+        // ---- (1) 入度 → 行偏移 (源行按卡切，各卡的部分计数在 host 上相加) ----
+        // 所有卡对之间 P2P + native atomic (S9 源行切分 fill、S11 计数 peer 归约都要)
+        bool p2p_all = G > 1;
+        for (int a = 0; p2p_all && a < G; ++a)
+            for (int b2 = 0; b2 < G; ++b2) {
+                if (a == b2) continue;
+                int can = 0, atom = 0;
+                CUDA_CHECK(cudaDeviceCanAccessPeer(&can, dev_of(a), dev_of(b2)));
+                CUDA_CHECK(cudaDeviceGetP2PAttribute(&atom, cudaDevP2PAttrNativeAtomicSupported, dev_of(a), dev_of(b2)));
+                if (!can || !atom) p2p_all = false;
+            }
+        // S9: 多卡且所有卡对之间有 P2P + native atomic → 源行切分 fill (OC_GPU_REV_SPLIT=0 关掉)
+        bool split = G > 1 && p2p_all;
+        if (const char* e = std::getenv("OC_GPU_REV_SPLIT")) if (e[0] == '0') split = false;
+        // S16: split 时每张卡的源行 [N·g/G, N·(g+1)/G) 若放得进显存 (≤ 30 % 空闲; SIFT100M: G=4 3.2 GB 是，G=2 6.4 GB 否)
+        // 就在 count 时整段留在显存，fill 直接用，不再传第二遍 (OC_GPU_REV_RESIDENT=0 关掉)
+        bool resident = split && !(std::getenv("OC_GPU_REV_RESIDENT") && std::getenv("OC_GPU_REV_RESIDENT")[0] == '0');
+        for (int g = 0; resident && g < G; ++g) {
+            CUDA_CHECK(cudaSetDevice(dev_of(g)));
+            size_t free_b = 0, total_b = 0;
+            CUDA_CHECK(cudaMemGetInfo(&free_b, &total_b));
+            const size_t src_b = static_cast<size_t>(N * (g + 1) / G - N * g / G) * K * sizeof(uint32_t);
+            if (src_b > free_b * 3 / 10) resident = false;
+        }
+        CUDA_CHECK(cudaSetDevice(dev0));
+        std::vector<uint32_t*> d_srcs(static_cast<size_t>(G), nullptr);   // resident: 各卡源行 (count → fill)
+        auto q = Clock::now();
+        // S11: 计数在 GPU 上归约 + 前缀和 (多卡: 别卡的部分计数经 NVLink 直接加到卡 0；cub 扫描出 uint64 行偏移)，
+        // host 只收一次 (N+1)·8 B 的偏移。原来每张卡 D2H N·4 B 计数、host 上相加 + 串行前缀和，
+        // 外加 800 MB 的 off 串行清零 (SIFT100M G=2: d2h 0.35–0.48 s/卡 + alloc ~0.8 s + prefix 0.13 s)。
+        // 结果相同 (整数)。OC_GPU_REV_GPUSCAN=0 走原来的 host 路径。
+        const bool gpu_scan = N <= static_cast<int64_t>(INT32_MAX) && (G == 1 || p2p_all) &&
+            !(std::getenv("OC_GPU_REV_GPUSCAN") && std::getenv("OC_GPU_REV_GPUSCAN")[0] == '0');
+        std::unique_ptr<uint64_t[]> off_buf(new uint64_t[static_cast<size_t>(N) + 1]);   // 不清零: 下面整段写满
+        uint64_t* const off = off_buf.get();
+        {
+            std::vector<uint32_t*> d_cnts(static_cast<size_t>(G), nullptr);   // gpu_scan: 各卡的部分计数留在显存
+            if (gpu_scan && G > 1)
+                run_on_gpus([&](int g) {   // 卡 0 读别卡的计数 (peer)，warm-up 通常已打开
+                    if (g != 0) return;
+                    for (int h = 1; h < G; ++h) {
+                        const cudaError_t e = cudaDeviceEnablePeerAccess(dev_of(h), 0);
+                        if (e == cudaErrorPeerAccessAlreadyEnabled) (void)cudaGetLastError();
+                        else CUDA_CHECK(e);
+                    }
+                });
+            std::vector<std::vector<uint32_t>> part(static_cast<size_t>(G));
+            std::vector<double> th2d(static_cast<size_t>(G), 0.0);
+            std::vector<double> c_setup(static_cast<size_t>(G), 0.0), c_loop(static_cast<size_t>(G), 0.0), c_d2h(static_cast<size_t>(G), 0.0);
+            const auto q_spawn = Clock::now();
+            run_on_gpus([&](int g) {
+                auto qg = Clock::now();
+                c_setup[static_cast<size_t>(g)] = std::chrono::duration<double>(qg - q_spawn).count();   // 线程启动 + setDevice (含 context 创建)
+                PinnedStaging stg;
+                uint32_t* d_fwd = nullptr; uint32_t* d_cnt = nullptr; unsigned long long* d_bad = nullptr;
+                const int64_t r_lo = N * g / G, r_hi = N * (g + 1) / G;
+                if (resident) CUDA_CHECK(cudaMalloc(&d_srcs[static_cast<size_t>(g)], std::max<size_t>(1, static_cast<size_t>(r_hi - r_lo) * K * sizeof(uint32_t))));
+                else CUDA_CHECK(cudaMalloc(&d_fwd, static_cast<size_t>(batch_rows) * K * sizeof(uint32_t)));
+                CUDA_CHECK(cudaMalloc(&d_cnt, static_cast<size_t>(N) * sizeof(uint32_t)));
+                CUDA_CHECK(cudaMalloc(&d_bad, sizeof(unsigned long long)));
+                CUDA_CHECK(cudaMemset(d_cnt, 0, static_cast<size_t>(N) * sizeof(uint32_t)));
+                CUDA_CHECK(cudaMemset(d_bad, 0, sizeof(unsigned long long)));
+                c_setup[static_cast<size_t>(g)] += secs(qg); qg = Clock::now();
+                if (resident) {   // 各批传到 d_src 的各自位置 (不覆盖)，kernel 不用等
+                    uint32_t* d_src = d_srcs[static_cast<size_t>(g)];
+                    for (int64_t r0 = r_lo; r0 < r_hi; r0 += batch_rows) {
+                        const uint32_t rows = static_cast<uint32_t>(std::min<int64_t>(batch_rows, r_hi - r0));
+                        uint32_t* dst = d_src + static_cast<size_t>(r0 - r_lo) * K;
+                        auto qb = Clock::now();
+                        stg.h2d(dst, h_fwd + static_cast<size_t>(r0) * K, static_cast<size_t>(rows) * K * sizeof(uint32_t));
+                        th2d[static_cast<size_t>(g)] += secs(qb);
+                        const uint64_t ne = static_cast<uint64_t>(rows) * K;
+                        kern_rev_count<<<static_cast<unsigned>((ne + 255) / 256), 256>>>(dst, ne, static_cast<uint64_t>(N), d_cnt, d_bad);
+                        CUDA_CHECK(cudaGetLastError());
+                    }
+                } else
+                for_each_batch(stg, d_fwd, r_lo, r_hi, th2d[static_cast<size_t>(g)], [&](int64_t, uint32_t rows) {
+                    const uint64_t ne = static_cast<uint64_t>(rows) * K;
+                    kern_rev_count<<<static_cast<unsigned>((ne + 255) / 256), 256>>>(d_fwd, ne, static_cast<uint64_t>(N), d_cnt, d_bad);
+                    CUDA_CHECK(cudaGetLastError());
+                });
+                CUDA_CHECK(cudaDeviceSynchronize());
+                c_loop[static_cast<size_t>(g)] = secs(qg); qg = Clock::now();
+                unsigned long long h_bad = 0;
+                CUDA_CHECK(cudaMemcpy(&h_bad, d_bad, sizeof(h_bad), cudaMemcpyDeviceToHost));
+                if (h_bad) throw std::runtime_error("GpuReverseMerge: " + std::to_string(h_bad) + " forward entries >= N");
+                if (d_fwd) CUDA_CHECK(cudaFree(d_fwd));
+                CUDA_CHECK(cudaFree(d_bad));
+                if (gpu_scan) {
+                    d_cnts[static_cast<size_t>(g)] = d_cnt;
+                } else {
+                    auto& c = part[static_cast<size_t>(g)];
+                    c.resize(static_cast<size_t>(N));
+                    stg.d2h(c.data(), d_cnt, c.size() * sizeof(uint32_t));
+                    CUDA_CHECK(cudaFree(d_cnt));
+                }
+                c_d2h[static_cast<size_t>(g)] = secs(qg);
+            });
+            const double c_gpu = secs(q_spawn);
+            auto qh = Clock::now();
+            for (double x : th2d) t_h2d = std::max(t_h2d, x);
+            if (gpu_scan) {
+                // 在卡 0 (当前线程的设备 dev0) 上: 加上别卡的计数 → uint64 前缀和 → 一次 D2H
+                uint32_t* d_c0 = d_cnts[0];
+                for (int h = 1; h < G; ++h) {
+                    kern_add_u32<<<static_cast<unsigned>((N + 255) / 256), 256>>>(d_c0, d_cnts[static_cast<size_t>(h)], static_cast<uint64_t>(N));
+                    CUDA_CHECK(cudaGetLastError());
+                }
+                CUDA_CHECK(cudaDeviceSynchronize());
+                for (int h = 1; h < G; ++h) {
+                    CUDA_CHECK(cudaSetDevice(dev_of(h)));
+                    CUDA_CHECK(cudaFree(d_cnts[static_cast<size_t>(h)]));
+                }
+                CUDA_CHECK(cudaSetDevice(dev0));
+                uint64_t* d_off = nullptr;
+                CUDA_CHECK(cudaMalloc(&d_off, (static_cast<size_t>(N) + 1) * sizeof(uint64_t)));
+                CUDA_CHECK(cudaMemset(d_off, 0, sizeof(uint64_t)));
+                auto in_it = thrust::make_transform_iterator(static_cast<const uint32_t*>(d_c0), U32ToU64{});
+                size_t tmp_b = 0;
+                CUDA_CHECK(cub::DeviceScan::InclusiveSum(nullptr, tmp_b, in_it, d_off + 1, static_cast<int>(N)));
+                void* d_tmp = nullptr;
+                CUDA_CHECK(cudaMalloc(&d_tmp, std::max<size_t>(tmp_b, 1)));
+                CUDA_CHECK(cub::DeviceScan::InclusiveSum(d_tmp, tmp_b, in_it, d_off + 1, static_cast<int>(N)));
+                CUDA_CHECK(cudaDeviceSynchronize());
+                CUDA_CHECK(cudaFree(d_tmp)); CUDA_CHECK(cudaFree(d_c0));
+                {
+                    PinnedStaging stg;
+                    stg.d2h(off, d_off, (static_cast<size_t>(N) + 1) * sizeof(uint64_t));
+                }
+                CUDA_CHECK(cudaFree(d_off));
+                std::cout << std::fixed << std::setprecision(2) << "  [Timing] GPU reverse count detail: gpu=" << c_gpu
+                          << "s [per GPU setup/loop:";
+                for (int g = 0; g < G; ++g) std::cout << " " << c_setup[static_cast<size_t>(g)] << "/" << c_loop[static_cast<size_t>(g)] << "(h2d " << th2d[static_cast<size_t>(g)] << ")";
+                std::cout << "] gpu reduce+scan+d2h=" << secs(qh) << "s\n";
+            } else {
+            if (G > 1) {
+                #pragma omp parallel for schedule(static)
+                for (int64_t j = 0; j < N; ++j) {
+                    uint32_t sum = 0;
+                    for (int g = 0; g < G; ++g) sum += part[static_cast<size_t>(g)][static_cast<size_t>(j)];
+                    part[0][static_cast<size_t>(j)] = sum;
+                }
+            }
+            const double c_sum = secs(qh); qh = Clock::now();
+            const auto& cnt = part[0];
+            off[0] = 0;
+            for (int64_t j = 0; j < N; ++j) off[static_cast<size_t>(j) + 1] = off[static_cast<size_t>(j)] + cnt[static_cast<size_t>(j)];
+            const double c_pre = secs(qh);
+            std::cout << std::fixed << std::setprecision(2) << "  [Timing] GPU reverse count detail: alloc(off)+gpu=" << c_gpu
+                      << "s [per GPU setup/loop/d2h:";
+            for (int g = 0; g < G; ++g) std::cout << " " << c_setup[static_cast<size_t>(g)] << "/" << c_loop[static_cast<size_t>(g)] << "(h2d " << th2d[static_cast<size_t>(g)] << ")/" << c_d2h[static_cast<size_t>(g)];
+            std::cout << "] host sum=" << c_sum << "s prefix=" << c_pre << "s\n";
+            }   // !gpu_scan
+        }
+        n_edges = off[static_cast<size_t>(N)];
+        if (n_edges != n_elems) throw std::runtime_error("GpuReverseMerge: edge count mismatch");
+        t_count = secs(q);
+
+        // ---- (2) dst 段: 每边 sizeof(KeyT) (分段排序再 ×2)，每行 off 8 + cur 4 (+ int32 偏移 4)；多卡时至少 G 段 ----
+        const int64_t kSubRows = int64_t(1) << 22;   // 合并时前向行块
+        size_t budget = ~size_t(0);
+        for (int g = 0; g < G; ++g) {
+            CUDA_CHECK(cudaSetDevice(dev_of(g)));
+            size_t free_b = 0, total_b = 0;
+            CUDA_CHECK(cudaMemGetInfo(&free_b, &total_b));
+            const size_t fixed = static_cast<size_t>(batch_rows) * K * 4 + static_cast<size_t>(std::min<int64_t>(N, kSubRows)) * K * 4;
+            budget = std::min(budget, static_cast<size_t>(free_b * 0.85) > fixed ? static_cast<size_t>(free_b * 0.85) - fixed : size_t(64) << 20);
+        }
+        CUDA_CHECK(cudaSetDevice(dev0));
+        if (const char* e = std::getenv("OC_GPU_REV_BUDGET_MB"))   // 测试用: 强制多段
+            budget = std::min(budget, static_cast<size_t>(std::atoll(e)) << 20);
+        const size_t per_edge = sizeof(KeyT) * (segsort ? 2 : 1);
+        // split: 一轮里别卡段的 off_rel 在每张卡上各有一份副本 → 每行约多 8·(G-1) B
+        const size_t per_row = 12 + (segsort ? 4 : 0) + (split ? 8 * static_cast<size_t>(G - 1) : 0);
+        const uint64_t max_seg_edges = segsort ? static_cast<uint64_t>(INT32_MAX) - 1 : ~0ull;   // cub 的 int 下标
+        // 多卡: 段按累计边数切在 k·E/G (k = 1..G-1)，最后一段收尾。原来每段 ≤ ceil(E/G) 条边、在超出前一行停 →
+        // G 段总差几行，多出一个只有几行的尾段轮到卡 0，卡 0 为它再传一遍整张前向图、扫一遍全部边
+        // (SIFT100M: G=2 passes=3, G=4 passes=5)。显存预算 / cub 上限照旧可以多切段 (轮流分给各卡)。
+        std::vector<std::pair<int64_t, int64_t>> segs;
+        for (int64_t lo = 0; lo < N; ) {
+            const uint64_t seg_end_target = (G > 1 && static_cast<int>(segs.size()) < G - 1)
+                ? n_edges * static_cast<uint64_t>(segs.size() + 1) / static_cast<uint64_t>(G) : ~0ull;
+            int64_t hi = lo; size_t need = 0; uint64_t e_acc = 0;
+            while (hi < N) {
+                const uint64_t ce = off[static_cast<size_t>(hi) + 1] - off[static_cast<size_t>(hi)];
+                const size_t add = static_cast<size_t>(ce) * per_edge + per_row;
+                if (hi > lo && (need + add + (size_t(64) << 20) > budget || e_acc + ce > max_seg_edges ||
+                                off[static_cast<size_t>(hi) + 1] > seg_end_target)) break;
+                need += add; e_acc += ce; ++hi;
+            }
+            segs.emplace_back(lo, hi);
+            lo = hi;
+        }
+        passes = static_cast<int>(segs.size());
+        src_split = split; src_resident = resident;
+        std::vector<double> tf(static_cast<size_t>(G), 0.0), tsel(static_cast<size_t>(G), 0.0), tm(static_cast<size_t>(G), 0.0), th2(static_cast<size_t>(G), 0.0);
+        struct SegBuf {
+            int64_t lo = 0, hi = 0; uint32_t R = 0; uint64_t E = 0;
+            uint64_t* d_off = nullptr; uint32_t* d_cur = nullptr; KeyT* d_keys = nullptr; KeyT* d_keys2 = nullptr; int* d_off32 = nullptr;
+        };
+        auto make_off_rel = [&](int64_t lo, int64_t hi) {
+            std::vector<uint64_t> off_rel(static_cast<size_t>(hi - lo) + 1);
+            const uint64_t base = off[static_cast<size_t>(lo)];
+            for (int64_t r = 0; r <= hi - lo; ++r) off_rel[static_cast<size_t>(r)] = off[static_cast<size_t>(lo + r)] - base;
+            return off_rel;
+        };
+        // 段 si 的 dst 缓冲分配在当前卡上 (off_rel / cur / keys)
+        auto alloc_seg = [&](SegBuf& b, size_t si) {
+            b = SegBuf{};
+            b.lo = segs[si].first; b.hi = segs[si].second;
+            b.R = static_cast<uint32_t>(b.hi - b.lo);
+            b.E = off[static_cast<size_t>(b.hi)] - off[static_cast<size_t>(b.lo)];
+            CUDA_CHECK(cudaMalloc(&b.d_off, (static_cast<size_t>(b.R) + 1) * sizeof(uint64_t)));
+            CUDA_CHECK(cudaMalloc(&b.d_cur, static_cast<size_t>(b.R) * sizeof(uint32_t)));
+            CUDA_CHECK(cudaMalloc(&b.d_keys, std::max<size_t>(1, b.E) * sizeof(KeyT)));
+            const auto off_rel = make_off_rel(b.lo, b.hi);
+            CUDA_CHECK(cudaMemcpy(b.d_off, off_rel.data(), off_rel.size() * sizeof(uint64_t), cudaMemcpyHostToDevice));
+            if (segsort) {
+                std::vector<int> o32(off_rel.size());
+                for (size_t i = 0; i < o32.size(); ++i) o32[i] = static_cast<int>(off_rel[i]);
+                CUDA_CHECK(cudaMalloc(&b.d_off32, o32.size() * sizeof(int)));
+                CUDA_CHECK(cudaMemcpy(b.d_off32, o32.data(), o32.size() * sizeof(int), cudaMemcpyHostToDevice));
+            }
+            CUDA_CHECK(cudaMemset(b.d_cur, 0, static_cast<size_t>(b.R) * sizeof(uint32_t)));
+        };
+        auto check_err = [&](int* d_err) {
+            int h_err = 0;
+            CUDA_CHECK(cudaMemcpy(&h_err, d_err, sizeof(int), cudaMemcpyDeviceToHost));
+            if (h_err) throw std::runtime_error("GpuReverseMerge: reverse edge count overflow (fill vs count mismatch)");
+        };
+        // fill 之后 (keys 已齐): select → 段内前向行按块上传 → 合并 → 按行流给 emit (emit 不要求顺序)，释放段缓冲
+        auto finish_seg = [&](int g, PinnedStaging& stg, uint32_t* d_rows, SegBuf& b) {
+            auto qq = Clock::now();
+            const int64_t lo = b.lo, hi = b.hi; const uint32_t R = b.R; const uint64_t E = b.E;
+            CUDA_CHECK(cudaFree(b.d_cur)); b.d_cur = nullptr;
+            const KeyT* d_sel = b.d_keys;
+            if (!segsort) {
+                if (L <= 32) kern_rev_select<32, KeyT><<<(R + 127) / 128, 128>>>(b.d_off, R, L, b.d_keys);
+                else         kern_rev_select<64, KeyT><<<(R + 127) / 128, 128>>>(b.d_off, R, L, b.d_keys);
+                CUDA_CHECK(cudaGetLastError());
+            } else if (E > 0) {
+                CUDA_CHECK(cudaMalloc(&b.d_keys2, E * sizeof(KeyT)));
+                size_t tmp_b = 0;
+                CUDA_CHECK(cub::DeviceSegmentedSort::SortKeys(nullptr, tmp_b, b.d_keys, b.d_keys2, static_cast<int>(E),
+                                                              static_cast<int>(R), b.d_off32, b.d_off32 + 1));
+                void* d_tmp = nullptr;
+                CUDA_CHECK(cudaMalloc(&d_tmp, std::max<size_t>(tmp_b, 1)));
+                CUDA_CHECK(cub::DeviceSegmentedSort::SortKeys(d_tmp, tmp_b, b.d_keys, b.d_keys2, static_cast<int>(E),
+                                                              static_cast<int>(R), b.d_off32, b.d_off32 + 1));
+                CUDA_CHECK(cudaFree(d_tmp));
+                CUDA_CHECK(cudaFree(b.d_keys)); b.d_keys = nullptr;   // 排好的在 d_keys2
+                d_sel = b.d_keys2;
+            }
+            CUDA_CHECK(cudaDeviceSynchronize());
+            tsel[static_cast<size_t>(g)] += secs(qq); qq = Clock::now();
+            for (int64_t s0 = lo; s0 < hi; s0 += kSubRows) {
+                const int64_t s1 = std::min<int64_t>(hi, s0 + kSubRows);
+                const uint32_t n = static_cast<uint32_t>(s1 - s0);
+                stg.h2d(d_rows, h_fwd + static_cast<size_t>(s0) * K, static_cast<size_t>(n) * K * sizeof(uint32_t));
+                const unsigned nb = (n + 127) / 128;
+                const uint32_t rf = static_cast<uint32_t>(s0 - lo);
+                if      (K <= 32)  kern_rev_merge<32,  KeyT><<<nb, 128>>>(d_rows, n, K, b.d_off, rf, d_sel, L, src_mask);
+                else if (K <= 64)  kern_rev_merge<64,  KeyT><<<nb, 128>>>(d_rows, n, K, b.d_off, rf, d_sel, L, src_mask);
+                else if (K <= 128) kern_rev_merge<128, KeyT><<<nb, 128>>>(d_rows, n, K, b.d_off, rf, d_sel, L, src_mask);
+                else if (K <= 256) kern_rev_merge<256, KeyT><<<nb, 128>>>(d_rows, n, K, b.d_off, rf, d_sel, L, src_mask);
+                else               kern_rev_merge<512, KeyT><<<nb, 128>>>(d_rows, n, K, b.d_off, rf, d_sel, L, src_mask);
+                CUDA_CHECK(cudaGetLastError());
+                CUDA_CHECK(cudaDeviceSynchronize());
+                stg.d2h_rows(d_rows, n, K, [&](const uint32_t* rows, int64_t r0, int64_t nn) { emit(rows, s0 + r0, nn); });
+            }
+            tm[static_cast<size_t>(g)] += secs(qq);
+            if (b.d_keys) CUDA_CHECK(cudaFree(b.d_keys));
+            if (b.d_keys2) CUDA_CHECK(cudaFree(b.d_keys2));
+            if (b.d_off32) CUDA_CHECK(cudaFree(b.d_off32));
+            CUDA_CHECK(cudaFree(b.d_off));
+            b = SegBuf{};
+        };
+        if (!split) {
+            // 1 卡 (或无 P2P): 每段由一张卡负责，它把整张前向图按批传一遍，只收落在本段的边
+            run_on_gpus([&](int g) {
+                PinnedStaging stg;
+                uint32_t* d_fwd = nullptr; uint32_t* d_rows = nullptr; int* d_err = nullptr;
+                CUDA_CHECK(cudaMalloc(&d_fwd, static_cast<size_t>(batch_rows) * K * sizeof(uint32_t)));
+                CUDA_CHECK(cudaMalloc(&d_rows, static_cast<size_t>(std::min<int64_t>(N, kSubRows)) * K * sizeof(uint32_t)));
+                CUDA_CHECK(cudaMalloc(&d_err, sizeof(int)));
+                CUDA_CHECK(cudaMemset(d_err, 0, sizeof(int)));
+                for (size_t si = static_cast<size_t>(g); si < segs.size(); si += static_cast<size_t>(G)) {
+                    auto qq = Clock::now();
+                    SegBuf b;
+                    alloc_seg(b, si);
+                    for_each_batch(stg, d_fwd, 0, N, th2[static_cast<size_t>(g)], [&](int64_t r0, uint32_t rows) {
+                        const uint64_t ne = static_cast<uint64_t>(rows) * K;
+                        kern_rev_fill<KeyT><<<static_cast<unsigned>((ne + 255) / 256), 256>>>(d_fwd, static_cast<uint64_t>(r0), rows,
+                            static_cast<uint32_t>(K), static_cast<uint32_t>(b.lo), static_cast<uint32_t>(b.hi), b.d_off, b.d_cur, b.d_keys, src_bits, d_err);
+                        CUDA_CHECK(cudaGetLastError());
+                    });
+                    CUDA_CHECK(cudaDeviceSynchronize());
+                    check_err(d_err);
+                    tf[static_cast<size_t>(g)] += secs(qq);
+                    finish_seg(g, stg, d_rows, b);
+                }
+                CUDA_CHECK(cudaFree(d_rows)); CUDA_CHECK(cudaFree(d_fwd)); CUDA_CHECK(cudaFree(d_err));
+            });
+        } else {
+            // S9 多卡源行切分: 段按轮分配 (第 k 轮卡 g 持有段 k·G+g)。每轮每张卡只把自己的源行
+            // [N·g/G, N·(g+1)/G) 传上来一次，kern_rev_fill_multi 把边直接写进 dst 段所在卡的 keys
+            // (NVLink peer 写 / peer atomic)；以前每张卡每段都要传整张前向图 (PCIe 共享)。
+            // 参考 cuVS mg/snmg.cuh 分片构建: 每个 rank 只处理自己的 shard。
+            struct GpuCtx {
+                std::unique_ptr<PinnedStaging> stg;
+                uint32_t* d_fwd = nullptr; uint32_t* d_rows = nullptr; int* d_err = nullptr; RevSegDev* d_tab = nullptr;
+            };
+            std::vector<GpuCtx> ctx(static_cast<size_t>(G));
+            run_on_gpus([&](int g) {
+                for (int h = 0; h < G; ++h) {
+                    if (h == g) continue;
+                    const cudaError_t e = cudaDeviceEnablePeerAccess(dev_of(h), 0);
+                    if (e == cudaErrorPeerAccessAlreadyEnabled) (void)cudaGetLastError();
+                    else CUDA_CHECK(e);
+                }
+                auto& c = ctx[static_cast<size_t>(g)];
+                c.stg = std::make_unique<PinnedStaging>();
+                CUDA_CHECK(cudaMalloc(&c.d_fwd, static_cast<size_t>(batch_rows) * K * sizeof(uint32_t)));
+                CUDA_CHECK(cudaMalloc(&c.d_rows, static_cast<size_t>(std::min<int64_t>(N, kSubRows)) * K * sizeof(uint32_t)));
+                CUDA_CHECK(cudaMalloc(&c.d_err, sizeof(int)));
+                CUDA_CHECK(cudaMemset(c.d_err, 0, sizeof(int)));
+                CUDA_CHECK(cudaMalloc(&c.d_tab, static_cast<size_t>(G) * sizeof(RevSegDev)));
+            });
+            std::vector<SegBuf> sb(static_cast<size_t>(G));
+            for (size_t s_base = 0; s_base < segs.size(); s_base += static_cast<size_t>(G)) {
+                const int nseg = static_cast<int>(std::min<size_t>(static_cast<size_t>(G), segs.size() - s_base));
+                run_on_gpus([&](int g) {   // 各卡分配自己这一轮的段
+                    auto qq = Clock::now();
+                    if (g < nseg) alloc_seg(sb[static_cast<size_t>(g)], s_base + static_cast<size_t>(g));
+                    tf[static_cast<size_t>(g)] += secs(qq);
+                });
+                run_on_gpus([&](int g) {   // 各卡扫自己的源行，边写到持有 dst 段的卡
+                    auto qq = Clock::now();
+                    auto& c = ctx[static_cast<size_t>(g)];
+                    std::vector<RevSegDev> tab(static_cast<size_t>(nseg));
+                    std::vector<uint64_t*> rep(static_cast<size_t>(nseg), nullptr);   // 别卡段的 off_rel 在本卡的副本 (只读，免得 peer 读)
+                    for (int s = 0; s < nseg; ++s) {
+                        const SegBuf& b = sb[static_cast<size_t>(s)];
+                        const uint64_t* o = b.d_off;
+                        if (s != g) {
+                            const auto off_rel = make_off_rel(b.lo, b.hi);
+                            CUDA_CHECK(cudaMalloc(&rep[static_cast<size_t>(s)], off_rel.size() * sizeof(uint64_t)));
+                            CUDA_CHECK(cudaMemcpy(rep[static_cast<size_t>(s)], off_rel.data(), off_rel.size() * sizeof(uint64_t), cudaMemcpyHostToDevice));
+                            o = rep[static_cast<size_t>(s)];
+                        }
+                        tab[static_cast<size_t>(s)] = RevSegDev{static_cast<uint32_t>(b.lo), static_cast<uint32_t>(b.hi), o, b.d_cur, b.d_keys};
+                    }
+                    CUDA_CHECK(cudaMemcpy(c.d_tab, tab.data(), tab.size() * sizeof(RevSegDev), cudaMemcpyHostToDevice));
+                    const int64_t r_lo = N * g / G, r_hi = N * (g + 1) / G;
+                    if (uint32_t* d_src = d_srcs[static_cast<size_t>(g)]) {   // S16: 源行已在显存
+                        for (int64_t r0 = r_lo; r0 < r_hi; r0 += batch_rows) {
+                            const uint32_t rows = static_cast<uint32_t>(std::min<int64_t>(batch_rows, r_hi - r0));
+                            const uint64_t ne = static_cast<uint64_t>(rows) * K;
+                            kern_rev_fill_multi<KeyT><<<static_cast<unsigned>((ne + 255) / 256), 256>>>(d_src + static_cast<size_t>(r0 - r_lo) * K,
+                                static_cast<uint64_t>(r0), rows, static_cast<uint32_t>(K), c.d_tab, nseg, src_bits, c.d_err);
+                            CUDA_CHECK(cudaGetLastError());
+                        }
+                    } else
+                    for_each_batch(*c.stg, c.d_fwd, r_lo, r_hi, th2[static_cast<size_t>(g)], [&](int64_t r0, uint32_t rows) {
+                        const uint64_t ne = static_cast<uint64_t>(rows) * K;
+                        kern_rev_fill_multi<KeyT><<<static_cast<unsigned>((ne + 255) / 256), 256>>>(c.d_fwd, static_cast<uint64_t>(r0), rows,
+                            static_cast<uint32_t>(K), c.d_tab, nseg, src_bits, c.d_err);
+                        CUDA_CHECK(cudaGetLastError());
+                    });
+                    CUDA_CHECK(cudaDeviceSynchronize());
+                    check_err(c.d_err);
+                    for (auto* p : rep) if (p) CUDA_CHECK(cudaFree(p));
+                    tf[static_cast<size_t>(g)] += secs(qq);
+                });   // run_on_gpus 末尾每张卡 cudaDeviceSynchronize → 所有 peer 写在 finish 之前完成
+                run_on_gpus([&](int g) {
+                    if (g < nseg) {
+                        auto& c = ctx[static_cast<size_t>(g)];
+                        finish_seg(g, *c.stg, c.d_rows, sb[static_cast<size_t>(g)]);
+                    }
+                });
+            }
+            run_on_gpus([&](int g) {
+                auto& c = ctx[static_cast<size_t>(g)];
+                CUDA_CHECK(cudaFree(c.d_rows)); CUDA_CHECK(cudaFree(c.d_fwd)); CUDA_CHECK(cudaFree(c.d_err)); CUDA_CHECK(cudaFree(c.d_tab));
+                if (d_srcs[static_cast<size_t>(g)]) { CUDA_CHECK(cudaFree(d_srcs[static_cast<size_t>(g)])); d_srcs[static_cast<size_t>(g)] = nullptr; }
+                c.stg.reset();
+            });
+        }
+        for (int g = 0; g < G; ++g) {   // 多卡: 各项取最慢那张卡
+            t_fill = std::max(t_fill, tf[static_cast<size_t>(g)]); t_select = std::max(t_select, tsel[static_cast<size_t>(g)]);
+            t_merge = std::max(t_merge, tm[static_cast<size_t>(g)]); t_h2d = std::max(t_h2d, th2[static_cast<size_t>(g)]);
+        }
+    }
+};
+
 // Method E: 单遍扫描 + per-chunk 磁盘 flush 的 scatter buffer（见
 // kern_scatter_rank 和 edge_chunk_accumulator.hpp），rank 保序，不要求
 // forward/output 整图常驻 host。
@@ -1459,6 +2093,124 @@ __global__ void kern_e_merge(const uint32_t* __restrict__ fwd, const uint32_t* _
 // 多 stream 重叠——本机没有 GPU 没法在这上面调优，先保证正确、简单，异步
 // 重叠留作后续在真实硬件上验证过一遍之后再加。
 // =====================================================================
+// #79 进程内 id 翻译 (Method E Phase 2 的结果直接翻回原始 id 顺序写 final_graph.bin)，省掉
+// translate_ids 进程: 它把 N*K_out 的中间图写盘再按 1 GB 窗整份重读 ceil(N*K*4 / 1 GB) 遍
+// (SIFT100M 13 遍 × 12.8 GB, 25 s)。这里每个合并好的行按 inverse_perm 放到原始行位置
+// (值也翻译)，整张原始顺序的图留在内存里，最后一次顺序写出。结果与 translate_ids 逐字节相同。
+// 参考 cuVS cagra_ace.cuh::ace_adjust_sub_graph_ids: 子图 id 在合并时就地换回原始 id。
+// 只在 N*K_out*4 + N*5 B ≤ host 预算 / 4 时启用，否则照旧走 translate_ids (1B 规模)。
+struct InProcessTranslate {
+    int64_t N = 0; int32_t K = 0;
+    std::vector<uint32_t> inv;                 // new id → old id
+    std::unique_ptr<uint32_t[]> fin;           // 原始顺序的最终图 (N, K) (缓冲模式)
+    // S20 mmap 模式: fin 直接是最终输出文件 (MAP_SHARED) 头 12 B 之后的部分，按旧 id 散写就是写文件，
+    // 省掉最后再把 12.8 GB 整块 write 一遍 (同一文件的 buffered write 不随线程数扩展: /dev/shm 1.5–1.8 GB/s,
+    // / 的页缓存 1.0–1.2 GB/s，SIFT100M 7.5–10 s)。脏页由内核回写。是否走进程内翻译仍由 host budget / 4 决定。
+    uint32_t* F = nullptr;                     // 两种模式下 add_rows 都写这里
+    int map_fd = -1; void* map_base = nullptr; size_t map_len = 0;
+    std::vector<uint8_t> hit;                  // 每个原始行被写过 (置换检查)
+    std::atomic<int64_t> n_bad{0};             // 越界 id 计数 (bounds check)；多 GPU 时 add_rows 并发
+    double secs = 0;
+    std::mutex secs_mtx;
+    double t_inv = 0, t_alloc = 0, t_add_sum = 0, t_hit = 0, t_write = 0;   // 细分计时 (add_rows: 各次调用之和)
+    int64_t n_add_calls = 0;
+    static size_t bytes_needed(int64_t n, int32_t k) {
+        return static_cast<size_t>(n) * k * sizeof(uint32_t) + static_cast<size_t>(n) * (sizeof(uint32_t) + 1);
+    }
+    // map_path 非空: mmap 模式 (直接写最终文件)；空: 缓冲模式 (最后整块写出)
+    InProcessTranslate(const std::string& inv_path, int64_t n, int32_t k, const std::string& map_path = "") : N(n), K(k) {
+        auto t0 = std::chrono::steady_clock::now();
+        inv = translate_ids::read_inverse_perm(inv_path, N);
+        auto t1 = std::chrono::steady_clock::now();
+        t_inv = std::chrono::duration<double>(t1 - t0).count();
+        if (!map_path.empty()) {
+            constexpr size_t kHdr = sizeof(int64_t) + sizeof(int32_t);
+            map_len = kHdr + static_cast<size_t>(N) * K * sizeof(uint32_t);
+            map_fd = ::open(map_path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
+            if (map_fd < 0) throw std::runtime_error("InProcessTranslate: cannot create " + map_path);
+            if (::ftruncate(map_fd, static_cast<off_t>(map_len)) != 0) throw std::runtime_error("InProcessTranslate: ftruncate failed " + map_path);
+            map_base = ::mmap(nullptr, map_len, PROT_READ | PROT_WRITE, MAP_SHARED, map_fd, 0);
+            if (map_base == MAP_FAILED) { map_base = nullptr; throw std::runtime_error("InProcessTranslate: mmap failed " + map_path); }
+            char* b = static_cast<char*>(map_base);
+            std::memcpy(b, &N, sizeof(int64_t));
+            std::memcpy(b + sizeof(int64_t), &K, sizeof(int32_t));
+            F = reinterpret_cast<uint32_t*>(b + kHdr);   // 12 B 偏移: 4 B 对齐
+        } else {
+            fin.reset(new uint32_t[static_cast<size_t>(N) * K]);
+            F = fin.get();
+        }
+        hit.assign(static_cast<size_t>(N), 0);
+        t_alloc = std::chrono::duration<double>(std::chrono::steady_clock::now() - t1).count();
+        secs += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    }
+    ~InProcessTranslate() { if (map_base) ::munmap(map_base, map_len); if (map_fd >= 0) ::close(map_fd); }
+    // S20: fin 预先触页 (后台线程，跟读前向图 / GPU count+fill 重叠)，按旧 id 随机散写时不再在 GPU 线程的
+    // emit 里吃首次缺页。fin 本来就整块要写满，峰值内存不变 (仍受 host budget / 4 约束)。
+    double t_prefault = 0;
+    void prefault() {
+        auto t0 = std::chrono::steady_clock::now();
+        const size_t n_el = static_cast<size_t>(N) * K;
+        const int64_t piece = int64_t(1) << 22;   // 16 MB
+        #pragma omp parallel for schedule(static) num_threads(std::max(1, std::min(16, omp_get_max_threads())))
+        for (int64_t o = 0; o < static_cast<int64_t>(n_el); o += piece)
+            std::memset(F + o, 0, static_cast<size_t>(std::min<int64_t>(piece, static_cast<int64_t>(n_el) - o)) * sizeof(uint32_t));
+        t_prefault = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    }
+    // rows = 新 id 空间的第 [r0, r0+n) 行
+    void add_rows(const uint32_t* rows, int64_t r0, int64_t n) {
+        auto t0 = std::chrono::steady_clock::now();
+        if (r0 < 0 || r0 + n > N) throw std::runtime_error("InProcessTranslate: row range out of bounds");
+        int64_t bad = 0;
+        // S20: 多 GPU 时 add_rows 从 G 个 GPU 线程同时调用，每次各开一个默认大小的 OpenMP team 会互相抢核 (同 S10)
+        const int nth = g_num_gpus > 1 ? std::max(4, omp_get_max_threads() / g_num_gpus) : omp_get_max_threads();
+        #pragma omp parallel for reduction(+:bad) schedule(static) num_threads(nth)
+        for (int64_t i = 0; i < n; ++i) {
+            const uint32_t old_row = inv[static_cast<size_t>(r0 + i)];
+            if (old_row >= static_cast<uint64_t>(N)) { ++bad; continue; }   // bounds check
+            hit[old_row] = 1;
+            const uint32_t* src = rows + static_cast<size_t>(i) * K;
+            uint32_t* dst = F + static_cast<size_t>(old_row) * K;
+            for (int32_t k = 0; k < K; ++k) {
+                uint32_t v = src[k];
+                if (v >= static_cast<uint64_t>(N)) { ++bad; v = 0; }        // bounds check
+                dst[k] = inv[v];
+            }
+        }
+        n_bad += bad;
+        std::lock_guard<std::mutex> lk(secs_mtx);
+        const double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        secs += dt; t_add_sum += dt; ++n_add_calls;
+    }
+    void write(const std::string& path) {
+        auto t0 = std::chrono::steady_clock::now();
+        if (n_bad > 0)
+            throw std::runtime_error("Method E: " + std::to_string(n_bad.load()) + " out-of-range ids during id translation");
+        int64_t n_hit = 0;
+        #pragma omp parallel for reduction(+:n_hit) schedule(static)
+        for (int64_t i = 0; i < N; ++i) n_hit += hit[static_cast<size_t>(i)];
+        if (n_hit != N)
+            throw std::runtime_error("Method E: inverse_perm is not a permutation (" + std::to_string(n_hit) +
+                                     " of " + std::to_string(N) + " rows hit)");
+        auto t1 = std::chrono::steady_clock::now();
+        t_hit = std::chrono::duration<double>(t1 - t0).count();
+        if (map_base) {   // mmap 模式: 内容已经在文件里，解除映射即可 (path 就是映射的那个文件)
+            if (::munmap(map_base, map_len) != 0) throw std::runtime_error("Method E: munmap failed for " + path);
+            map_base = nullptr;
+            if (::close(map_fd) != 0) throw std::runtime_error("Method E: close failed for " + path);
+            map_fd = -1;
+        } else {
+            graph_io::StreamingGraphWriter w(path, N, K);
+            w.write_rows(fin.get(), 0, N);
+            if (w.rows_written() != N) throw std::runtime_error("Method E: short write of " + path);
+        }
+        t_write = std::chrono::duration<double>(std::chrono::steady_clock::now() - t1).count();
+        secs += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        std::cout << std::fixed << std::setprecision(2) << "  [Timing] in-process translate detail: read_inv=" << t_inv
+                  << "s alloc=" << t_alloc << "s prefault(bg)=" << t_prefault << "s add_rows(sum over " << n_add_calls << " calls)=" << t_add_sum
+                  << "s hit_check=" << t_hit << "s write=" << t_write << "s\n";
+    }
+};
+
 static void run_method_E(
     const std::string& fwd_path,
     const std::string& out_path,
@@ -1467,7 +2219,9 @@ static void run_method_E(
     size_t gpu_budget_bytes,
     size_t edge_buffer_bytes,
     const std::string& tmp_dir,
-    size_t host_budget_bytes)
+    size_t host_budget_bytes,
+    const std::string& inv_perm_path,   // 跟 final_path 一起给: Phase 2 结果进程内翻回原始 id (#79)
+    const std::string& final_path)
 {
     using Clock = std::chrono::steady_clock;
     const int32_t num_chunks = static_cast<int32_t>(plan.starts.size()) - 1;
@@ -1534,7 +2288,20 @@ static void run_method_E(
     // 单次 drain 且整张前向图一批就进了显存 (batch_rows >= N) 时，Phase 2 也在 GPU 上做
     // (到 drain 的时候再按实际空闲显存确认一次，放不下就退回 CPU Phase 2)
     bool gpu_phase2 = single_drain && static_cast<int64_t>(batch_rows) >= N && K_out <= 64;
+    if (const char* e = std::getenv("OC_GPU_PHASE2")) if (e[0] == '0') gpu_phase2 = false;   // 测试用: 小数据集也走 GpuReverseMerge
     uint32_t* d_gpu_out = nullptr;   // GPU phase 2 的结果 (N, K_out)，写盘时按行块经 pinned 区流出
+    // #96 / 1B: 没走单 chunk GPU phase 2 的情况 (多 chunk，或 K_out > 64 高度数) 反向边 + 合并都在 GPU 上按 dst 分段做
+    // (GpuReverseMerge)，host 只要整张前向图 + 8 B/行
+    const size_t gpu_rev_host_bytes = static_cast<size_t>(N) * K_out * 4 + static_cast<size_t>(N) * 12;
+    const bool gpu_rev = !gpu_phase2 && GpuReverseMerge::supported(N, K_out) &&
+        gpu_rev_host_bytes <= host_budget_bytes / 2 &&
+        !(std::getenv("OC_GPU_REV") && std::getenv("OC_GPU_REV")[0] == '0');
+    if (gpu_rev) {   // 原来 Phase 1 的 chunk / batch / overflow 缓冲用不到，只留象征性大小
+        capacity_per_chunk = 16;
+        chunk_buf_bytes = static_cast<size_t>(num_chunks) * capacity_per_chunk * sizeof(edge_chunk::EdgeRecord);
+        batch_rows = static_cast<uint32_t>(std::min<int64_t>(4096, N));
+        overflow_cap = 1024;
+    }
 
     std::cout << "  [Method E] " << plan.label
               << ", num_chunks=" << num_chunks
@@ -1578,39 +2345,43 @@ static void run_method_E(
     // buffer、经 pinned 暂存区上传，不再整块 cudaMallocHost (SIFT10M 1.28 GB: 0.7 s) +
     // 单线程 ifstream 读；多批时照旧
     const bool single_batch = static_cast<int64_t>(batch_rows) >= N;
-    uint32_t* h_fwd_batch = nullptr;
-    std::unique_ptr<uint32_t[]> h_fwd_page;
-    if (single_batch) h_fwd_page.reset(new uint32_t[static_cast<size_t>(N) * K_out]);
-    else CUDA_CHECK(cudaMallocHost(&h_fwd_batch, static_cast<size_t>(batch_rows) * K_out * sizeof(uint32_t)));
+    // #80: 批缓冲 / overflow / drain 缓冲都改成不清零的 pageable 内存，H2D / D2H 经 PinnedStaging 的
+    // 2 × 64 MB pinned 区 (多线程拷进拷出)，不再整块 cudaMallocHost (SIFT100M 1.9 + 3.7 + 3.4 GB:
+    // 分配 6.5 s、释放 1–3 s，都在关键路径上)；只有真正用到的页才驻留。
+    // 参考 cuVS cagra_build.cuh::build_knn_graph: 小块 pinned 双缓冲 + 大块 host 数据。
+    std::unique_ptr<uint32_t[]> h_fwd_page(new uint32_t[static_cast<size_t>(single_batch ? N : static_cast<int64_t>(batch_rows)) * K_out]);
+    uint32_t* h_fwd_batch = h_fwd_page.get();
     std::vector<uint32_t> h_chunk_count(static_cast<size_t>(num_chunks));
-    edge_chunk::EdgeRecord* h_overflow_buf = nullptr;
-    CUDA_CHECK(cudaMallocHost(&h_overflow_buf, static_cast<size_t>(overflow_cap) * sizeof(edge_chunk::EdgeRecord)));
-    edge_chunk::EdgeRecord* h_drain_buf = nullptr;
-    if (!single_drain)
-        CUDA_CHECK(cudaMallocHost(&h_drain_buf, capacity_per_chunk * sizeof(edge_chunk::EdgeRecord)));
+    std::unique_ptr<edge_chunk::EdgeRecord[]> h_overflow_page(new edge_chunk::EdgeRecord[static_cast<size_t>(overflow_cap)]);
+    edge_chunk::EdgeRecord* h_overflow_buf = h_overflow_page.get();
+    std::unique_ptr<edge_chunk::EdgeRecord[]> h_drain_page;
+    if (!single_drain) h_drain_page.reset(new edge_chunk::EdgeRecord[capacity_per_chunk]);
+    edge_chunk::EdgeRecord* h_drain_buf = h_drain_page.get();
+    PinnedStaging p1_stg;
     double t_alloc_pinned = std::chrono::duration<double>(Clock::now() - t_alloc1).count();
     std::cout << "  [Timing] Alloc: device=" << std::fixed << std::setprecision(2) << t_alloc_device
               << "s, pinned-host=" << t_alloc_pinned << "s\n";
 
     edge_chunk::EdgeVec mem_edges;
-    if (edges_in_memory && !single_drain) mem_edges.reserve(total_edges);
+    if (edges_in_memory && !single_drain && !gpu_rev) mem_edges.reserve(total_edges);
     // 多 chunk 时: 每个点只留 (rank, src) 最小的 K_out 条反向边、放内存 (TopKReverseStore，输出逐字节相同)，
     // 不再写 chunk 文件再读回——SIFT100M 32 GB 的边文件读回时命中/不命中 page cache 能差 ±115 s。
     // 放不下 host 预算的一半 (例如 SIFT1B) 时照旧走磁盘 accumulator。
-    const bool use_store = !edges_in_memory &&
+    const bool use_store = !edges_in_memory && !gpu_rev &&
         edge_chunk::TopKReverseStore::bytes_needed(N, static_cast<uint32_t>(K_out)) <= host_budget_bytes / 2;
     edge_chunk::TopKReverseStore store;
     if (use_store) store.init(N, static_cast<uint32_t>(K_out));
     std::cout << "  [Method E] edges " << (edges_in_memory ? "in memory"
+                                           : gpu_rev ? "in memory, top-K_out per destination selected on GPU (#96)"
                                            : use_store ? "in memory, top-K_out per destination"
                                                        : "via disk accumulator") << "\n";
 
     auto t_acc_create0 = Clock::now();
-    auto acc = (edges_in_memory || use_store)
+    auto acc = (edges_in_memory || use_store || gpu_rev)
         ? edge_chunk::EdgeChunkAccumulator{}
         : edge_chunk::EdgeChunkAccumulator::create(tmp_dir, num_chunks, edge_buffer_bytes,
               static_cast<size_t>(N) * static_cast<size_t>(K_out));
-    if (!edges_in_memory && !use_store) acc.start();
+    if (!edges_in_memory && !use_store && !gpu_rev) acc.start();
     auto add_edges = [&](int32_t c, const edge_chunk::EdgeRecord* recs, size_t n) {
         if (edges_in_memory) mem_edges.insert(mem_edges.end(), recs, recs + n);
         else if (use_store) store.add(recs, n);
@@ -1620,8 +2391,52 @@ static void run_method_E(
     std::cout << "  [Timing] acc.create()+start()=" << std::fixed << std::setprecision(2)
               << t_acc_create << "s\n";
 
+    // S20: 进程内 id 翻译 (#79) 的 inverse_perm 读入 + fin 分配 / 预触页放到后台，从 Phase 1 开始就跟读前向图、
+    // GPU count / fill 重叠；第一次 emit 时才等它 (xl_get)。是否走进程内翻译照旧由 host budget / 4 决定。
+    const bool xl_on = !final_path.empty() && InProcessTranslate::bytes_needed(N, K_out) <= host_budget_bytes / 4;
+    const bool xl_async = !(std::getenv("OC_XL_ASYNC") && std::getenv("OC_XL_ASYNC")[0] == '0');
+    const bool xl_mmap = !(std::getenv("OC_XL_MMAP") && std::getenv("OC_XL_MMAP")[0] == '0');   // S20 mmap 模式 (默认开)
+    std::future<std::unique_ptr<InProcessTranslate>> xl_fut;
+    if (xl_on && xl_async)
+        xl_fut = std::async(std::launch::async, [&inv_perm_path, &final_path, N, K_out, xl_mmap] {
+            auto p = std::make_unique<InProcessTranslate>(inv_perm_path, N, K_out, xl_mmap ? final_path : std::string());
+            p->prefault();
+            return p;
+        });
     // -------- Phase 1: 单遍扫描 forward_graph.bin，散射进 per-chunk buffer --------
     auto tA = Clock::now();
+    GpuReverseMerge grev;
+    std::unique_ptr<uint32_t[]> h_fwd_all;   // gpu_rev: 整张前向图 (反向边的源表 + 合并的底稿)
+    if (gpu_rev) {
+        // S10: 多卡时读前向图 (磁盘, 数秒) 的同时在后台给每张卡建 CUDA context、打开 P2P，
+        // 免得 GpuReverseMerge 的 count 阶段第一次碰其他卡时才付这笔开销 (OC_GPU_WARMUP=0 关掉)
+        std::vector<std::thread> warm;
+        if (g_num_gpus > 1 && !(std::getenv("OC_GPU_WARMUP") && std::getenv("OC_GPU_WARMUP")[0] == '0')) {
+            int dev0 = 0;
+            CUDA_CHECK(cudaGetDevice(&dev0));
+            const int G = g_num_gpus;
+            for (int g = 0; g < G; ++g)
+                warm.emplace_back([g, G, dev0] {   // 设备映射同 GpuReverseMerge::dev_of
+                    auto dev_of = [dev0](int x) { return x == 0 ? dev0 : x; };
+                    if (cudaSetDevice(dev_of(g)) != cudaSuccess) { (void)cudaGetLastError(); return; }
+                    (void)cudaFree(nullptr);
+                    for (int h = 0; h < G; ++h) {
+                        if (h == g) continue;
+                        int can = 0;
+                        if (cudaDeviceCanAccessPeer(&can, dev_of(g), dev_of(h)) == cudaSuccess && can)
+                            (void)cudaDeviceEnablePeerAccess(dev_of(h), 0);
+                    }
+                    (void)cudaGetLastError();   // AlreadyEnabled 等无害错误清掉
+                });
+        }
+        h_fwd_all.reset(new uint32_t[static_cast<size_t>(N) * K_out]);
+        parallel_pread_file(fwd_path, static_cast<off_t>(sizeof(int64_t) + sizeof(int32_t)),
+                            static_cast<size_t>(N) * K_out * sizeof(uint32_t), h_fwd_all.get());
+        for (auto& t : warm) t.join();
+        const double t_phase1 = std::chrono::duration<double>(Clock::now() - tA).count();
+        std::cout << "  [Timing] Phase 1 (read forward graph for the GPU reverse + merge) = " << std::fixed
+                  << std::setprecision(2) << t_phase1 << "s\n";
+    } else
     {
         std::ifstream fwd_in(fwd_path, std::ios::binary);
         if (!fwd_in.is_open())
@@ -1629,26 +2444,30 @@ static void run_method_E(
         fwd_in.seekg(sizeof(int64_t) + sizeof(int32_t), std::ios::beg);  // 跳过 N/K_out header
 
         uint64_t total_in_chunk = 0, total_overflow = 0;
+        double p1_read = 0, p1_h2d = 0, p1_kern = 0, p1_ovf_d2h = 0, p1_ovf_add = 0, p1_drain = 0;
+        auto p1s = [](Clock::time_point a) { return std::chrono::duration<double>(Clock::now() - a).count(); };
 
         for (int64_t bs = 0; bs < N; bs += batch_rows) {
+            auto q1 = Clock::now();
             uint32_t cur_rows = static_cast<uint32_t>(std::min<int64_t>(batch_rows, N - bs));
             size_t n_elems = static_cast<size_t>(cur_rows) * K_out;
 
             if (single_batch) {
                 parallel_pread_file(fwd_path, static_cast<off_t>(sizeof(int64_t) + sizeof(int32_t)),
                                     n_elems * sizeof(uint32_t), h_fwd_page.get());
-                PinnedStaging stg;
-                stg.h2d(d_fwd_batch, h_fwd_page.get(), n_elems * sizeof(uint32_t));
-                h_fwd_page.reset();
+                p1_stg.h2d(d_fwd_batch, h_fwd_page.get(), n_elems * sizeof(uint32_t));
+                h_fwd_page.reset(); h_fwd_batch = nullptr;
             } else {
             // #89: 多线程 pread 进 pinned 批缓冲 (原来单线程 ifstream 顺序读，SIFT100M 7 批 × 1.87 GB)；字节相同
             parallel_pread_file(fwd_path, static_cast<off_t>(sizeof(int64_t) + sizeof(int32_t)) +
                                               static_cast<off_t>(bs) * K_out * static_cast<off_t>(sizeof(uint32_t)),
                                 n_elems * sizeof(uint32_t), h_fwd_batch);
+            p1_read += p1s(q1); q1 = Clock::now();
 
-            CUDA_CHECK(cudaMemcpy(d_fwd_batch, h_fwd_batch,
-                n_elems * sizeof(uint32_t), cudaMemcpyHostToDevice));
+            p1_stg.h2d(d_fwd_batch, h_fwd_batch, n_elems * sizeof(uint32_t));
+            p1_h2d += p1s(q1);
             }
+            q1 = Clock::now();
             CUDA_CHECK(cudaMemset(d_overflow_count, 0, sizeof(uint32_t)));
 
             uint64_t total_edges = static_cast<uint64_t>(cur_rows) * K_out;
@@ -1661,6 +2480,7 @@ static void run_method_E(
                 d_overflow_buf, d_overflow_count, overflow_cap);
             CUDA_CHECK(cudaGetLastError());
             CUDA_CHECK(cudaDeviceSynchronize());
+            p1_kern += p1s(q1); q1 = Clock::now();
 
             CUDA_CHECK(cudaMemcpy(h_chunk_count.data(), d_chunk_count,
                 static_cast<size_t>(num_chunks) * sizeof(uint32_t), cudaMemcpyDeviceToHost));
@@ -1672,8 +2492,8 @@ static void run_method_E(
                     " > " + std::to_string(overflow_cap) +
                     "). Increase --gpu-budget-mb or --edge-buffer-mb.");
             if (ofc > 0) {
-                CUDA_CHECK(cudaMemcpy(h_overflow_buf, d_overflow_buf,
-                    static_cast<size_t>(ofc) * sizeof(edge_chunk::EdgeRecord), cudaMemcpyDeviceToHost));
+                p1_stg.d2h(h_overflow_buf, d_overflow_buf, static_cast<size_t>(ofc) * sizeof(edge_chunk::EdgeRecord));
+                p1_ovf_d2h += p1s(q1); q1 = Clock::now();
                 if (use_store) store.add(h_overflow_buf, ofc);   // 整批插入 (chunk 无关)
                 else
                 for (uint32_t e = 0; e < ofc; ++e) {
@@ -1682,19 +2502,25 @@ static void run_method_E(
                     add_edges(static_cast<int32_t>(c), &h_overflow_buf[e], 1);
                 }
                 total_overflow += ofc;
+                p1_ovf_add += p1s(q1);
             }
 
+            q1 = Clock::now();
             for (int32_t c = 0; c < num_chunks; ++c) {
                 if (!single_drain && h_chunk_count[static_cast<size_t>(c)] >= capacity_per_chunk) {
                     uint32_t take = static_cast<uint32_t>(capacity_per_chunk);
-                    CUDA_CHECK(cudaMemcpy(h_drain_buf, d_chunk_buf + static_cast<size_t>(c) * capacity_per_chunk,
-                        static_cast<size_t>(take) * sizeof(edge_chunk::EdgeRecord), cudaMemcpyDeviceToHost));
+                    p1_stg.d2h(h_drain_buf, d_chunk_buf + static_cast<size_t>(c) * capacity_per_chunk,
+                               static_cast<size_t>(take) * sizeof(edge_chunk::EdgeRecord));
                     add_edges(c, h_drain_buf, take);
                     CUDA_CHECK(cudaMemset(d_chunk_count + c, 0, sizeof(uint32_t)));
                     total_in_chunk += take;
                 }
             }
+            p1_drain += p1s(q1);
         }
+        std::cout << "  [Timing] Phase 1 batches: read=" << std::fixed << std::setprecision(2) << p1_read
+                  << "s h2d=" << p1_h2d << "s kernel=" << p1_kern << "s overflow_d2h=" << p1_ovf_d2h
+                  << "s overflow_add=" << p1_ovf_add << "s drain=" << p1_drain << "s\n";
 
         // 收尾：drain 每个 chunk 剩下没写满的部分
         CUDA_CHECK(cudaMemcpy(h_chunk_count.data(), d_chunk_count,
@@ -1787,8 +2613,8 @@ static void run_method_E(
                 total_in_chunk += take;
                 continue;
             }
-            CUDA_CHECK(cudaMemcpy(h_drain_buf, d_chunk_buf + static_cast<size_t>(c) * capacity_per_chunk,
-                static_cast<size_t>(take) * sizeof(edge_chunk::EdgeRecord), cudaMemcpyDeviceToHost));
+            p1_stg.d2h(h_drain_buf, d_chunk_buf + static_cast<size_t>(c) * capacity_per_chunk,
+                       static_cast<size_t>(take) * sizeof(edge_chunk::EdgeRecord));
             add_edges(c, h_drain_buf, take);
             total_in_chunk += take;
         }
@@ -1803,7 +2629,8 @@ static void run_method_E(
     }
 
     auto t_finish0 = Clock::now();
-    if (!edges_in_memory && !use_store) acc.finish();
+    if (gpu_rev) {}
+    else if (!edges_in_memory && !use_store) acc.finish();
     else if (edges_in_memory && gpu_phase2 ? d_gpu_out == nullptr
                         : edges_in_memory && mem_edges.size() != static_cast<size_t>(N) * static_cast<size_t>(K_out))
         throw std::runtime_error("Method E: in-memory edge count " + std::to_string(mem_edges.size()) +
@@ -1818,9 +2645,7 @@ static void run_method_E(
     cudaFree(d_overflow_buf);
     cudaFree(d_overflow_count);
     cudaFree(d_fwd_batch);
-    cudaFreeHost(h_fwd_batch);
-    cudaFreeHost(h_overflow_buf);
-    cudaFreeHost(h_drain_buf);
+    h_fwd_page.reset(); h_overflow_page.reset(); h_drain_page.reset();
     double t_free = std::chrono::duration<double>(Clock::now() - t_free0).count();
     std::cout << "  [Timing] acc.finish()=" << std::fixed << std::setprecision(2) << t_acc_finish
               << "s, free buffers=" << t_free << "s\n";
@@ -1836,14 +2661,50 @@ static void run_method_E(
             throw std::runtime_error("Method E: cannot reopen " + fwd_path);
         fwd_in2.seekg(sizeof(int64_t) + sizeof(int32_t), std::ios::beg);
 
-        graph_io::StreamingGraphWriter writer(out_path, N, K_out);
+        std::unique_ptr<InProcessTranslate> xl;
+        std::once_flag xl_once;
+        auto xl_get = [&]() -> InProcessTranslate* {   // 后台准备好的翻译器 (第一次调用时等它)
+            if (!xl_on) return nullptr;
+            std::call_once(xl_once, [&] {
+                xl = xl_async ? xl_fut.get()
+                              : std::make_unique<InProcessTranslate>(inv_perm_path, N, K_out, xl_mmap ? final_path : std::string());
+            });
+            return xl.get();
+        };
+        if (!final_path.empty()) {
+            if (xl_on) { /* S20: 已在 Phase 1 开始时后台构造 */ }
+            else
+                std::cout << "  [Method E] in-process id translation needs "
+                          << InProcessTranslate::bytes_needed(N, K_out) / 1e9
+                          << " GB > host budget / 4; writing " << out_path << " for translate_ids\n";
+        }
+        // 翻译时不写中间图 (out_path)，行交给 xl
+        std::unique_ptr<graph_io::StreamingGraphWriter> writer_p;
+        if (!xl_on) writer_p = std::make_unique<graph_io::StreamingGraphWriter>(out_path, N, K_out);
+        std::atomic<int64_t> rows_out{0};
+        auto emit_rows = [&](const uint32_t* rows, int64_t r0, int64_t n) {
+            if (xl_on) xl_get()->add_rows(rows, r0, n);
+            else if (gpu_rev) writer_p->write_rows_at(rows, r0, n);   // GPU 反向合并: 行不一定按序 (多 GPU)
+            else writer_p->write_rows(rows, r0, n);
+            rows_out += n;
+        };
         if (gpu_phase2) {
             PinnedStaging stg;
             stg.d2h_rows(d_gpu_out, N, K_out, [&](const uint32_t* rows, int64_t r0, int64_t n) {
-                writer.write_rows(rows, r0, n);
+                emit_rows(rows, r0, n);
             });
             cudaFree(d_gpu_out); d_gpu_out = nullptr;
             std::cout << "  [Method E] phase 2 on GPU\n";
+        }
+        if (gpu_rev) {
+            grev.num_gpus = g_num_gpus;
+            grev.run(h_fwd_all.get(), N, K_out, emit_rows);
+            std::cout << "  [Timing] GPU reverse + merge: count=" << std::fixed << std::setprecision(2) << grev.t_count
+                      << "s fill=" << grev.t_fill << "s select=" << grev.t_select << "s merge+emit=" << grev.t_merge
+                      << "s (h2d inside=" << grev.t_h2d << "s, passes=" << grev.passes << (grev.src_split ? " src-split" : "") << (grev.src_resident ? " resident" : "") << ", "
+                      << (grev.key64 ? "64" : "32") << "-bit keys, " << (grev.segsort ? "segmented sort" : "per-row insertion")
+                      << ", edges=" << grev.n_edges << ")\n";
+            h_fwd_all.reset();
         }
 
         std::vector<uint32_t> row_block;
@@ -1851,37 +2712,51 @@ static void run_method_E(
         double p2_fwd = 0, p2_edges = 0, p2_csr = 0, p2_merge = 0, p2_write = 0;
         auto p2s = [](Clock::time_point a) { return std::chrono::duration<double>(Clock::now() - a).count(); };
 
-        for (int32_t c = 0; !gpu_phase2 && c < num_chunks; ++c) {
+        for (int32_t c = 0; !gpu_phase2 && !gpu_rev && c < num_chunks; ++c) {
             uint32_t j_lo = plan.starts[static_cast<size_t>(c)];
             uint32_t j_hi = plan.starts[static_cast<size_t>(c) + 1];
             uint32_t chunk_sz = j_hi - j_lo;
 
+            // 前向行按子块 (≤ 4M 行) 读 / 合并 / 输出: row_block 不再是整个 chunk 大小
+            // (SIFT100M 6.4 GB)，给 #79 的整图翻译缓冲腾出内存；输出行仍按升序连续
+            const int64_t sub_rows = std::max<int64_t>(1, std::min<int64_t>(chunk_sz, int64_t(1) << 22));
+            auto read_fwd_rows = [&](int64_t s0, int64_t s1) {
+                row_block.resize(static_cast<size_t>(s1 - s0) * K_out);
+                // 并行 pread 这一段的前向行 (原来单线程 ifstream: SIFT100M read_fwd 11 s)
+                parallel_pread_file(fwd_path,
+                    static_cast<off_t>(sizeof(int64_t) + sizeof(int32_t)) + static_cast<off_t>(j_lo + s0) * K_out * static_cast<off_t>(sizeof(uint32_t)),
+                    row_block.size() * sizeof(uint32_t), row_block.data());
+            };
             auto q0 = Clock::now();
-            row_block.resize(static_cast<size_t>(chunk_sz) * K_out);
-            // 并行 pread 这一块的前向行 (原来单线程 ifstream: SIFT100M read_fwd 11 s)
-            parallel_pread_file(fwd_path,
-                static_cast<off_t>(sizeof(int64_t) + sizeof(int32_t)) + static_cast<off_t>(j_lo) * K_out * static_cast<off_t>(sizeof(uint32_t)),
-                row_block.size() * sizeof(uint32_t), row_block.data());
-
-            p2_fwd += p2s(q0); q0 = Clock::now();
             if (use_store) {
-                // 每行的反向源直接从 store 取 ((rank, src) 升序)，合并规则不变
-                #pragma omp parallel
-                {
-                    std::vector<uint32_t> src(static_cast<size_t>(K_out));
-                    #pragma omp for schedule(dynamic, 4096)
-                    for (int64_t lj = 0; lj < static_cast<int64_t>(chunk_sz); ++lj) {
-                        uint32_t n_src = store.sources(j_lo + static_cast<uint32_t>(lj), src.data());
-                        edge_chunk::merge_rank_ordered_into_row(
-                            row_block.data() + static_cast<size_t>(lj) * K_out,
-                            src.data(), n_src, static_cast<uint32_t>(K_out));
+                for (int64_t s0 = 0; s0 < static_cast<int64_t>(chunk_sz); s0 += sub_rows) {
+                    const int64_t s1 = std::min<int64_t>(chunk_sz, s0 + sub_rows);
+                    q0 = Clock::now();
+                    read_fwd_rows(s0, s1);
+                    uint32_t* rows_p = row_block.data();
+                    p2_fwd += p2s(q0); q0 = Clock::now();
+                    // 每行的反向源直接从 store 取 ((rank, src) 升序)，合并规则不变
+                    #pragma omp parallel
+                    {
+                        std::vector<uint32_t> src(static_cast<size_t>(K_out));
+                        #pragma omp for schedule(dynamic, 4096)
+                        for (int64_t lj = s0; lj < s1; ++lj) {
+                            const uint32_t j = j_lo + static_cast<uint32_t>(lj);
+                            uint32_t n_src = store.sources(j, src.data());
+                            edge_chunk::merge_rank_ordered_into_row(
+                                rows_p + static_cast<size_t>(lj - s0) * K_out,
+                                src.data(), n_src, static_cast<uint32_t>(K_out));
+                        }
                     }
+                    p2_merge += p2s(q0); q0 = Clock::now();
+                    emit_rows(rows_p, j_lo + s0, s1 - s0);
+                    p2_write += p2s(q0);
                 }
-                p2_merge += p2s(q0); q0 = Clock::now();
-                writer.write_rows(row_block.data(), j_lo, chunk_sz);
-                p2_write += p2s(q0);
                 continue;
             }
+            row_block.resize(static_cast<size_t>(chunk_sz) * K_out);
+            read_fwd_rows(0, chunk_sz);
+            p2_fwd += p2s(q0); q0 = Clock::now();
             if (edges_in_memory) chunk_edges = std::move(mem_edges);   // num_chunks == 1
             else acc.read_chunk(c, chunk_edges);
             p2_edges += p2s(q0); q0 = Clock::now();
@@ -1900,17 +2775,24 @@ static void run_method_E(
             }
 
             p2_merge += p2s(q0); q0 = Clock::now();
-            writer.write_rows(row_block.data(), j_lo, chunk_sz);
+            emit_rows(row_block.data(), j_lo, chunk_sz);
             p2_write += p2s(q0);
         }
-        if (!gpu_phase2)
+        if (!gpu_phase2 && !gpu_rev)
             std::cout << "  [Timing] Phase 2 breakdown: read_fwd=" << std::fixed << std::setprecision(2) << p2_fwd
                       << "s read_edges=" << p2_edges << "s csr=" << p2_csr << "s merge=" << p2_merge
                       << "s write=" << p2_write << "s\n";
 
-        if (writer.rows_written() != N)
-            throw std::runtime_error("Method E: wrote " + std::to_string(writer.rows_written()) +
+        if (rows_out.load() != N)
+            throw std::runtime_error("Method E: wrote " + std::to_string(rows_out.load()) +
                                      " rows, expected " + std::to_string(N));
+        if (xl_on) {
+            xl_get();
+            { std::vector<uint32_t>().swap(row_block); }
+            xl->write(final_path);
+            std::cout << "  [Method E] ids translated in-process -> " << final_path
+                      << " [" << std::fixed << std::setprecision(2) << xl->secs << "s incl. write]\n";
+        }
     }
     double t_phase2 = std::chrono::duration<double>(Clock::now() - tB).count();
     std::cout << "  [Timing] Phase 2 (merge + stream write) = " << t_phase2 << "s\n";
@@ -1943,6 +2825,8 @@ int main(int argc, char** argv)
                 "E (per-chunk disk-backed scatter buffer, rank-priority preserving, "
                 "single pass, streams fwd graph + output from/to disk -- doesn't "
                 "require the full graph resident in host memory like A/B/C/D do)")
+            ("num-gpus", po::value<int>()->default_value(1),
+                "Method E GPU reverse + merge: use visible CUDA devices 0..G-1")
             ("gpu-budget-mb", po::value<size_t>()->default_value(8000),
                 "GPU memory budget for chunk buffers (MB)")
             ("host-budget-mb", po::value<size_t>()->default_value(204800),
@@ -1951,6 +2835,12 @@ int main(int argc, char** argv)
             ("edge-buffer-mb", po::value<size_t>()->default_value(1024),
                 "Method E only: total host-side staging budget (MB), shared across all "
                 "chunks' disk-flush buffers -- same semantics as bucket2's --bucket-vec-buffer")
+            ("inverse-perm", po::value<std::string>()->default_value(""),
+                "Method E: inverse_perm.bin (bucket2's reorder). With --final-output the merged graph is translated "
+                "back to the original id order in-process and written to --final-output instead of --output (same "
+                "bytes as translate_ids), when N*K_out*4 + 5N bytes <= host budget / 4; otherwise --output as usual")
+            ("final-output", po::value<std::string>()->default_value(""),
+                "Method E: translated graph path (see --inverse-perm)")
             ("tmp-dir", po::value<std::string>()->default_value(""),
                 "Method E only: scratch directory for per-chunk edge files "
                 "(default: <output dir>/.optimize_chunked_e_tmp, removed on success)")
@@ -1968,15 +2858,29 @@ int main(int argc, char** argv)
         po::store(po::parse_command_line(argc, argv, desc), vm);
         if (vm.count("help")) { std::cout << desc << "\n"; return 0; }
         po::notify(vm);
+        {
+            int ndev = 0;
+            if (cudaGetDeviceCount(&ndev) != cudaSuccess) ndev = 0;
+            g_num_gpus = std::max(1, vm["num-gpus"].as<int>());
+            if (g_num_gpus > 1) g_stage_threads = std::max(4, omp_get_max_threads() / (4 * g_num_gpus));
+            if (g_num_gpus > std::max(ndev, 1))
+                throw std::runtime_error("--num-gpus " + std::to_string(g_num_gpus) + " > visible CUDA devices");
+        }
 
         const std::string fwd_path  = vm["forward-graph"].as<std::string>();
         const std::string out_path  = vm["output"].as<std::string>();
+        const std::string inv_perm_path = vm["inverse-perm"].as<std::string>();
+        const std::string final_path    = vm["final-output"].as<std::string>();
+        if (inv_perm_path.empty() != final_path.empty())
+            throw std::runtime_error("--inverse-perm and --final-output must be given together");
         const std::string method    = vm["method"].as<std::string>();
         const size_t gpu_budget_mb  = vm["gpu-budget-mb"].as<size_t>();
         const size_t gpu_budget_b   = gpu_budget_mb << 20;
         const size_t edge_buffer_mb = vm["edge-buffer-mb"].as<size_t>();
         const size_t edge_buffer_b  = edge_buffer_mb << 20;
-        const size_t host_budget_b  = vm["host-budget-mb"].as<size_t>() << 20;
+        size_t host_budget_b  = vm["host-budget-mb"].as<size_t>() << 20;
+        // 测试用: OC_HOST_BUDGET_MB 覆盖 --host-budget-mb (小上限强制走磁盘 / translate_ids 回退路径做带搜索的检查)
+        if (const char* e = std::getenv("OC_HOST_BUDGET_MB")) host_budget_b = static_cast<size_t>(std::atoll(e)) << 20;
         std::string tmp_dir_arg     = vm["tmp-dir"].as<std::string>();
         const std::string bo_path   = vm["bucket-offsets"].as<std::string>();
         int32_t rev_cap_arg         = vm["rev-degree-cap"].as<int32_t>();
@@ -2026,7 +2930,8 @@ int main(int argc, char** argv)
 
             std::cout << "=== Step 3: Reverse graph + merge (method E) ===\n";
             auto t2 = Clock::now();
-            run_method_E(fwd_path, out_path, N, K_out, plan, gpu_budget_b, edge_buffer_b, tmp_dir, host_budget_b);
+            run_method_E(fwd_path, out_path, N, K_out, plan, gpu_budget_b, edge_buffer_b, tmp_dir, host_budget_b,
+                         inv_perm_path, final_path);
             std::cout << "  Done [" << std::chrono::duration<double>(Clock::now() - t2).count()
                       << "s]\n";
 

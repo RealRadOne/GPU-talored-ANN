@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
-# One full build of the bucket pipeline + quality eval, on GPU 0.
+# One full build of the bucket pipeline + quality eval, on GPU 0 (SMOKE=1: see the lock block).
 #
-#   run_pipeline.sh -d sift1M|sift10M|sift100M [-m auto|large] [-r REPS] [-o OUTDIR] [-q] [-k]
+#   run_pipeline.sh -d DATASET [-m auto|large] [-r REPS] [-o OUTDIR] [-q] [-k]
+#     -d DATASET : a name from datasets.json (sift1M, sift10M, sift100M, msTuring10M, ...);
+#                  vector type from the base file extension (.u8bin / .i8bin / .fbin),
+#                  size-adaptive parameters from dataset_env.py (env values override them)
 #     -m auto  : bucket2 picks GPU-resident vs out-of-core itself; optimize (cuVS
 #                resident prune+reverse) runs if it fits, else falls back to
 #                prune_windowed + optimize_chunked -m E.            (default)
 #     -m large : force the large-dataset path end to end
 #                (bucket2 --out-of-core, prune_windowed, optimize_chunked -m E).
-#     -r REPS  : full build repetitions (median is reported). default 3 (sift10M: 1)
+#     -r REPS  : full build repetitions (median is reported). default: datasets.json "reps"
 #     -q       : skip quality eval (timing only)
 #     -k       : keep the big intermediate files (default: delete after eval)
 #
@@ -17,10 +20,10 @@
 set -uo pipefail
 
 SKILL="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-ROOT=/home/lanlu/microBenchmark
+ROOT="$(cd "$SKILL/../../.." && pwd)"   # the worktree this skill lives in
 BB=$ROOT/bucketDemo/buildBucket
 BIN=$BB/build
-EVAL=$ROOT/bucketDemo/evalCuvs/build/cagra_eval
+EVAL=$ROOT/bucketDemo/evalCuvs/build/cagra_eval   # eval tool (not optimized); worktree build: uint8 / int8 / float32 (P1)
 PY=/home/lanlu/miniconda3/envs/cuvs-bench/bin/python
 source "$SKILL/scripts/params.sh"
 
@@ -31,19 +34,49 @@ while getopts "d:m:r:o:qk" o; do
     q) QUALITY=0 ;; k) KEEP=1 ;; *) sed -n 2,17p "$0"; exit 1 ;;
   esac
 done
-case $DS in
-  sift1M)  BASE=$ROOT/dataset/sift1M/base.1M.u8bin;   : "${REPS:=3}" ;;
-  sift10M) BASE=$ROOT/dataset/sift10M/base.10M.u8bin; : "${REPS:=1}" ;;
-  sift100M) BASE=$ROOT/dataset/sift100M/base.100M.u8bin; : "${REPS:=1}" ;;
-  *) echo "-d sift1M|sift10M|sift100M required"; exit 1 ;;
-esac
-DSDIR=$(dirname "$BASE")
-# SIFT100M (user decision 2026-10-22): 2 build rounds instead of 3, and search with DiskANN's
-# CPU in-memory searcher (cuVS CAGRA search does not fit 100M on the 16 GB GPU)
-[[ $DS == sift100M ]] && ITERATIONS=2
+# 数据集查表 + 按规模自适应的参数 (dataset_env.py；环境变量里显式给的值优先，用于参数扫描)
+ENV_OUT=$("$PY" -I "$SKILL/scripts/dataset_env.py" "$DS") || { echo "$ENV_OUT"; exit 1; }
+eval "$ENV_OUT"
+DSDIR=$DS_DIR
+[[ $MODE == large ]] && DEF_REPS=$DEF_REPS_LARGE
+: "${REPS:=$DEF_REPS}"
+[[ ${B13_DISTS:-0} == 1 ]] && BUCKET2_EXTRA="${BUCKET2_EXTRA/--skip-dists/}"   # B13: prune reads vector_dists.bin
+BUCKET2_EXTRA="$BUCKET2_EXTRA --kmeans-train-fraction $KMEANS_TRAIN_FRACTION --cache-mb $CACHE_MB --bucket-mem-mb $BUCKET_MEM_MB --gpu-bucket-cache-mb $GPU_BUCKET_CACHE_MB"
+(( ${ARRIVAL_MEM_MB:-0} > 0 )) && BUCKET2_EXTRA="$BUCKET2_EXTRA --arrival-mem-mb $ARRIVAL_MEM_MB"   # scale S1 (0 = all on disk / pre-S1 binaries)
+(( ${BUCKET2_HOST_BUDGET_MB:-0} > 0 )) && BUCKET2_EXTRA="$BUCKET2_EXTRA --host-budget-mb $BUCKET2_HOST_BUDGET_MB"   # scale S21 (0 = no shared cap / pre-S21 binaries)
+CHUNKED_EXTRA="$CHUNKED_EXTRA --host-budget-mb $CHUNKED_HOST_BUDGET_MB"
+# MGPU=G (G > 1): multi-GPU build on G free devices (bucket2 Step 4 / Step 6, prune, optimize_chunked
+# get --num-gpus G); select_gpu still guards GPU 0. Single-GPU runs (unset / 1) are unchanged.
+if (( ${MGPU:-1} > 1 )); then
+  BUCKET2_EXTRA="$BUCKET2_EXTRA --num-gpus $MGPU"; PRUNE_EXTRA="$PRUNE_EXTRA --num-gpus $MGPU"; CHUNKED_EXTRA="$CHUNKED_EXTRA --num-gpus $MGPU"
+fi
+export BUCKET2_A1_PASSES=$A1_PASSES   # A1-R local join passes (resident path, #40)
+export BUCKET2_A7_UNWIN=$A7_UNWIN     # A7: unwindowed batched GPU prune (#55)
+echo "[$DS] $DTYPE N=$N D=$DIM reps=$REPS iters=$ITERATIONS ratio=$CENTROID_RATIO nprobe=$NPROBE search=$SEARCH ($ADAPT_NOTE)"
 : "${OUT:=$BB/runs/$(date +%Y%m%d_%H%M%S)_${DS}_${MODE}}"
 mkdir -p "$OUT"
-export CUDA_VISIBLE_DEVICES=0
+# 正式计时排队（user 2026-10-22）：optimize-bucket2 和 optimize-bucket2-tagore 两个 loop 的计时运行
+# 共用这把锁，同一时刻只有一个 pipeline 在测时间（CPU / 磁盘 / page cache 是共用的）。
+# SMOKE=1：冒烟测试，不拿锁、judge 拒收（OUTDIR/SMOKE），跑在 SMOKE_GPU（默认 2，NUMA node 1）上，
+# nice 19、OMP 8 线程、只用 node 1 的核，尽量不干扰另一个 loop 正在计时的运行。
+BENCH_LOCK=/home/lanlu/.bench_locks/bucket2_bench.lock
+if [[ ${SMOKE:-0} == 1 ]]; then
+  GPU=${SMOKE_GPU:-2}; GPU_ORDER="${SMOKE_GPU_ORDER:-2 3 1}"   # never moves to GPU 0: timed runs live there
+  renice -n 19 $$ >/dev/null; taskset -pc 1-79:2 $$ >/dev/null
+  export OMP_NUM_THREADS=${SMOKE_THREADS:-8}
+  touch "$OUT/SMOKE"
+  # 冒烟测试可以用别的 build 目录 (改动中的代码不编进 build/，计时运行只用 build/)
+  [[ -n ${BUCKET2_BIN_DIR:-} ]] && BIN=$BUCKET2_BIN_DIR
+else
+  GPU=0; rm -f "$OUT/SMOKE"   # preferred GPU; select_gpu moves off it if it is taken
+  mkdir -p "$(dirname "$BENCH_LOCK")"
+  exec 9>>"$BENCH_LOCK"
+  if ! flock -n 9; then
+    echo "[bench lock] busy, waiting: $(cat "$BENCH_LOCK.owner" 2>/dev/null)"; flock 9
+  fi
+  echo "$$ $(date +%F_%T) $SKILL $* -> $OUT" > "$BENCH_LOCK.owner"
+fi
+source "$SKILL/scripts/gpu_select.sh"
 
 TAG="k${KNN_K}p${NPROBE}m${NEIGHBORS_M}t${ITERATIONS}"
 timed() {  # timed NAME CMD... -> $OUT/rep$R/NAME.{log,time}; returns cmd exit code
@@ -52,13 +85,72 @@ timed() {  # timed NAME CMD... -> $OUT/rep$R/NAME.{log,time}; returns cmd exit c
   /usr/bin/time -f "%e %M" -o "$RD/$name.time" stdbuf -oL -eL "$@" > "$RD/$name.log" 2>&1
 }
 
+# 这一次运行作废重跑的条件：跑的过程中 GPU 上出现了别人的进程（我们自己的进程此时都已退出）。
+# 返回 0 = 重跑这次（调用方 continue），否则按 FAILED 退出
+GPU_RETRIES=0
+rep_retry_or_fail() {  # rep_retry_or_fail STAGE
+  kill "$SMI" 2>/dev/null; wait "$SMI" 2>/dev/null
+  spot_stop
+  if ! gpu_is_free "$GPU" && (( GPU_RETRIES < 10 )); then
+    GPU_RETRIES=$((GPU_RETRIES + 1))
+    echo "[gpu] GPU $GPU taken by another process during rep $R (stage $1): discarding this rep, rerunning"
+    rm -rf "$RD"; R=$((R - 1)); return 0
+  fi
+  echo "$1 FAILED"; exit 3
+}
+
+# ---- spot simulation (optimize-bucket2-spot, branch spot/bucket2) ----
+# SPOT=1: replay SPOT_TRACE (CSV; empty = no events) with spot_sim.py during bucket2 + prune, scale SPOT_SCALE
+# (trace s per real s, default 60), optional SPOT_NOTICE_REAL_S; bucket2 / prune_windowed read the state file via
+# BUCKET2_SPOT_DIR (src/spot_sched.hpp). optimize_chunked stays single-GPU on the on-demand device (user 2026-11-20).
+SPOT_SIM=$ROOT/.claude/skills/optimize-bucket2-spot/scripts/spot_sim.py
+SPOT_DIR=""; SPOT_PID=""
+spot_start() {
+  [[ ${SPOT:-0} == 1 ]] || return 0
+  SPOT_DIR=/dev/shm/spot_sim/$(basename "$OUT")_rep${R}_$$; rm -rf "$SPOT_DIR"; mkdir -p "$SPOT_DIR"
+  local na=(); [[ -n ${SPOT_NOTICE_REAL_S:-} ]] && na=(--notice-real-s "$SPOT_NOTICE_REAL_S")
+  "$PY" -I "$SPOT_SIM" run --trace "${SPOT_TRACE:-}" --dir "$SPOT_DIR" --n-inst "${MGPU:-1}" --scale "${SPOT_SCALE:-60}" \
+    "${na[@]}" --log "$RD/spot_events.log" > /dev/null 2>&1 9>&- &
+  SPOT_PID=$!
+  export BUCKET2_SPOT_DIR=$SPOT_DIR
+  echo "${SPOT_TRACE:-none} scale=${SPOT_SCALE:-60} notice_real_s=${SPOT_NOTICE_REAL_S:-scaled} mode=${BUCKET2_SPOT_MODE:-default}" > "$RD/spot.txt"
+}
+spot_stop() {
+  [[ -n $SPOT_PID ]] && { kill "$SPOT_PID" 2>/dev/null; wait "$SPOT_PID" 2>/dev/null; }
+  [[ -n $SPOT_DIR ]] && rm -rf "$SPOT_DIR"
+  SPOT_PID=""; SPOT_DIR=""; unset BUCKET2_SPOT_DIR
+}
+trap spot_stop EXIT
+# optimize_chunked: single GPU in spot AND plain runs on this branch (user 2026-11-23: same optimize for both, so
+# plain vs spot compares only the spot stages); OPT_MGPU=1 restores multi-GPU optimize for plain runs.
+if (( ${MGPU:-1} > 1 )) && [[ ${SPOT:-0} == 1 || ${OPT_MGPU:-0} != 1 ]]; then CHUNKED_EXTRA="${CHUNKED_EXTRA/--num-gpus $MGPU/--num-gpus 1}"; fi
+
 for ((R = 0; R < REPS; R++)); do
+  select_gpu
+  MGPU_LIST=""
+  if (( ${MGPU:-1} > 1 )); then   # MGPU: G free devices (other users' jobs change Step 4 batching + timing)
+    MW=0
+    while :; do
+      free=(); for g in $GPU_ORDER; do gpu_is_free "$g" && free+=("$g"); done   # preference order (gpu_select.sh: 2 3 0 1, agreement 2026-11-19)
+      fs=" ${free[*]} "
+      if (( MGPU == 2 )); then   # same NUMA node first, our pair 2,3 before 0,1 (GPU 0,1 = node 0; 2,3 = node 1), all pairs are NVLink
+        for pr in "2 3" "0 1"; do read -r ga gb <<< "$pr"; [[ $fs == *" $ga "* && $fs == *" $gb "* ]] && { MGPU_LIST="$ga,$gb"; break; }; done
+      fi
+      [[ -z $MGPU_LIST ]] && (( ${#free[@]} >= MGPU )) && MGPU_LIST=$(IFS=,; echo "${free[*]:0:MGPU}")
+      [[ -n $MGPU_LIST ]] && break
+      (( MW % 600 == 0 )) && echo "GPU_WAIT $(date +%F_%T): MGPU=$MGPU, free GPU(s): ${free[*]:-none}"
+      sleep 60; MW=$((MW + 60))
+    done
+    export CUDA_VISIBLE_DEVICES=$MGPU_LIST; GPU=${MGPU_LIST%%,*}   # end-of-rep "GPU taken" check watches our first device
+    echo "[gpu] MGPU=$MGPU on GPUs $MGPU_LIST"
+  fi
   RD=$OUT/rep$R; W=$RD/work; mkdir -p "$W"
-  echo "[$DS/$MODE rep $R] -> $RD"
-  # GPU-0 memory sampler (MiB), for the peak-memory guard
-  nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -i 0 -lms 200 > "$RD/gpu_mem.txt" &
+  echo "${MGPU_LIST:-$GPU}" > "$RD/gpu.txt"
+  echo "[$DS/$MODE rep $R, GPU $GPU] -> $RD"
+  # GPU memory sampler (MiB), for the peak-memory guard
+  nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -i "${MGPU_LIST:-$GPU}" -lms 200 > "$RD/gpu_mem.txt" 9>&- &
   SMI=$!
-  sync; echo 3 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null 2>&1 || true
+  [[ ${SMOKE:-0} == 1 ]] || { sync; echo 3 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null 2>&1 || true; }
 
   B2_FLAGS=(-i "$BASE" -o "$W" --centroid-ratio "$CENTROID_RATIO" --seed "$SEED"
             --knn-k "$KNN_K" --nprobe "$NPROBE" --neighbors-m "$NEIGHBORS_M" -t "$ITERATIONS")
@@ -66,8 +158,9 @@ for ((R = 0; R < REPS; R++)); do
   # GPU-resident path: bucket2 does prune + reverse edges + id translation in-process
   # and writes final_graph.bin itself (user decision 2026-10-21); out-of-core ignores it
   [[ $MODE == auto ]] && B2_FLAGS+=(--fused-optimize-degree "$OUTPUT_DEGREE")
+  spot_start
   # shellcheck disable=SC2086
-  timed bucket2 "$BIN/bucket2" "${B2_FLAGS[@]}" $BUCKET2_EXTRA || { echo "bucket2 FAILED"; kill $SMI; exit 3; }
+  timed bucket2 "$BIN/bucket2" "${B2_FLAGS[@]}" $BUCKET2_EXTRA || { rep_retry_or_fail bucket2; continue; }
   O=$W/$TAG
 
   PATH_USED=resident
@@ -76,48 +169,59 @@ for ((R = 0; R < REPS; R++)); do
     FUSED=1   # resident path finished inside bucket2 (optimize + translate_ids folded in)
   elif [[ $MODE == auto ]]; then
     # shellcheck disable=SC2086
-    timed optimize "$BIN/optimize" -i "$O/data_reordered.u8bin" -g "$O/vector_knn.bin" \
+    timed optimize "$BIN/optimize" -i "$O/data_reordered$EXT" -g "$O/vector_knn.bin" \
       -o "$O/graph_new_ids.bin" --output-degree "$OUTPUT_DEGREE" $OPTIMIZE_EXTRA
     rc=$?
     if [[ $rc -eq 2 ]]; then PATH_USED=large; rm -f "$RD/optimize.time"
-    elif [[ $rc -ne 0 ]]; then echo "optimize FAILED"; kill $SMI; exit 3; fi
+    elif [[ $rc -ne 0 ]]; then rep_retry_or_fail optimize; continue; fi
   else
     PATH_USED=large
   fi
   if [[ $PATH_USED == large ]]; then
     # shellcheck disable=SC2086
-    timed prune "$BIN/prune_windowed" -k "$O/vector_knn.bin" -i "$O/data_reordered.u8bin" \
+    timed prune "$BIN/prune_windowed" -k "$O/vector_knn.bin" -i "$O/data_reordered$EXT" \
       --bucket-offsets "$O/bucket_offsets.bin" --bucket-process-order "$O/bucket_process_order.bin" \
       -c "$O/centroid_knn.bin" -o "$O/forward_graph_reordered.bin" \
       --output-degree "$OUTPUT_DEGREE" --cache-mb "$PRUNE_CACHE_MB" $PRUNE_EXTRA \
-      || { echo "prune FAILED"; kill $SMI; exit 3; }
+      $( [[ ${A4_POOL:-0} == 1 ]] && echo --pool-graph "$O/centroid_pool.bin" ) \
+      $( [[ ${B13_DISTS:-0} == 1 ]] && echo --dists "$O/vector_dists.bin" ) \
+      || { rep_retry_or_fail prune; continue; }
+    spot_stop   # optimize_chunked: no spot (single on-demand GPU)
     # shellcheck disable=SC2086
     timed optimize_chunked "$BIN/optimize_chunked" -g "$O/forward_graph_reordered.bin" \
       -o "$O/graph_new_ids.bin" -m E --bucket-offsets "$O/bucket_offsets.bin" \
       --gpu-budget-mb "$CHUNKED_GPU_BUDGET_MB" --edge-buffer-mb "$CHUNKED_EDGE_BUFFER_MB" \
-      --tmp-dir "$W/tmp" $CHUNKED_EXTRA \
-      || { echo "optimize_chunked FAILED"; kill $SMI; exit 3; }
+      --tmp-dir "$W/tmp" --inverse-perm "$O/inverse_perm.bin" --final-output "$O/final_graph.bin" $CHUNKED_EXTRA \
+      || { rep_retry_or_fail optimize_chunked; continue; }
   fi
-  if [[ $FUSED -eq 0 ]]; then
+  # final_graph.bin already there: ids translated in-process (bucket2 resident path, or
+  # optimize_chunked #79 when the translated graph fits its host budget)
+  if [[ ! -f $O/final_graph.bin ]]; then
     timed translate "$BIN/translate_ids" -g "$O/graph_new_ids.bin" -p "$O/inverse_perm.bin" \
-      -o "$O/final_graph.bin" || { echo "translate FAILED"; kill $SMI; exit 3; }
+      -o "$O/final_graph.bin" || { rep_retry_or_fail translate; continue; }
   fi
+  spot_stop
   kill $SMI; wait $SMI 2>/dev/null
+  if ! gpu_is_free "$GPU" && (( GPU_RETRIES < 10 )); then   # timing shared with someone else: invalid
+    GPU_RETRIES=$((GPU_RETRIES + 1))
+    echo "[gpu] GPU $GPU taken by another process during rep $R: discarding this rep, rerunning"
+    rm -rf "$RD"; R=$((R - 1)); continue
+  fi
   echo "$PATH_USED" > "$RD/path.txt"
 
   # quality only on the last rep (seeded build -> reps produce the same graph)
   if [[ $QUALITY -eq 1 && $R -eq $((REPS - 1)) ]]; then
     "$PY" -I "$SKILL/scripts/knn_similarity.py" "$O/vector_knn.bin" "$O/inverse_perm.bin" \
       "$DSDIR/base_knn_sample10K_k64.ibin" > "$RD/knn_similarity.json" || echo "knn_similarity FAILED"
-    # final-graph structural check + recall/QPS through the cuVS CAGRA searcher
-    # (SIFT100M: DiskANN CPU in-memory search, same JSON format; points[].itopk = DiskANN L)
-    if [[ $DS == sift100M ]]; then
+    # final-graph structural check + recall/QPS: cuVS CAGRA searcher (SEARCH=cagra, uint8) or
+    # DiskANN CPU in-memory search (SEARCH=diskann; same JSON format, points[].itopk = DiskANN L)
+    if [[ $SEARCH == diskann ]]; then
       "$PY" -I "$SKILL/scripts/diskann_search.py" "$BASE" "$O/final_graph.bin" \
-        "$DSDIR/query.public.10K.u8bin" "$DSDIR/groundtruth.ibin" "$W/diskann" \
+        "$DSDIR/query.public.10K$EXT" "$DSDIR/groundtruth.ibin" "$W/diskann" \
         2> "$RD/search.err" | grep '^{' > "$RD/search.json" || echo "search FAILED (see search.err)"
     else
     "$EVAL" search --data "$BASE" --graph "$O/final_graph.bin" \
-      --query "$DSDIR/query.public.10K.u8bin" --gt "$DSDIR/groundtruth.ibin" \
+      --query "$DSDIR/query.public.10K$EXT" --gt "$DSDIR/groundtruth.ibin" \
       2> "$RD/search.err" | grep '^{' > "$RD/search.json" || echo "search FAILED (see search.err)"
     fi
   fi

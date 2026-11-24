@@ -1,0 +1,138 @@
+diff --git a/bucketDemo/buildBucket/src/prune_windowed.cpp b/bucketDemo/buildBucket/src/prune_windowed.cpp
+index 4c42355..939492f 100644
+--- a/bucketDemo/buildBucket/src/prune_windowed.cpp
++++ b/bucketDemo/buildBucket/src/prune_windowed.cpp
+@@ -54,6 +54,8 @@
+ #include <type_traits>
+ #include <thread>
+ #include <mutex>
++#include <condition_variable>
++#include <deque>
+ #include <exception>
+ 
+ #include <fcntl.h>
+@@ -90,6 +92,72 @@ static size_t block_size_bytes(const BucketWindowBlock& b) {
+ 
+ // 多线程 pread 一段文件到 dst (每线程读自己的子区间；页面首次触碰也随之
+ // 并行，而不是一个线程串行 page-fault 几百 MB)。
++// S8 / P1 (scale loop): 多 GPU 剪枝时每张卡一个写线程。GPU 线程的 sink 只把 pinned 暂存区里的行拷进有界队列就返回，
++// 写线程按偏移 pwrite (writer.write_rows_at，跟原来同一个调用 → 输出逐字节相同)。原来 GPU 线程在 finish(c-1) 里
++// 自己 pwrite，被 dirty 页限速 / ext4 同一 inode 的写锁卡住时，这张卡下一块的 plan / load / kernel 全都排在后面。
++// 参考 TAGORE largeIndex: GPU 构建跟 CPU / 磁盘写出用独立线程流水；cuVS snmg 每个 rank 自己的资源。
++class AsyncRowSink {
++public:
++    AsyncRowSink(graph_io::StreamingGraphWriter& w, int32_t row_w, size_t cap_bytes)
++        : w_(w), row_w_(row_w), cap_(cap_bytes), th_([this] { loop(); }) {}
++    ~AsyncRowSink() { try { finish(); } catch (...) {} }   // 正常路径显式 finish() (错误在那里抛)
++    // GPU 线程调用: 拷一份 (rows 只在回调期间有效)，队列满了就等 (返回阻塞秒数)
++    double push(const uint32_t* rows, int64_t row0, int64_t n) {
++        const auto t0 = std::chrono::steady_clock::now();
++        Item it{std::vector<uint32_t>(rows, rows + static_cast<size_t>(n) * row_w_), row0, n};
++        const size_t bytes = it.rows.size() * sizeof(uint32_t);
++        std::unique_lock<std::mutex> lk(m_);
++        cv_.wait(lk, [&] { return err_ || queued_ == 0 || queued_ + bytes <= cap_; });
++        if (err_) std::rethrow_exception(err_);
++        queued_ += bytes; q_.push_back(std::move(it));
++        cv_.notify_all();
++        return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
++    }
++    // 等队列写完、收线程 (返回等待秒数)
++    double finish() {
++        const auto t0 = std::chrono::steady_clock::now();
++        { std::lock_guard<std::mutex> lk(m_); done_ = true; }
++        cv_.notify_all();
++        if (th_.joinable()) th_.join();
++        if (err_) std::rethrow_exception(err_);
++        return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
++    }
++    double write_s() const { return write_s_; }
++private:
++    struct Item { std::vector<uint32_t> rows; int64_t row0, n; };
++    void loop() {
++        for (;;) {
++            Item it;
++            {
++                std::unique_lock<std::mutex> lk(m_);
++                cv_.wait(lk, [&] { return done_ || !q_.empty(); });
++                if (q_.empty()) return;   // done_ 且已写完
++                it = std::move(q_.front()); q_.pop_front();
++            }
++            try {
++                const auto t0 = std::chrono::steady_clock::now();
++                w_.write_rows_at(it.rows.data(), it.row0, it.n);
++                write_s_ += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
++            } catch (...) {
++                std::lock_guard<std::mutex> lk(m_); err_ = std::current_exception(); cv_.notify_all(); return;
++            }
++            std::lock_guard<std::mutex> lk(m_);
++            queued_ -= it.rows.size() * sizeof(uint32_t);
++            cv_.notify_all();
++        }
++    }
++    graph_io::StreamingGraphWriter& w_;
++    int32_t row_w_;
++    size_t cap_, queued_ = 0;
++    bool done_ = false;
++    std::exception_ptr err_;
++    double write_s_ = 0;
++    std::deque<Item> q_;
++    std::mutex m_;
++    std::condition_variable cv_;
++    std::thread th_;   // 最后初始化 (用到上面的成员)
++};
++
+ static void parallel_pread(const std::string& path, off_t offset, size_t bytes, void* dst)
+ {
+     int fd = ::open(path.c_str(), O_RDONLY);
+@@ -596,25 +664,48 @@ int main(int argc, char** argv)
+                 std::vector<prune_windowed_gpu::ChunkStats> st(static_cast<size_t>(G));
+                 std::vector<std::exception_ptr> exc(static_cast<size_t>(G));
+                 std::vector<std::thread> th;
+-                std::mutex sink_mtx;
++                // S8 / P1: 每卡一个写线程 (AsyncRowSink，队列上限 1 GB；BUCKET2_PRUNE_ASYNC_SINK=0 退回 GPU 线程自己写)
++                const bool async_sink = !(std::getenv("BUCKET2_PRUNE_ASYNC_SINK") && std::getenv("BUCKET2_PRUNE_ASYNC_SINK")[0] == '0');
++                std::vector<double> g_wall(static_cast<size_t>(G), 0), g_block(static_cast<size_t>(G), 0),
++                                    g_drain(static_cast<size_t>(G), 0), g_write(static_cast<size_t>(G), 0);
+                 for (int g = 0; g < G; ++g) {
+                     th.emplace_back([&, g] {
+                         try {
++                            const auto tg_0 = Clock::now();
+                             prune_windowed_gpu::set_device(g);
++                            std::unique_ptr<AsyncRowSink> as;
++                            if (async_sink) as = std::make_unique<AsyncRowSink>(writer, output_degree, size_t(1) << 30);
++                            double& blk = g_block[static_cast<size_t>(g)];
++                            double& wr = g_write[static_cast<size_t>(g)];
+                             prune_windowed_gpu::run_chunked<T>(N, M_in, D_all, offsets_new.data(), n_buckets, win, win_len, Wmax,
+                                 output_degree, budget / G,
+                                 [&](int64_t lo, int64_t n, int32_t* c, T* v) { load_rows(lo, n, c, v); },
+                                 [&](const uint32_t* rows, int64_t row0, int64_t n) {
++                                    if (as) { blk += as->push(rows, row0, n); return; }
+                                     auto tw0 = Clock::now();
+                                     writer.write_rows_at(rows, row0, n);
+-                                    std::lock_guard<std::mutex> lk(sink_mtx);
+-                                    t_sink += std::chrono::duration<double>(Clock::now() - tw0).count();
++                                    const double d = std::chrono::duration<double>(Clock::now() - tw0).count();
++                                    blk += d; wr += d;
+                                 },
+                                 &st[static_cast<size_t>(g)], cut[static_cast<size_t>(g)], cut[static_cast<size_t>(g) + 1]);
++                            if (as) { g_drain[static_cast<size_t>(g)] = as->finish(); wr = as->write_s(); }
++                            g_wall[static_cast<size_t>(g)] = std::chrono::duration<double>(Clock::now() - tg_0).count();
+                         } catch (...) { exc[static_cast<size_t>(g)] = std::current_exception(); }
+                     });
+                 }
+                 for (auto& t : th) t.join();
++                // 计时 (原来 compute = wall − 各卡 sink 之和，G = 4 时成了负数): 每卡 compute = wall − 阻塞在 sink 上 − 收尾等写完；
++                // t_sink 记最慢那张卡的 (阻塞 + 收尾)，这样 compute(parallel) = 墙钟 − t_sink 仍有意义
++                double max_wait = 0;
++                for (int g = 0; g < G; ++g) {
++                    const size_t gi = static_cast<size_t>(g);
++                    max_wait = std::max(max_wait, g_block[gi] + g_drain[gi]);
++                    std::cout << "  [prune gpu" << g << "] wall=" << std::fixed << std::setprecision(3) << g_wall[gi]
++                              << "s compute=" << g_wall[gi] - g_block[gi] - g_drain[gi] << "s sink_block=" << g_block[gi]
++                              << "s drain=" << g_drain[gi] << "s write(" << (async_sink ? "writer thread" : "inline") << ")="
++                              << g_write[gi] << "s\n";
++                }
++                t_sink = max_wait;
+                 prune_windowed_gpu::set_device(0);
+                 for (auto& e : exc) if (e) std::rethrow_exception(e);
+                 for (auto& x : st) { cst.chunks += x.chunks; cst.loaded_rows += x.loaded_rows; }

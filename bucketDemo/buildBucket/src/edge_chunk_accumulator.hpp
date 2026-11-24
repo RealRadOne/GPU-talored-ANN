@@ -23,6 +23,7 @@
 // optimize_chunked.cu's merge_rev_into_output_chunk already uses.
 
 #pragma once
+#include <cstdlib>
 
 #include <algorithm>
 #include <omp.h>
@@ -415,7 +416,12 @@ struct TopKReverseStore {
     void add(const EdgeRecord* recs, size_t n) {
         if (n == 0) return;
         const int T = std::max(1, omp_get_max_threads());
-        const int P = T * 8;
+        // #80: 每线程 512 个目标区间 (原来 8): 一个区间的行 (N/(80·512) ≈ 2.4K 行 × 256 B ≈ 0.6 MB @100M)
+        // 放得进 L2，插入不再随机打 40 MB 的行区；SIFT100M Phase 1 33 → 25 s (64: 29 s, 1024: 29 s, 2048: 31 s)。
+        // 结果与插入顺序无关 (每行留 (rank, src) 最小的 L 个)，输出逐字节相同。OC_STORE_PPT 覆盖 (A/B)
+        // 小 N 时按每区间 ≥ ~2K 行封顶 (至少 T·8，原值)，免得每次 add 都清零 T·P 的直方图
+        static const int ppt = [] { const char* e = std::getenv("OC_STORE_PPT"); return e ? std::max(1, std::atoi(e)) : 512; }();
+        const int P = static_cast<int>(std::max<int64_t>(int64_t(T) * 8, std::min<int64_t>(int64_t(T) * ppt, N / 2048)));
         auto part_of = [&](uint32_t d) { return static_cast<int>((static_cast<uint64_t>(d) * P) / static_cast<uint64_t>(N)); };
         hist.assign(static_cast<size_t>(T) * P + 1, 0);
         int64_t n_bad = 0;

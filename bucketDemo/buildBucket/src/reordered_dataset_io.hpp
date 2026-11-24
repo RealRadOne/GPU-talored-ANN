@@ -34,6 +34,7 @@
 #include <cstdint>
 #include <cstring>
 #include <fstream>
+#include <mutex>
 #include <numeric>
 #include <stdexcept>
 #include <string>
@@ -250,6 +251,7 @@ public:
                         vecs_out.size() * sizeof(DataT));
             return;
         }
+        std::lock_guard<std::mutex> lk(mtx_);   // 多 GPU Step 6: 多个 producer 共用一个读句柄
         in_.seekg(header_bytes_ + static_cast<std::streamoff>(lo) * D_ * sizeof(DataT));
         in_.read(reinterpret_cast<char*>(vecs_out.data()),
                  static_cast<std::streamsize>(vecs_out.size() * sizeof(DataT)));
@@ -262,6 +264,7 @@ private:
     const DataT* host_ = nullptr;
     int64_t host_rows_ = 0;
     std::ifstream in_;
+    std::mutex mtx_;
     int64_t D_;
     std::streamoff header_bytes_ = 0;
     std::vector<uint32_t> offsets_new_;

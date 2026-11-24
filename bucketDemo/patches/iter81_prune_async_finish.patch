@@ -1,0 +1,68 @@
+diff --git a/bucketDemo/buildBucket/src/prune_windowed_gpu.cu b/bucketDemo/buildBucket/src/prune_windowed_gpu.cu
+index 63fee0d..a4e966e 100644
+--- a/bucketDemo/buildBucket/src/prune_windowed_gpu.cu
++++ b/bucketDemo/buildBucket/src/prune_windowed_gpu.cu
+@@ -20,6 +20,7 @@
+ #include <climits>
+ #include <numeric>
+ #include <functional>
++#include <future>
+ #include <cstdlib>
+ #include <iostream>
+ #include <cstdint>
+@@ -672,6 +673,7 @@ void run_chunked(int64_t N, int M, int D, const uint32_t* h_offsets, int n_bucke
+             uint32_t* d_outB[2] = {d_out, d_out2};
+             int64_t ring_off = 0, prev_off = 0, prev_hd = 0;   // 块 c-1 在环里的区间
+             double t_plan = 0, t_load = 0, t_cdist = 0, t_wait = 0, t_d2h = 0;   // 分段计时 (prune 日志; CPU 侧)
++            double t_fin_wait = 0;   // finish 里等 kernel 的时间 (finish 跑在 worker 上，单独计)
+             // 读盘线程数: 跟 GPU 散布 (零拷贝读 pinned) 并发时线程多反而慢 (msTuring100M: 8 线程 load 43 s，
+             // 16 / 32 / 80 线程 58 / 65 / 57 s)；BUCKET2_PRUNE_LOAD_THREADS 可改
+             const int load_threads = std::max(1, std::min(omp_get_max_threads(),
+@@ -679,6 +681,7 @@ void run_chunked(int64_t N, int M, int D, const uint32_t* h_offsets, int n_bucke
+             auto nslots = [&](int q) { return static_cast<int32_t>((h_offsets[q + 1] - h_offsets[q] + kSlotRows - 1) / kSlotRows); };
+             struct Pending { int64_t row0, n_rows; };
+             Pending pend[2] = {};
++            std::future<void> fin_fut;   // 正在 worker 上跑的 finish (至多一个)
+             // 块 c 的结果: 等它的 kernel 完成、查错、D2H + sink
+             auto finish = [&](int32_t c) {
+                 const int b = c & 1;
+@@ -687,7 +690,7 @@ void run_chunked(int64_t N, int M, int D, const uint32_t* h_offsets, int n_bucke
+                 int h_err = 0;
+                 PWG_CHECK(cudaMemcpyAsync(&h_err, d_err, sizeof(int), cudaMemcpyDeviceToHost, stg_out.st));
+                 PWG_CHECK(cudaStreamSynchronize(stg_out.st));
+-                double t1 = omp_get_wtime(); t_wait += t1 - t0; t0 = t1;
++                double t1 = omp_get_wtime(); t_fin_wait += t1 - t0; t0 = t1;
+                 if (h_err)
+                     throw std::runtime_error(h_err == 2 ? "prune_windowed_gpu: center bucket not loaded in chunk"
+                                                         : "prune_windowed_gpu: fewer than output_degree valid candidates "
+@@ -786,6 +789,8 @@ void run_chunked(int64_t N, int M, int D, const uint32_t* h_offsets, int n_bucke
+                 prev_off = ring_off; prev_hd = hd; ring_off += hd;
+                 if (d_cdist && n_rows > 0)
+                     PWG_CHECK(cudaMemcpyAsync(d_cdist, h_cdist.data(), h_cdist.size() * sizeof(float), cudaMemcpyHostToDevice, stg.st));
++                // 块 c 的 kernel 要覆盖 d_outB[b]: 先等块 c-2 的 finish (它从 d_outB[b] D2H) 做完
++                if (fin_fut.valid()) fin_fut.get();
+                 if (blocks > 0)
+                     prune_kernel<<<static_cast<unsigned>(blocks), kWarpsPerBlock * 32, 0, stg.st>>>(
+                         d_candP, d_vecP, d_off, d_win, d_wl, d_cbase, row0, n_rows, M, D, n_buckets, W, out_deg, d_outB[b], d_err,
+@@ -794,14 +799,19 @@ void run_chunked(int64_t N, int M, int D, const uint32_t* h_offsets, int n_bucke
+                 PWG_CHECK(cudaEventRecord(ev_done[b], stg.st));
+                 pend[b] = {row0, n_rows};
+                 t_wait += omp_get_wtime() - t0;
+-                if (c > 0) finish(c - 1);   // 块 c-1 的结果写出跟 GPU 上的块 c 重叠
++                // #81: 块 c-1 的 等待 + D2H + sink 放到 worker 上，跟块 c+1 的规划 / 读盘 (主线程) 重叠；
++                // 同一时刻最多一个 finish，按块顺序 (sink 行序不变，输出逐字节相同)。原来这三段都串在主线程上
++                // (msTuring100M plan 13 + load 39 + d2h+sink 21 s，GPU 只等 3 s)。
++                // 参考 cuVS cagra_build.cuh::build_knn_graph: 下一批的 host 准备跟上一批的结果回收重叠。
++                if (c > 0) fin_fut = std::async(std::launch::async, finish, c - 1);
+                 if (stats) { stats->chunks++; stats->loaded_rows += hd; }
+                 prevU = pl.U;
+             }
++            if (fin_fut.valid()) fin_fut.get();
+             if (!plans.empty()) finish(static_cast<int32_t>(plans.size()) - 1);
+             std::cout << "  B12: GPU bucket pool " << pool_slots << " slots x " << kSlotRows << " rows\n";
+             std::cout << "  [Chunked timing] plan=" << t_plan << "s load=" << t_load << "s center_dists=" << t_cdist
+-                      << "s gpu_wait=" << t_wait << "s d2h+sink=" << t_d2h << "s (pipelined)\n";
++                      << "s gpu_wait=" << t_wait << "s fin_wait=" << t_fin_wait << "s d2h+sink=" << t_d2h << "s (pipelined, finish on a worker)\n";
+         } else
+         for (int p0 = 0; p0 < n_buckets; ++chunk_id) {
+             // ---- 并集 U(p0..p1): 加位置直到行数到上限 ----
