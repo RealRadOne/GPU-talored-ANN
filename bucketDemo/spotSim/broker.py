@@ -119,3 +119,54 @@ class TaskBroker:
         )
 
     
+
+class Segment:
+    def __init__(self, begin: float, end: float, reserved: int = -1) -> None:
+        self.cursor = begin
+        self.end = end
+        self.issued = begin     # farthest point handed to the owner (batch in flight ends here)
+        self.owner = -1         # worker index, -1 = free
+        self.reserved = reserved  # initial segment kept for this worker until it first asks
+
+    def left(self) -> float:
+        return self.end - self.cursor
+
+    def left_after_issued(self) -> float:
+        return self.end - max(self.issued, self.cursor)
+
+    def __repr__(self) -> str:
+        return f"Segment([{self.cursor:.3f}, {self.end:.3f}) owner={self.owner} reserved={self.reserved})"
+
+
+class SegmentBroker:
+    EPS = 1e-9
+
+    def __init__(self, work_s: float, n_initial: int) -> None:
+        """The static split: n_initial equal segments, segment k reserved for worker k."""
+        cuts = [work_s * k / n_initial for k in range(n_initial + 1)]
+        self.segments = [Segment(cuts[k], cuts[k + 1], reserved=k) for k in range(n_initial)]
+
+    def all_done(self) -> bool:
+        return all(s.cursor >= s.end - self.EPS for s in self.segments)
+
+    def grant(self, index: int, worker: int) -> None:
+        s = self.segments[index]
+        s.owner, s.issued, s.reserved = worker, s.cursor, -1
+
+    def issue(self, index: int, upto: float) -> None:
+        self.segments[index].issued = upto
+
+    def commit(self, index: int, upto: float) -> None:
+        self.segments[index].cursor = upto
+
+    def release(self, index: int) -> None:
+        """Owner gone (preempted / drained / done): the rest goes back to the pool, in-flight work is dropped."""
+        s = self.segments[index]
+        s.owner, s.issued = -1, s.cursor
+
+    def split(self, index: int, at: float) -> int:
+        """[cursor, end) -> [cursor, at) stays, [at, end) becomes a new free segment; returns its index."""
+        s = self.segments[index]
+        self.segments.append(Segment(at, s.end))
+        s.end = at
+        return len(self.segments) - 1

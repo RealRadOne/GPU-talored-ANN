@@ -1,0 +1,7 @@
+trace,gpus,scenario,scale,covers_real_s,no_event_s,predicted_s,slowdown,preempts_in_run,lost_s
+g4_A_high_volatility.csv,4,A_high_volatility,60.0,358.5,191.4,202.1,1.056,28,3.4
+g4_B_burst_arrivals.csv,4,B_burst_arrivals,60.0,2867.6,191.4,199.1,1.04,5,0.7
+g4_C_sustained_capacity.csv,4,C_sustained_capacity,60.0,3363.5,191.4,195.6,1.022,4,0.2
+g8_A_high_volatility.csv,8,A_high_volatility,60.0,358.5,191.4,199.4,1.042,75,32.2
+g8_B_burst_arrivals.csv,8,B_burst_arrivals,60.0,2972.5,191.4,197.4,1.032,12,13.2
+g8_C_sustained_capacity.csv,8,C_sustained_capacity,60.0,3381.1,191.4,197.9,1.034,4,0.5
