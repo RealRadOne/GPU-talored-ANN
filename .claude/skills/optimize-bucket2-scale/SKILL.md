@@ -44,6 +44,13 @@ writes become parallel but hit the kernel dirty-page throttle and turn Step 6 di
 optimize G > 1 re-uploads the whole forward graph per GPU per segment. prune barely scales (load + sink
 dominated). Step 4 scales (GPU search). Per-GPU setup (`gpu_buffer_alloc`, `future_access`) is replicated.
 
+## optimize_chunked GPUs: always `OPT_MGPU=1` (user 2026-11-23)
+
+Since the spot merge (SP8, main 303ce3b) the shared `run_pipeline.sh` runs optimize_chunked on **one GPU by default**, also
+in plain multi-GPU runs (the spot loop's choice). This loop keeps measuring multi-GPU optimize: **every `MGPU=G` run_pipeline
+call of this loop (bench chains, milestones, A/B) must set `OPT_MGPU=1`**, otherwise optimize runs single-GPU and the totals are
+not comparable with `best_scale.json`. (`mgpu_run.sh` passes `--num-gpus $G` to optimize_chunked itself and is unaffected.)
+
 ## GPU availability (user decisions 2026-11-01 / 2026-11-19)
 
 - **GPU agreement (2026-11-19):** wangcy07 uses GPUs 0,1; ours are 2,3, but 0,1 may be used while they are free.
@@ -169,8 +176,8 @@ bash $S/run_pipeline.sh -d sift10M -m auto  -o $R/sift10M_auto     # single-GPU 
 bash $S/run_pipeline.sh -d sift1M  -m large -o $R/sift1M_large
 JUDGE_MEM_REF=/home/lanlu/microBenchmark/.claude/skills/optimize-bucket2-scale/state/guard_mem_ref.json \
 python3 $S/judge.py $R/sift10M_auto $R/sift1M_large --quick   # speed / quality vs optimize-bucket2 best.json; memory vs the scale loop's own reference
-MGPU=2 bash $S/run_pipeline.sh -d sift100M -m auto -o $R/sift100M_auto_g2
-MGPU=4 bash $S/run_pipeline.sh -d sift100M -m auto -o $R/sift100M_auto_g4   # only if all 4 free at this point
+OPT_MGPU=1 MGPU=2 bash $S/run_pipeline.sh -d sift100M -m auto -o $R/sift100M_auto_g2
+OPT_MGPU=1 MGPU=4 bash $S/run_pipeline.sh -d sift100M -m auto -o $R/sift100M_auto_g4   # only if all 4 free at this point
 ```
 - Write it as `$R/chain.sh`, launch with `setsid nohup bash $R/chain.sh > $R/chain.out 2>&1 < /dev/null &`, record
   the **script's own PID** (`ps -o pid,lstart,cmd -p $(pgrep -d, -f chain.sh)`; the setsid wrapper exits at once)
